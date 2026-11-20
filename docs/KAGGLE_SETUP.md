@@ -106,3 +106,21 @@ Codex AI가 결과를 분석하고 코드를 수정하는 Ralph 반복은 아직
 그 단계는 `AGENTS.md`의 안전 규칙을 적용하고, 새 모델의 CPU 자기검사 및 GPU smoke test가 통과한 뒤 확장합니다.
 
 추가로 원본 녹음/가중치를 외부 AI 서비스에 전달하지 마세요.
+
+
+## GPU 요청은 True인데 CUDA가 False인 경우
+
+`kaggle kernels pull ... -m`의 `enable_gpu=true`는 GPU 요청이 저장됐다는 의미이며, 실행 환경의 CUDA 인식까지 보장하지는 않습니다.
+
+**학습 데이터를 사용하지 않는 비공개 GPU 진단 작업**을 먼저 실행하세요:
+
+    git pull
+    py tools/kaggle_gpu_probe.py --username siyul1122 --execute
+
+결과 로그에서 다음 값을 확인합니다:
+- `nvidia-smi`: GPU 장치 및 드라이버가 실제 런타임에서 보이는지
+- `torch.version.cuda`: PyTorch에 CUDA 지원이 포함됐는지
+- `torch.cuda.is_available`: PyTorch가 GPU를 실제 사용할 수 있는지
+- `GPU_PROBE_RESULT`: 최종 진단 요약
+
+`GPU_PROBE_RESULT = NOT_AVAILABLE`이면 본 학습을 재시도하지 말고 Kaggle 웹 편집기의 Settings → Accelerator 설정과 계정 GPU 사용 자격 및 가용성을 점검하세요. `GPU_PROBE_RESULT = AVAILABLE`이면 이전 작업의 일시적 런타임/할당 문제 가능성이 있으므로 본 학습을 2 Epoch으로 다시 시험합니다. 진단 작업 역시 소량의 무료 GPU 시간을 사용할 수 있습니다.
