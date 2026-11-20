@@ -255,6 +255,10 @@ def package(round_number, dataset, username, epochs, batch_size, source, variant
     return folder, ref
 
 
+class KaggleTerminalFailure(RuntimeError):
+    """Remote Kaggle job ended in ERROR/CANCELLED (safe to submit a new job)."""
+
+
 def run_kaggle(kaggle, folder, ref, result_folder, max_wait_seconds):
     # A distinct kernel per candidate avoids overwriting the ongoing E02/E03 jobs.
     command([kaggle, "kernels", "push", "-p", folder, "--accelerator", "NvidiaTeslaT4"])
@@ -276,7 +280,7 @@ def run_kaggle(kaggle, folder, ref, result_folder, max_wait_seconds):
                 print(command([kaggle, "kernels", "logs", ref], capture=True)[-16000:])
             except Exception as exc:
                 print("Could not fetch Kaggle logs:", exc, flush=True)
-            raise RuntimeError(f"Kaggle kernel failed: {ref}")
+            raise KaggleTerminalFailure(f"Kaggle kernel failed: {ref}")
         time.sleep(60)
     raise TimeoutError(
         f"Kernel still running after local wait deadline. Inspect {ref}; "
@@ -388,6 +392,7 @@ def main():
             folder = output_root / f"round_{round_n:02d}"
             folder.mkdir(parents=True, exist_ok=True)
             SOURCE.write_text(champion_source, encoding="utf-8")
+            submitted = False
             try:
                 explanation = codex_edit(codex, best["score"], round_n, recent, folder, variant, args.codex_model)
                 candidate = SOURCE.read_text(encoding="utf-8")
@@ -396,6 +401,7 @@ def main():
                 (folder / "hypothesis.txt").write_text(explanation, encoding="utf-8")
                 job_folder, ref = package(round_n, args.dataset, args.username, args.epochs, args.batch_size, candidate, variant, run_tag)
                 print(f"SUBMIT {ref} source_hash={sha256(candidate)[:12]}", flush=True)
+                submitted = True
                 result = run_kaggle(kaggle, job_folder, ref, folder, args.max_job_minutes * 60)
                 score = validate_result(result)
                 recent = result
@@ -427,6 +433,10 @@ def main():
             except Exception as exc:
                 SOURCE.write_text(champion_source, encoding="utf-8")
                 (folder / "error.txt").write_text(repr(exc), encoding="utf-8")
+                if submitted and not isinstance(exc, KaggleTerminalFailure):
+                    print("Remote job may still be running or its result uncertain. "
+                          "Stopping to prevent duplicate GPU jobs.", flush=True)
+                    raise
                 consecutive_errors += 1
                 print(f"ROUND {round_n} ERROR ({consecutive_errors}/{args.max_errors}): {exc}", flush=True)
                 if current_modified_paths() not in (set(), {"src/kaggle_train.py"}):
