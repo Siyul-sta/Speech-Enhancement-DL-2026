@@ -231,3 +231,11 @@ output/
 *.wav
 *.zip
 outputs/
+
+kaggle_run/
+runs/
+kaggle.json
+credentials.json
+.kaggle/
+speech-data.zip
+local_test_output/
