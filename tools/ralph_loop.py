@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import ast
 import hashlib
+import itertools
 import json
 import math
 import re
@@ -305,10 +306,12 @@ def main():
         "--codex-model", default="gpt-6.1-sol",
         help="Model explicitly passed to Codex CLI, overriding stale ~/.codex/config.toml pins",
     )
-    parser.add_argument("--rounds", type=int, default=3)
+    parser.add_argument("--rounds", type=int, default=3,
+                        help="Maximum rounds; 0 means run until GPU quota/safety stop")
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=4)
-    parser.add_argument("--max-total-minutes", type=int, default=180)
+    parser.add_argument("--max-total-minutes", type=int, default=180,
+                        help="Wall-time budget in minutes; 0 disables this limit")
     parser.add_argument("--max-job-minutes", type=int, default=80)
     parser.add_argument("--min-gpu-quota-hours", type=float, default=2.0)
     parser.add_argument("--stop-at-pesq", type=float, default=3.0)
@@ -326,9 +329,10 @@ def main():
         parser.error("Invalid Kaggle username or private dataset ref")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,79}", args.codex_model):
         parser.error("Invalid --codex-model name")
-    if not (1 <= args.rounds <= 40 and 2 <= args.epochs <= 100 and
+    if not (0 <= args.rounds <= 40 and 2 <= args.epochs <= 100 and
             1 <= args.batch_size <= 16 and 15 <= args.max_job_minutes <= 180 and
-            20 <= args.max_total_minutes <= 600 and args.max_stagnant >= 0 and
+            (args.max_total_minutes == 0 or 20 <= args.max_total_minutes <= 600) and
+            args.max_stagnant >= 0 and
             1 <= args.max_errors <= 10 and math.isfinite(args.stop_at_pesq) and
             args.stop_at_pesq > 0):
         parser.error("Experiment limits out of safe range")
@@ -338,8 +342,9 @@ def main():
     best = initial_best(require_complete=args.execute)
     print(f"Starting reference: {best['origin']} PESQ-WB={best['score']:.4f}")
     print(
-        f"Plan: at most {args.rounds} Codex revisions + {args.rounds} Kaggle GPU jobs, "
-        f"epochs <= {args.epochs}, local duration limit ~{args.max_total_minutes} min."
+        f"Plan: {args.rounds if args.rounds else 'until quota/safety stop'} Codex revisions + GPU jobs, "
+        f"epochs <= {args.epochs}, wall-time: "
+        f"{str(args.max_total_minutes) + ' min' if args.max_total_minutes else 'unlimited'}."
     )
     print(f"Codex model: {args.codex_model} (explicit CLI override)")
     print("Existing E02/E03 batch must be COMPLETE before starting this controller.")
@@ -378,13 +383,15 @@ def main():
     stagnant = 0
     consecutive_errors = 0
     try:
-        for round_n in range(1, args.rounds + 1):
-            remaining_seconds = args.max_total_minutes * 60 - (time.monotonic() - started)
-            # Do not launch a new remote job near the end of the overnight
-            # window: this controller cannot cancel GPU jobs after timeout.
-            if remaining_seconds < (args.max_job_minutes + 10) * 60:
-                print("Insufficient wall-time for another bounded GPU job. Stopping.", flush=True)
-                break
+        rounds = range(1, args.rounds + 1) if args.rounds else itertools.count(1)
+        for round_n in rounds:
+            if args.max_total_minutes:
+                remaining_seconds = args.max_total_minutes * 60 - (time.monotonic() - started)
+                # Do not launch a new remote job near the end of a bounded
+                # window: the controller cannot cancel a running GPU job.
+                if remaining_seconds < (args.max_job_minutes + 10) * 60:
+                    print("Insufficient wall-time for another bounded GPU job. Stopping.", flush=True)
+                    break
             if not args.no_pesq_target and best["score"] >= args.stop_at_pesq:
                 print("Target PESQ reached. Stopping.", flush=True)
                 break
