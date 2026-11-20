@@ -106,3 +106,9 @@ python src/inference.py --input input --output output --checkpoint checkpoints/b
 - [기존 실험 종료 후 이어서 실행하는 PowerShell 스크립트](tools/start_overnight.ps1)
 
 현재 3회 실험이 실행 중이면 **다른 PowerShell 창**에서 준비 스크립트를 실행하세요. 같은 소스 파일을 동시에 수정하지 않도록 기존 Python 프로세스 종료를 기다립니다. 사용자 설정 목표 PESQ 3.0에 도달해도 중단하지 않으며, 8시간 시간 예산과 무료 GPU 사용 한도를 지킵니다.
+
+## GPU 한도까지 지속 개선 (8시간 종료 없이)
+
+- [시간 제한 없는 로컬 Ralph Loop 스크립트](tools/start_until_quota.ps1)
+- 기존 8시간 `start_overnight.ps1` 실행 중이면 **8시간 대기 창만 Ctrl+C로 중단**하고, 기존 3회 학습은 유지한 채 새 PowerShell 창에서 `& .\\tools\\start_until_quota.ps1`를 실행합니다.
+- Kaggle 무료 GPU 잔여 시간이 2시간 아래로 떨어지거나 안전 문제가 생기면 신규 학습을 중단합니다. 3.0점 도달이나 8시간 경과는 중단 사유가 아닙니다.
