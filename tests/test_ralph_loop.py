@@ -22,6 +22,12 @@ class RalphLoopTests(unittest.TestCase):
     def setUpClass(cls):
         cls.source = (PROJECT / "src" / "kaggle_train.py").read_text(encoding="utf-8")
 
+    def test_codex_model_is_explicit_and_configurable(self):
+        script = (PROJECT / "tools" / "ralph_loop.py").read_text(encoding="utf-8")
+        self.assertIn('"--codex-model", default="gpt-6.1-sol"', script)
+        self.assertIn('codex, "exec", "--model", model', script)
+        self.assertIn('args.codex_model)', script)
+
     def test_dry_run_does_not_need_gpu_or_codex(self):
         # Dry-run is tested by users via CLI; unit-level check ensures args are declared.
         self.assertIn('parser.add_argument("--execute", action="store_true")',
