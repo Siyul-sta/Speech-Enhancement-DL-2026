@@ -99,3 +99,10 @@ python src/inference.py --input input --output output --checkpoint checkpoints/b
 - [실행 및 한도 설정 안내](docs/RALPH_LOOP.md)
 
 기존 E02/E03 연속 실험이 완료된 후 별도로 실행해야 합니다. 새 코드는 아직 Codex→Kaggle 통합 실험이 검증되지 않았으며, 무료 GPU/AI 호출 한도와 Private Kaggle 데이터 권한을 준수해야 합니다.
+
+## 밤새 자동 개선 (로컬 PC 8시간)
+
+- [8시간 Ralph Loop 설정 및 안전한 대기 실행](docs/OVERNIGHT.md)
+- [기존 실험 종료 후 이어서 실행하는 PowerShell 스크립트](tools/start_overnight.ps1)
+
+현재 3회 실험이 실행 중이면 **다른 PowerShell 창**에서 준비 스크립트를 실행하세요. 같은 소스 파일을 동시에 수정하지 않도록 기존 Python 프로세스 종료를 기다립니다. 사용자 설정 목표 PESQ 3.0에 도달해도 중단하지 않으며, 8시간 시간 예산과 무료 GPU 사용 한도를 지킵니다.
