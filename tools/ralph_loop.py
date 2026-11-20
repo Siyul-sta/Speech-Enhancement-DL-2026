@@ -14,6 +14,7 @@ Codex edits only src/kaggle_train.py, and each candidate runs a distinct PRIVATE
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 import math
@@ -51,18 +52,39 @@ def current_modified_paths():
     return {p.strip().replace("\\", "/") for p in (tracked + "\n" + staged).splitlines() if p.strip()}
 
 
-def initial_best():
-    best = {"score": BASELINE, "origin": "original_cnn", "round": 0}
-    for exp in ("e02_unet", "e03_mrstft"):
-        path = ROOT / "runs" / exp / "result.json"
-        if not path.is_file():
+def initial_best(require_complete=False):
+    """Only use completed, locally downloaded E02/E03 benchmark results."""
+    best = {"score": BASELINE, "origin": "original_cnn", "round": 0, "variant": "E02_UNET"}
+    for exp, variant in (("e02_unet", "E02_UNET"), ("e03_mrstft", "E03_MRSTFT")):
+        folder = ROOT / "runs" / exp
+        path = folder / "result.json"
+        checkpoint = folder / "best_model.pt"
+        if not path.is_file() or not checkpoint.is_file():
+            if require_complete:
+                raise RuntimeError(
+                    f"Baseline batch is not finished: missing {path} or {checkpoint}. "
+                    "Complete BOTH E02/E03 jobs and download outputs before --execute."
+                )
             continue
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
             score = float(data["best_validation_pesq_wb"])
-            if int(data["validation_files"]) == 164 and math.isfinite(score) and score > best["score"]:
-                best = {"score": score, "origin": exp, "round": 0}
-        except (ValueError, KeyError, TypeError, json.JSONDecodeError):
+            valid = (
+                data.get("experiment") == variant
+                and int(data["validation_files"]) == 164
+                and int(data["epochs_completed"]) >= 5
+                and math.isfinite(score)
+            )
+            if not valid:
+                raise ValueError("Incomplete/invalid baseline (possibly 2-epoch smoke test)")
+            if score > best["score"]:
+                best = {
+                    "score": score, "origin": exp, "round": 0, "variant": variant,
+                    "checkpoint": str(checkpoint),
+                }
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            if require_complete:
+                raise RuntimeError(f"Invalid or smoke-only baseline result {path}: {exc}") from exc
             print("WARN: invalid previous result ignored:", path)
     return best
 
@@ -81,23 +103,24 @@ def require_quota(kaggle, min_remaining_hours):
     raise RuntimeError("Could not read Kaggle GPU quota; refusing to submit")
 
 
-def codex_edit(codex, score, round_n, recent, output_folder):
+def codex_edit(codex, score, round_n, recent, output_folder, variant):
     prompt = (
         "You are performing ONE bounded iteration of a traditional speech enhancement "
         "research experiment, inside the current git repository. "
         "READ AGENTS.md. Current best 164-file PESQ-WB mean is "
-        f"{score:.8f}; last experiment summary: {json.dumps(recent, ensure_ascii=False)[:2000]}. "
-        "Edit ONLY src/kaggle_train.py. Improve the model architecture or the loss, "
-        "with ONE clear hypothesis and the smallest safe change. Keep "
-        "EXPERIMENT_CONFIG and DATASET_SLUG assignment lines exactly present; "
-        "keep SpectrogramUNet, SpeechPairs, run, run() entrypoint, E02_UNET accepted, "
-        "valid 16 kHz mono 48000-sample outputs, deterministic seed, and "
-        "PESQ on all 164 validation files; validation must not be used for training. "
-        "Do not load/upload raw datasets, tokens, secrets, or any private audio to "
-        "external services. No Internet/network operations, no git commits, no "
-        "GPU submissions, no modifications to any other file. "
-        "Do not change baseline metrics, early stopping or result schema. "
-        "Do not delete existing functionality. Explain your hypothesis in the final message."
+        f"{score:.8f}; current champion experiment variant is {variant}. "
+        f"Last experiment summary: {json.dumps(recent, ensure_ascii=False)[:2000]}. "
+        "Edit ONLY src/kaggle_train.py and ONLY INSIDE existing definitions "
+        "class ConvBlock, class SpectrogramUNet, def enhancement_loss. "
+        "Improve the model architecture or loss, ONE testable hypothesis. "
+        "Do not create/delete/reorder top-level functions, classes or imports. "
+        "Keep ALL dataset reading, training loop, evaluation, score calculation, "
+        "PESQ 164-file validation, output/checkpoint format, fixed seed and "
+        "early stopping completely unchanged. Inference must use noisy only. "
+        "Do not load/upload raw datasets, Kaggle tokens, secrets, or private audio "
+        "to any external service. No Internet/network operations, no git commits, "
+        "no GPU submissions. Do not change any other file. "
+        "Explain your hypothesis and why it may improve PESQ in final message."
     )
     summary = output_folder / "codex_summary.txt"
     stdout_log = output_folder / "codex_log.txt"
@@ -118,28 +141,52 @@ def codex_edit(codex, score, round_n, recent, output_folder):
 
 
 def validate_candidate(candidate, before):
+    """Reject any model candidate that changes data access, training or scoring."""
     if candidate == before:
         raise RuntimeError("Codex made no source change; GPU job not submitted")
     changed = current_modified_paths()
     if changed != {"src/kaggle_train.py"}:
         raise RuntimeError(f"Unexpected tracked changes from Codex: {sorted(changed)}")
-    compile(candidate, str(SOURCE), "exec")
-    for name in ("EXPERIMENT_CONFIG", "DATASET_SLUG", "SpectrogramUNet",
-                 "SpeechPairs", "def run(", 'if __name__ == "__main__"'):
-        if name not in candidate:
-            raise RuntimeError(f"Required source symbol missing: {name}")
-    if re.search(r"^EXPERIMENT_CONFIG = .+$", candidate, re.M) is None:
-        raise RuntimeError("No configurable EXPERIMENT_CONFIG assignment")
-    if re.search(r"^DATASET_SLUG = .+$", candidate, re.M) is None:
-        raise RuntimeError("No configurable DATASET_SLUG assignment")
-    print("Candidate Python syntax and experiment interface: PASS", flush=True)
+    old_tree = ast.parse(before, filename=str(SOURCE))
+    new_tree = ast.parse(candidate, filename=str(SOURCE))
+    if len(old_tree.body) != len(new_tree.body):
+        raise RuntimeError("Codex changed top-level structure; rejecting")
+    editable = {"ConvBlock", "SpectrogramUNet", "enhancement_loss"}
+    changed_allowed = []
+    for old, new in zip(old_tree.body, new_tree.body):
+        if type(old) is not type(new) or getattr(old, "name", None) != getattr(new, "name", None):
+            raise RuntimeError("Codex reordered/renamed a top-level definition; rejecting")
+        name = getattr(old, "name", None)
+        if name in editable:
+            if ast.dump(old, include_attributes=False) != ast.dump(new, include_attributes=False):
+                changed_allowed.append(name)
+                for child in ast.walk(new):
+                    if isinstance(child, ast.Call):
+                        fun = child.func
+                        label = fun.id if isinstance(fun, ast.Name) else (
+                            fun.attr if isinstance(fun, ast.Attribute) else ""
+                        )
+                        if label in {
+                            "eval", "exec", "compile", "__import__", "open", "getattr",
+                            "setattr", "system", "popen", "run", "load", "save",
+                            "read_text", "write_text", "unlink", "remove", "rmtree",
+                            "urlopen", "request", "post", "put", "delete",
+                        }:
+                            raise RuntimeError(f"Unsafe call added inside {name}: {label}")
+        elif ast.dump(old, include_attributes=False) != ast.dump(new, include_attributes=False):
+            raise RuntimeError(
+                f"Protected data/evaluation/training code changed: {name or type(old).__name__}"
+            )
+    if not changed_allowed:
+        raise RuntimeError("No model/loss improvement was made; rejecting")
+    print(f"Candidate AST structure: PASS (edited {changed_allowed})", flush=True)
 
 
-def package(round_number, dataset, username, epochs, batch_size, source):
+def package(round_number, dataset, username, epochs, batch_size, source, variant, run_tag):
     code = re.sub(
         r"^EXPERIMENT_CONFIG = .+$",
         "EXPERIMENT_CONFIG = " + repr({
-            "id": "E02_UNET", "epochs": epochs, "batch_size": batch_size,
+            "id": variant, "epochs": epochs, "batch_size": batch_size,
             "patience": 7, "seed": 42,
         }),
         source, count=1, flags=re.M,
@@ -149,14 +196,14 @@ def package(round_number, dataset, username, epochs, batch_size, source):
         "DATASET_SLUG = " + repr(dataset),
         code, count=1, flags=re.M,
     )
-    slug = f"speech-enhancement-ralph-r{round_number:02d}"
+    slug = f"speech-enhancement-ralph-{run_tag}-r{round_number:02d}"
     ref = username + "/" + slug
     folder = ROOT / "kaggle_run" / f"ralph_r{round_number:02d}"
     folder.mkdir(parents=True, exist_ok=True)
     (folder / "run.py").write_text(code, encoding="utf-8")
     metadata = {
         "id": ref,
-        "title": "Speech Enhancement Ralph R" + f"{round_number:02d}",
+        "title": f"Speech Enhancement Ralph {run_tag} R{round_number:02d}",
         "code_file": "run.py",
         "language": "python",
         "kernel_type": "script",
@@ -239,7 +286,7 @@ def main():
     if not SOURCE.exists():
         parser.error("Missing src/kaggle_train.py")
     current = SOURCE.read_text(encoding="utf-8")
-    best = initial_best()
+    best = initial_best(require_complete=args.execute)
     print(f"Starting reference: {best['origin']} PESQ-WB={best['score']:.4f}")
     print(
         f"Plan: at most {args.rounds} Codex revisions + {args.rounds} Kaggle GPU jobs, "
@@ -257,10 +304,14 @@ def main():
         parser.error("codex and kaggle CLI must both be available and logged in")
     command([codex, "login", "status"])
     require_quota(kaggle, args.min_gpu_quota_hours)
-    OUTPUT.mkdir(parents=True, exist_ok=True)
+    run_tag = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    output_root = OUTPUT / ("run_" + run_tag)
+    output_root.mkdir(parents=True, exist_ok=False)
     champion_source = current
-    (OUTPUT / "best_source.py").write_text(champion_source, encoding="utf-8")
-    (OUTPUT / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
+    (output_root / "best_source.py").write_text(champion_source, encoding="utf-8")
+    (output_root / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
+    variant = best["variant"]
+    print(f"Reference variant: {variant}; results folder: {output_root}", flush=True)
     started = time.monotonic()
     recent = {"best": best}
     stagnant = 0
@@ -273,16 +324,16 @@ def main():
                 print("Target PESQ reached. Stopping.", flush=True)
                 break
             require_quota(kaggle, args.min_gpu_quota_hours)
-            folder = OUTPUT / f"round_{round_n:02d}"
+            folder = output_root / f"round_{round_n:02d}"
             folder.mkdir(parents=True, exist_ok=True)
             SOURCE.write_text(champion_source, encoding="utf-8")
             try:
-                explanation = codex_edit(codex, best["score"], round_n, recent, folder)
+                explanation = codex_edit(codex, best["score"], round_n, recent, folder, variant)
                 candidate = SOURCE.read_text(encoding="utf-8")
                 validate_candidate(candidate, champion_source)
                 (folder / "candidate_source.py").write_text(candidate, encoding="utf-8")
                 (folder / "hypothesis.txt").write_text(explanation, encoding="utf-8")
-                job_folder, ref = package(round_n, args.dataset, args.username, args.epochs, args.batch_size, candidate)
+                job_folder, ref = package(round_n, args.dataset, args.username, args.epochs, args.batch_size, candidate, variant, run_tag)
                 print(f"SUBMIT {ref} source_hash={sha256(candidate)[:12]}", flush=True)
                 result = run_kaggle(kaggle, job_folder, ref, folder, args.max_job_minutes * 60)
                 score = validate_result(result)
@@ -293,11 +344,11 @@ def main():
                     best = {
                         "score": score, "origin": ref, "round": round_n,
                         "source_hash": sha256(candidate),
-                        "checkpoint": str(folder / "best_model.pt"),
+                        "checkpoint": str(folder / "best_model.pt"), "variant": variant,
                         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
                     }
-                    (OUTPUT / "best_source.py").write_text(champion_source, encoding="utf-8")
-                    (OUTPUT / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
+                    (output_root / "best_source.py").write_text(champion_source, encoding="utf-8")
+                    (output_root / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
                     stagnant = 0
                     print("IMPROVED: new champion saved", flush=True)
                 else:
@@ -314,7 +365,7 @@ def main():
     finally:
         SOURCE.write_text(champion_source, encoding="utf-8")
         print(f"FINAL best PESQ-WB={best['score']:.4f} ({best['origin']})", flush=True)
-        print("Results and candidate sources: runs/ralph/ (not committed to GitHub)", flush=True)
+        print(f"Results and candidate sources: {output_root} (not committed to GitHub)", flush=True)
 
 
 if __name__ == "__main__":
