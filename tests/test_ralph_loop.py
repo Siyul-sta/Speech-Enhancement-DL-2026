@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -20,7 +21,12 @@ spec.loader.exec_module(ralph)
 class RalphLoopTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
-        cls.source = (PROJECT / "src" / "kaggle_train.py").read_text(encoding="utf-8")
+        # The live experiment can leave a successful candidate in the working tree.
+        # Test against the tracked trainer from HEAD rather than the mutable file.
+        cls.source = subprocess.run(
+            ["git", "show", "HEAD:src/kaggle_train.py"], cwd=PROJECT,
+            check=True, text=True, capture_output=True,
+        ).stdout
 
     def test_codex_model_is_explicit_and_configurable(self):
         script = (PROJECT / "tools" / "ralph_loop.py").read_text(encoding="utf-8")
@@ -66,6 +72,53 @@ class RalphLoopTests(unittest.TestCase):
         with patch.object(ralph, "current_modified_paths", return_value={"src/kaggle_train.py", "README.md"}):
             with self.assertRaisesRegex(RuntimeError, "Unexpected tracked changes"):
                 ralph.validate_candidate(revised, self.source)
+
+    def test_overnight_model_flags_exist(self):
+        script = (PROJECT / "tools" / "ralph_loop.py").read_text(encoding="utf-8")
+        self.assertIn('"--no-pesq-target", action="store_true"', script)
+        self.assertIn("1 <= args.rounds <= 40", script)
+        self.assertIn("if args.max_stagnant and stagnant >= args.max_stagnant:", script)
+        self.assertIn("class KaggleTerminalFailure(RuntimeError):", script)
+
+    def test_prior_verified_champion_is_resumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for exp, variant, score in (
+                ("e02_unet", "E02_UNET", 2.3771),
+                ("e03_mrstft", "E03_MRSTFT", 2.20),
+            ):
+                folder = root / "runs" / exp
+                folder.mkdir(parents=True)
+                (folder / "best_model.pt").write_bytes(b"test-baseline")
+                (folder / "result.json").write_text(json.dumps({
+                    "experiment": variant,
+                    "best_validation_pesq_wb": score,
+                    "validation_files": 164,
+                    "epochs_completed": 25,
+                }), encoding="utf-8")
+            folder = root / "runs" / "ralph" / "run_20261120180100"
+            round_dir = folder / "round_01"
+            round_dir.mkdir(parents=True)
+            checkpoint = round_dir / "best_model.pt"
+            checkpoint.write_bytes(b"test-new-champion")
+            (round_dir / "result.json").write_text(json.dumps({
+                "best_validation_pesq_wb": 2.44,
+                "validation_files": 164,
+                "epochs_completed": 25,
+            }), encoding="utf-8")
+            (folder / "best_source.py").write_text(self.source, encoding="utf-8")
+            (folder / "best.json").write_text(json.dumps({
+                "score": 2.44,
+                "origin": "siyul1122/speech-enhancement-ralph-test-r01",
+                "round": 1,
+                "variant": "E02_UNET",
+                "checkpoint": str(checkpoint),
+                "source_hash": ralph.sha256(self.source),
+            }), encoding="utf-8")
+            with patch.object(ralph, "ROOT", root):
+                best = ralph.initial_best(require_complete=True)
+            self.assertAlmostEqual(best["score"], 2.44)
+            self.assertEqual(best["source_path"], str(folder / "best_source.py"))
 
     def test_finished_baselines_pick_e03_when_best(self):
         with tempfile.TemporaryDirectory() as tmp:
