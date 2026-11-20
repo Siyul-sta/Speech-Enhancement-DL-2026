@@ -73,6 +73,16 @@ class RalphLoopTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "Unexpected tracked changes"):
                 ralph.validate_candidate(revised, self.source)
 
+    def test_unlimited_quota_mode_is_explicit(self):
+        script = (PROJECT / "tools" / "ralph_loop.py").read_text(encoding="utf-8")
+        watcher = (PROJECT / "tools" / "start_until_quota.ps1").read_text(encoding="utf-8")
+        self.assertIn("if args.rounds else itertools.count(1)", script)
+        self.assertIn("if args.max_total_minutes:", script)
+        self.assertIn("0 <= args.rounds <= 40", script)
+        self.assertIn('"--rounds", "0"', watcher)
+        self.assertIn('"--max-total-minutes", "0"', watcher)
+        self.assertIn('"--min-gpu-quota-hours", "2"', watcher)
+
     def test_overnight_model_flags_exist(self):
         script = (PROJECT / "tools" / "ralph_loop.py").read_text(encoding="utf-8")
         self.assertIn('"--no-pesq-target", action="store_true"', script)
