@@ -45,7 +45,21 @@ def locate_data_root() -> Path:
     slug = DATASET_SLUG.rsplit("/", 1)[-1]
     mount = Path("/kaggle/input") / slug
     if not mount.exists():
-        raise FileNotFoundError(f"Kaggle dataset is not mounted: {mount}")
+        # On some Kaggle runs datasets may be mounted under another parent.
+        # Print a bounded diagnostic before failing rather than silently blaming CUDA.
+        input_root = Path("/kaggle/input")
+        top_levels = sorted(p.name for p in input_root.iterdir()) if input_root.exists() else []
+        print(f"DATASET_MOUNT_DIAGNOSTIC expected={mount} mounted_roots={top_levels[:30]}", flush=True)
+        if input_root.exists():
+            for manifest in input_root.rglob("train/samples.csv"):
+                candidate = manifest.parent.parent
+                if (candidate / "validation/samples.csv").is_file():
+                    print(f"DATASET_MOUNT_DIAGNOSTIC found_alternative_root={candidate}", flush=True)
+                    return candidate
+        raise FileNotFoundError(
+            f"Private dataset not mounted in Kaggle run: {mount}. "
+            "Check notebook Inputs/Add Input and kernel-metadata.json dataset_sources."
+        )
     if (mount / "train/samples.csv").is_file() and (mount / "validation/samples.csv").is_file():
         return mount
     matches = list(mount.rglob("train/samples.csv"))
