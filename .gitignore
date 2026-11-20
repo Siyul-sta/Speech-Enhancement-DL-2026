@@ -221,3 +221,13 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Speech challenge private / generated data
+train/
+validation/
+input/
+output/
+.waveform_cache/
+*.wav
+*.zip
+outputs/
