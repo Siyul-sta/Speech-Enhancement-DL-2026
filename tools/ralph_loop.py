@@ -123,6 +123,10 @@ def initial_best(require_complete=False):
     return best
 
 
+class QuotaGuardReached(RuntimeError):
+    """Kaggle GPU free quota is too low for another safe experiment."""
+
+
 def require_quota(kaggle, min_remaining_hours):
     # Do not submit another job if we cannot verify remaining free GPU quota.
     output = command([kaggle, "quota"], capture=True)
@@ -132,7 +136,7 @@ def require_quota(kaggle, min_remaining_hours):
             remaining = float(cells[2].rstrip("h"))
             print(f"Kaggle GPU hours remaining: {remaining:.2f}", flush=True)
             if remaining < min_remaining_hours:
-                raise RuntimeError("Insufficient verified Kaggle GPU quota; stopping")
+                raise QuotaGuardReached("Insufficient verified Kaggle GPU quota; stopping")
             return
     raise RuntimeError("Could not read Kaggle GPU quota; refusing to submit")
 
@@ -395,7 +399,11 @@ def main():
             if not args.no_pesq_target and best["score"] >= args.stop_at_pesq:
                 print("Target PESQ reached. Stopping.", flush=True)
                 break
-            require_quota(kaggle, args.min_gpu_quota_hours)
+            try:
+                require_quota(kaggle, args.min_gpu_quota_hours)
+            except QuotaGuardReached as exc:
+                print(f"GPU QUOTA STOP: {exc}", flush=True)
+                break
             folder = output_root / f"round_{round_n:02d}"
             folder.mkdir(parents=True, exist_ok=True)
             SOURCE.write_text(champion_source, encoding="utf-8")
