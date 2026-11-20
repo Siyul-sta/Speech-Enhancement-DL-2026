@@ -83,3 +83,12 @@ python src/inference.py --input input --output output --checkpoint checkpoints/b
 - 임의로 생성한 16 kHz/모노 3초 WAV를 추론해 입력과 동일한 48,000표본을 출력하는 테스트를 통과했습니다.
 - **비공개 채점 환경의 전체 파일에 대한 실행은 아직 검증하지 않았습니다.**
 - 챌린지 제출 시 **GitHub 링크 외에 회차별 AI 활용 내역서**도 별도로 제출해야 합니다.
+
+## Kaggle 무료 GPU 실험 자동화 (준비 완료, 실제 학습 미실행)
+
+- [Kaggle CLI 설정·실행 안내](docs/KAGGLE_SETUP.md)
+- [U-Net 학습 스크립트](src/kaggle_train.py)
+- [GPU 실험 큐·자동 결과 수집](tools/kaggle_loop.py)
+- [Codex 실험 규칙](AGENTS.md)
+
+기본 CNN PESQ-WB 1.6961은 실제 검증 점수입니다. E02/E03 U-Net은 **아직 Kaggle에서 실행·검증되지 않은 실험 코드**입니다. 수업 음성 데이터의 제3자 Kaggle 업로드 허용 여부를 확인한 뒤 실행하세요.
