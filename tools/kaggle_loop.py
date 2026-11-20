@@ -73,6 +73,17 @@ def package_job(username, dataset, variant, epochs, batch_size, patience):
     return folder, ref
 
 
+def show_kernel_logs(kaggle, ref):
+    """Print the latest Kaggle logs automatically if a job fails."""
+    try:
+        logs = run_command([kaggle, "kernels", "logs", ref], capture=True)
+        print("\n=== KAGGLE ERROR LOG (last 24,000 chars) ===", flush=True)
+        print(logs[-24000:], flush=True)
+        print("=== END KAGGLE ERROR LOG ===\n", flush=True)
+    except (OSError, subprocess.CalledProcessError) as exc:
+        print(f"Unable to retrieve logs for {ref}: {exc}", flush=True)
+
+
 def wait_for_kernel(kaggle, ref, interval, max_wait):
     start = time.monotonic()
     while time.monotonic() - start < max_wait:
@@ -81,12 +92,15 @@ def wait_for_kernel(kaggle, ref, interval, max_wait):
         low = status.lower()
         # Errors are terminal; do not trigger further GPU jobs after an error.
         if re.search(r"\b(error|failed|cancelled|canceled)\b", low):
+            show_kernel_logs(kaggle, ref)
             raise RuntimeError(f"Kaggle run failed: {ref}\n{status}")
         if re.search(r"\bcomplete\b", low):
             return
         if not re.search(r"\b(queued|running|pending)\b", low):
+            show_kernel_logs(kaggle, ref)
             raise RuntimeError(f"Unrecognized Kaggle status: {status}")
         time.sleep(interval)
+    show_kernel_logs(kaggle, ref)
     raise TimeoutError(
         f"Kaggle job still unresolved after max_wait; check manually: {ref}"
     )
