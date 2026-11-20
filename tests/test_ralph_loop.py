@@ -47,7 +47,7 @@ class RalphLoopTests(unittest.TestCase):
                 ralph.validate_candidate(revised, self.source)
 
     def test_top_level_import_is_rejected(self):
-        revised = "import socket\n" + self.source
+        revised = self.source.replace("import csv\n", "import csv\nimport socket\n")
         with patch.object(ralph, "current_modified_paths", return_value={"src/kaggle_train.py"}):
             with self.assertRaisesRegex(RuntimeError, "top-level"):
                 ralph.validate_candidate(revised, self.source)
