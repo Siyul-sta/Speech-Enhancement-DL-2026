@@ -103,7 +103,7 @@ def require_quota(kaggle, min_remaining_hours):
     raise RuntimeError("Could not read Kaggle GPU quota; refusing to submit")
 
 
-def codex_edit(codex, score, round_n, recent, output_folder, variant):
+def codex_edit(codex, score, round_n, recent, output_folder, variant, model):
     prompt = (
         "You are performing ONE bounded iteration of a traditional speech enhancement "
         "research experiment, inside the current git repository. "
@@ -125,7 +125,7 @@ def codex_edit(codex, score, round_n, recent, output_folder, variant):
     summary = output_folder / "codex_summary.txt"
     stdout_log = output_folder / "codex_log.txt"
     args = [
-        codex, "exec", "--sandbox", "workspace-write",
+        codex, "exec", "--model", model, "--sandbox", "workspace-write",
         "-C", str(ROOT), "-o", str(summary), prompt,
     ]
     print(f"ROUND {round_n}: Codex editing a candidate source ...", flush=True)
@@ -264,6 +264,10 @@ def main():
     parser = argparse.ArgumentParser(description="Local bounded Codex + Kaggle research loop")
     parser.add_argument("--username", required=True)
     parser.add_argument("--dataset", required=True, help="Approved private Kaggle dataset user/slug")
+    parser.add_argument(
+        "--codex-model", default="gpt-6.1-sol",
+        help="Model explicitly passed to Codex CLI, overriding stale ~/.codex/config.toml pins",
+    )
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--epochs", type=int, default=25)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -279,6 +283,8 @@ def main():
         r"[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+", args.dataset
     ):
         parser.error("Invalid Kaggle username or private dataset ref")
+    if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,79}", args.codex_model):
+        parser.error("Invalid --codex-model name")
     if not (1 <= args.rounds <= 10 and 2 <= args.epochs <= 100 and
             1 <= args.batch_size <= 16 and 15 <= args.max_job_minutes <= 180 and
             20 <= args.max_total_minutes <= 600 and args.max_stagnant >= 1):
@@ -292,6 +298,7 @@ def main():
         f"Plan: at most {args.rounds} Codex revisions + {args.rounds} Kaggle GPU jobs, "
         f"epochs <= {args.epochs}, local duration limit ~{args.max_total_minutes} min."
     )
+    print(f"Codex model: {args.codex_model} (explicit CLI override)")
     print("Existing E02/E03 batch must be COMPLETE before starting this controller.")
     if not args.execute:
         print("DRY RUN ONLY. No Codex request and no Kaggle GPU job submitted.")
@@ -328,7 +335,7 @@ def main():
             folder.mkdir(parents=True, exist_ok=True)
             SOURCE.write_text(champion_source, encoding="utf-8")
             try:
-                explanation = codex_edit(codex, best["score"], round_n, recent, folder, variant)
+                explanation = codex_edit(codex, best["score"], round_n, recent, folder, variant, args.codex_model)
                 candidate = SOURCE.read_text(encoding="utf-8")
                 validate_candidate(candidate, champion_source)
                 (folder / "candidate_source.py").write_text(candidate, encoding="utf-8")
