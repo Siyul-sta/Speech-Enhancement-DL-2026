@@ -38,7 +38,7 @@ def main():
         parser.error("Invalid Kaggle username")
     folder = ROOT / "kaggle_run" / "gpu_probe"
     folder.mkdir(parents=True, exist_ok=True)
-    ref = args.username + "/speech-enhancement-gpu-probe"
+    ref = args.username + "/speech-enhancement-gpu-diagnostic"
     probe = r'''
 from __future__ import annotations
 import os
