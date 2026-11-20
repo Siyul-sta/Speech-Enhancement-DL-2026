@@ -92,3 +92,10 @@ python src/inference.py --input input --output output --checkpoint checkpoints/b
 - [Codex 실험 규칙](AGENTS.md)
 
 기본 CNN PESQ-WB 1.6961은 실제 검증 점수입니다. E02/E03 U-Net은 **아직 Kaggle에서 실행·검증되지 않은 실험 코드**입니다. 수업 음성 데이터의 제3자 Kaggle 업로드 허용 여부를 확인한 뒤 실행하세요.
+
+## Codex Ralph Loop (로컬 PC 유지)
+
+- [반복 실험 컨트롤러](tools/ralph_loop.py)
+- [실행 및 한도 설정 안내](docs/RALPH_LOOP.md)
+
+기존 E02/E03 연속 실험이 완료된 후 별도로 실행해야 합니다. 새 코드는 아직 Codex→Kaggle 통합 실험이 검증되지 않았으며, 무료 GPU/AI 호출 한도와 Private Kaggle 데이터 권한을 준수해야 합니다.
