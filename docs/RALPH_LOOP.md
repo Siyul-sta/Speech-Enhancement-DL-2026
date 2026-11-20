@@ -30,6 +30,18 @@ E02/E03 중 하나가 `ERROR`라면 오류부터 해결하세요. 자동 루프�
     git pull
     codex login status
     kaggle quota
+
+이전 버전에서 모델 오류 `The 'gpt-5.5' model is not supported...`가 발생했다면,
+PC의 Codex 설정이 구형 모델명 `gpt-5.5`로 고정돼 있을 수 있습니다.
+Ralph Loop는 기본적으로 `gpt-6.1-sol`을 명시적으로 사용해 로컬 설정을 덮어씁니다.
+아래 단일 명령으로 먼저 Codex의 실제 계정 접근을 확인하세요 (GPU 사용 없음).
+
+    codex exec -m gpt-6.1-sol "Reply exactly: OK"
+
+모델 접근 권한에 따라 실패한다면, Codex에서 사용 가능한 모델명을 확인하고
+`--codex-model <모델명>`으로 지정하세요.
+위 명령이 실패하는 상태에서는 Ralph Loop를 `--execute`하지 마세요.
+Codex CLI는 `gpt-5.5`가 로컬 설정에 남아 있을 경우, 명시하지 않으면 그 모델을 사용할 수 있습니다.
     py -m unittest discover -s tests -p "test_ralph_loop.py" -v
 
 `codex login status`는 ChatGPT로 로그인한 상태여야 합니다. API 키는 요구하지 않습니다.
@@ -46,7 +58,7 @@ Kaggle 데이터셋은 **기존 비공개 `siyul1122/speech-data-private`만 연
 
 기존 E02/E03 본 실험 결과가 모두 `runs/e02_unet`, `runs/e03_mrstft`에 저장된 이후에만:
 
-    py tools/ralph_loop.py --username siyul1122 --dataset siyul1122/speech-data-private --rounds 1 --epochs 2 --max-total-minutes 40 --max-job-minutes 25 --execute
+    py tools/ralph_loop.py --username siyul1122 --dataset siyul1122/speech-data-private --rounds 1 --epochs 2 --max-total-minutes 40 --max-job-minutes 25 --codex-model gpt-6.1-sol --execute
 
 이 명령은 Codex 수정→모델/손실 이외 코드 변경 차단→Kaggle 2 Epoch→164개 PESQ 평가→성능 비교/롤백의 **실제 통합 테스트**입니다. 2 Epoch 후보가 기존 25 Epoch 우승 모델보다 PESQ가 낮은 것은 자연스럽고, 자동 롤백이 정상입니다. 스크립트는 새 `runs/ralph/run_YYYYMMDDHHMMSS/` 폴더를 만들어 이전 실험 결과를 덮어쓰지 않습니다.
 
