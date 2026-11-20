@@ -5,7 +5,7 @@
 - E02/E03 학습 큐 (`tools/kaggle_loop.py`)와 **별개**입니다. 기존 E02/E03 학습이 끝날 때까지 이 코드를 실행하지 마세요.
 - 기존 E02 2 Epoch PESQ 1.8846, E02 11 Epoch에서 최고 2.2147까지 확인됨. **본 학습과 E03 최종 점수는 아직 여기서 확인하지 않았습니다.**
 - 이 문서에 설명된 `tools/ralph_loop.py`는 Codex가 매번 학습 코드의 한 부분을 개선하도록 요청하고, 별도 Kaggle GPU 작업에 보내 PESQ-WB 164개 검증점수로 후보를 평가하며, 최고 후보를 보존하는 **유한 반복(최대 10회)** 자동화입니다.
-- 소스 코드 구현을 완료했지만 **실제 사용자 Windows 환경에서 Codex→Kaggle의 전체 루프 테스트는 아직 하지 않았습니다.** 첫 실행 결과에 따라 수정이 필요할 수 있습니다.
+- 소스 코드와 오프라인 안전성 테스트를 추가했지만 **실제 사용자 Windows 환경에서 Codex→Kaggle의 전체 루프 테스트는 아직 하지 않았습니다.** 첫 실행 결과에 따라 수정이 필요할 수 있습니다.
 - ChatGPT Work, GitHub Actions, 유료 Colab은 사용하지 않습니다. 실행하는 동안 Windows PC, PowerShell, 인터넷 연결이 유지되어야 합니다.
 
 ## 1. 이미 실행 중인 E02/E03 자동 실험 완료 확인
@@ -30,6 +30,7 @@ E02/E03 중 하나가 `ERROR`라면 오류부터 해결하세요. 자동 루프�
     git pull
     codex login status
     kaggle quota
+    py -m unittest discover -s tests -p "test_ralph_loop.py" -v
 
 `codex login status`는 ChatGPT로 로그인한 상태여야 합니다. API 키는 요구하지 않습니다.
 Kaggle 데이터셋은 **기존 비공개 `siyul1122/speech-data-private`만 연결**합니다.
@@ -41,15 +42,23 @@ Kaggle 데이터셋은 **기존 비공개 `siyul1122/speech-data-private`만 연
 
 출력에서 `DRY RUN ONLY`을 확인합니다.
 
-## 4. AI 반복 3회 실행 (한도가 있는 자동 실험)
+## 4. AI 반복 테스트: 1회, 2 Epoch
+
+기존 E02/E03 본 실험 결과가 모두 `runs/e02_unet`, `runs/e03_mrstft`에 저장된 이후에만:
+
+    py tools/ralph_loop.py --username siyul1122 --dataset siyul1122/speech-data-private --rounds 1 --epochs 2 --max-total-minutes 40 --max-job-minutes 25 --execute
+
+이 명령은 Codex 수정→모델/손실 이외 코드 변경 차단→Kaggle 2 Epoch→164개 PESQ 평가→성능 비교/롤백의 **실제 통합 테스트**입니다. 2 Epoch 후보가 기존 25 Epoch 우승 모델보다 PESQ가 낮은 것은 자연스럽고, 자동 롤백이 정상입니다. 스크립트는 새 `runs/ralph/run_YYYYMMDDHHMMSS/` 폴더를 만들어 이전 실험 결과를 덮어쓰지 않습니다.
+
+## 5. AI 반복 3회 본 실험 (한도가 있는 자동 실험)
 
     py tools/ralph_loop.py --username siyul1122 --dataset siyul1122/speech-data-private --rounds 3 --epochs 25 --max-total-minutes 180 --execute
 
 실제 작동 순서:
-1. `runs/e02_unet/result.json`, `runs/e03_mrstft/result.json`에서 **현재 최고 PESQ(164건)** 탐색
+1. `runs/e02_unet/result.json`, `runs/e03_mrstft/result.json` 및 모델 파일이 존재하고 본 학습이 완료되었는지 확인한 후 **현재 최고 PESQ(164건)** 탐색
 2. `codex exec --sandbox workspace-write`가 `src/kaggle_train.py`에서 새 모델/손실 함수 가설 하나를 코드로 구현
-3. 변경된 파일이 `src/kaggle_train.py`뿐인지 확인하고, Python 문법과 필수 엔트리포인트 검사
-4. `speech-enhancement-ralph-r01`처럼 **독립적인 비공개 Kaggle T4 작업**으로 GPU 학습
+3. 수정 파일이 `src/kaggle_train.py`뿐인지 확인하고, **ConvBlock / SpectrogramUNet / enhancement_loss 이외의 데이터 로딩·학습·평가 코드 변경을 AST 비교로 차단**
+4. `speech-enhancement-ralph-YYYYMMDDHHMMSS-r01`처럼 **독립적인 비공개 Kaggle T4 작업**으로 GPU 학습. E02와 E03 중 기존 우승 모델의 손실 설정을 유지
 5. 전체 Validation 164개 PESQ-WB 평균 확인 및 체크포인트 다운로드
 6. 0.005점 이상 개선되면 새 최고 모델과 코드를 보존; 아니면 코드를 이전 최고 버전으로 되돌림
 7. 정한 횟수/목표 점수/개선 정체/시간 제한/GPU 잔량 조건에서 중단
@@ -63,7 +72,7 @@ Kaggle 데이터셋은 **기존 비공개 `siyul1122/speech-data-private`만 연
 - `--max-stagnant 2`: 2회 연속 PESQ 개선이 없으면 중단
 - `--stop-at-pesq 3.0`: PESQ 3.0을 달성하면 중단 (3.0 달성은 보장하지 않음)
 
-## 5. 진행 확인
+## 6. 진행 확인
 
 자동 루프를 실행한 원래 PowerShell 화면에 각 실험 `PESQ-WB`, `IMPROVED`, `NO IMPROVEMENT`가 출력됩니다.
 
@@ -71,7 +80,7 @@ Kaggle 로그 보기:
 
     kaggle kernels logs siyul1122/speech-enhancement-ralph-r01 --follow --interval 10
 
-파일은 `runs/ralph/`에 보관:
+파일은 `runs/ralph/run_YYYYMMDDHHMMSS/`에 보관:
 - `best.json`: 최고 기록, Kaggle 작업 주소, 체크포인트 경로
 - `best_source.py`: 최고 모델의 재현 가능한 소스 코드
 - `round_01/result.json`: 평균 PESQ, epoch, 성능 차이
@@ -83,9 +92,9 @@ Kaggle 로그 보기:
 원래 `checkpoints/best_mask_cnn.pt`는 절대 변경되지 않습니다.
 Kaggle 외부에 음성파일을 추가 전송하지 않습니다.
 
-## 6. 주의사항
+## 7. 주의사항
 
-- Codex가 변경한 코드에는 결함이나 성능 악화가 있을 수 있습니다. 문법/인터페이스 검사는 실행 성공이나 안전성을 보증하지 않습니다.
+- Codex가 변경한 코드에는 결함이나 성능 악화가 있을 수 있습니다. AST 검사는 평가 로직의 구조적 변경을 방지하지만 **모든 악의적 동작이나 모델 오류를 방지하지는 않습니다**. 생성 코드와 Kaggle 권한을 검토하세요.
 - **Kaggle 작업을 중복 제출하지 마세요.** 기존 E02/E03이 완료되기 전에는 AI 반복 루프를 실행하지 마세요.
 - Codex 로컬 코드 편집을 허용하므로, 본인 PC에서는 주요 파일 백업을 유지하고 `AGENTS.md` 지침을 검토하세요.
 - AI가 만든 코드는 Kaggle에서 실행되므로, 데이터 취급 제한에 주의하고 전면 무감독 실행 전에 코드 변경 내용과 네트워크 접근을 검토하는 것을 권장합니다.
