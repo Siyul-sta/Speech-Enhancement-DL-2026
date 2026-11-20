@@ -211,6 +211,13 @@ def run():
         raise ValueError(f"Unknown experiment: {variant}")
     WORK.mkdir(parents=True, exist_ok=True)
     seed_everything(int(cfg["seed"]))
+    print(
+        f"CUDA_DIAGNOSTIC torch={torch.__version__} "
+        f"cuda_build={torch.version.cuda} "
+        f"cuda_available={torch.cuda.is_available()} "
+        f"device_count={torch.cuda.device_count()}",
+        flush=True,
+    )
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type != "cuda" and Path("/kaggle").exists():
         raise RuntimeError("Kaggle GPU unavailable; refusing CPU full training")
