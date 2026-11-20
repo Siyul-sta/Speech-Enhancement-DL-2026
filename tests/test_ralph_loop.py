@@ -86,7 +86,7 @@ class RalphLoopTests(unittest.TestCase):
     def test_overnight_model_flags_exist(self):
         script = (PROJECT / "tools" / "ralph_loop.py").read_text(encoding="utf-8")
         self.assertIn('"--no-pesq-target", action="store_true"', script)
-        self.assertIn("1 <= args.rounds <= 40", script)
+        self.assertIn("0 <= args.rounds <= 40", script)
         self.assertIn("if args.max_stagnant and stagnant >= args.max_stagnant:", script)
         self.assertIn("class KaggleTerminalFailure(RuntimeError):", script)
 
