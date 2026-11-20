@@ -86,6 +86,39 @@ def initial_best(require_complete=False):
             if require_complete:
                 raise RuntimeError(f"Invalid or smoke-only baseline result {path}: {exc}") from exc
             print("WARN: invalid previous result ignored:", path)
+    # Resume the best *verified* previous Ralph champion, not simply the E02/E03 baseline.
+    history_root = ROOT / "runs" / "ralph"
+    if history_root.is_dir():
+        for prior in sorted(history_root.glob("run_*")):
+            metadata_file = prior / "best.json"
+            source_file = prior / "best_source.py"
+            if not metadata_file.is_file() or not source_file.is_file():
+                continue
+            try:
+                metadata = json.loads(metadata_file.read_text(encoding="utf-8"))
+                score = float(metadata["score"])
+                checkpoint = Path(metadata["checkpoint"])
+                if not checkpoint.is_absolute():
+                    checkpoint = ROOT / checkpoint
+                summary_file = checkpoint.parent / "result.json"
+                if not checkpoint.is_file() or not summary_file.is_file():
+                    continue
+                result = json.loads(summary_file.read_text(encoding="utf-8"))
+                source = source_file.read_text(encoding="utf-8")
+                valid = (
+                    int(metadata.get("round", 0)) > 0
+                    and metadata.get("variant") in ("E02_UNET", "E03_MRSTFT")
+                    and int(result["validation_files"]) == 164
+                    and math.isfinite(score)
+                    and abs(float(result["best_validation_pesq_wb"]) - score) < 1e-6
+                    and metadata.get("source_hash") == sha256(source)
+                )
+                if valid and score > best["score"]:
+                    best = dict(metadata)
+                    best["source_path"] = str(source_file)
+                    best["checkpoint"] = str(checkpoint)
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                print("WARN: invalid prior Ralph champion ignored:", prior)
     return best
 
 
@@ -275,6 +308,10 @@ def main():
     parser.add_argument("--max-job-minutes", type=int, default=80)
     parser.add_argument("--min-gpu-quota-hours", type=float, default=2.0)
     parser.add_argument("--stop-at-pesq", type=float, default=3.0)
+    parser.add_argument("--no-pesq-target", action="store_true",
+                        help="Keep exploring beyond PESQ 3.0 (metric itself is bounded)")
+    parser.add_argument("--max-errors", type=int, default=3,
+                        help="Abort after this many consecutive candidate/preflight errors")
     parser.add_argument("--min-improvement", type=float, default=0.005)
     parser.add_argument("--max-stagnant", type=int, default=2)
     parser.add_argument("--execute", action="store_true")
@@ -285,9 +322,11 @@ def main():
         parser.error("Invalid Kaggle username or private dataset ref")
     if not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,79}", args.codex_model):
         parser.error("Invalid --codex-model name")
-    if not (1 <= args.rounds <= 10 and 2 <= args.epochs <= 100 and
+    if not (1 <= args.rounds <= 40 and 2 <= args.epochs <= 100 and
             1 <= args.batch_size <= 16 and 15 <= args.max_job_minutes <= 180 and
-            20 <= args.max_total_minutes <= 600 and args.max_stagnant >= 1):
+            20 <= args.max_total_minutes <= 600 and args.max_stagnant >= 0 and
+            1 <= args.max_errors <= 10 and math.isfinite(args.stop_at_pesq) and
+            args.stop_at_pesq > 0):
         parser.error("Experiment limits out of safe range")
     if not SOURCE.exists():
         parser.error("Missing src/kaggle_train.py")
@@ -303,8 +342,20 @@ def main():
     if not args.execute:
         print("DRY RUN ONLY. No Codex request and no Kaggle GPU job submitted.")
         return
-    if current_modified_paths():
-        parser.error("Clean tracked git changes first; preserving current work")
+    # The previously running Ralph controller may have left its *verified*
+    # champion in src/kaggle_train.py. Do not reject this known safe state.
+    champion_source = (
+        Path(best["source_path"]).read_text(encoding="utf-8")
+        if best.get("source_path") else current
+    )
+    modified = current_modified_paths()
+    if modified and not (
+        modified == {"src/kaggle_train.py"} and current == champion_source
+    ):
+        parser.error(
+            "Unexpected tracked changes found; preserving your work. "
+            "Commit/stash them before starting overnight improvements."
+        )
     codex = shutil.which("codex") or shutil.which("codex.cmd")
     kaggle = shutil.which("kaggle")
     if not codex or not kaggle:
@@ -314,7 +365,6 @@ def main():
     run_tag = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
     output_root = OUTPUT / ("run_" + run_tag)
     output_root.mkdir(parents=True, exist_ok=False)
-    champion_source = current
     (output_root / "best_source.py").write_text(champion_source, encoding="utf-8")
     (output_root / "best.json").write_text(json.dumps(best, indent=2), encoding="utf-8")
     variant = best["variant"]
@@ -322,12 +372,16 @@ def main():
     started = time.monotonic()
     recent = {"best": best}
     stagnant = 0
+    consecutive_errors = 0
     try:
         for round_n in range(1, args.rounds + 1):
-            if time.monotonic() - started >= args.max_total_minutes * 60:
-                print("Total wall-time budget reached. Stopping.", flush=True)
+            remaining_seconds = args.max_total_minutes * 60 - (time.monotonic() - started)
+            # Do not launch a new remote job near the end of the overnight
+            # window: this controller cannot cancel GPU jobs after timeout.
+            if remaining_seconds < (args.max_job_minutes + 10) * 60:
+                print("Insufficient wall-time for another bounded GPU job. Stopping.", flush=True)
                 break
-            if best["score"] >= args.stop_at_pesq:
+            if not args.no_pesq_target and best["score"] >= args.stop_at_pesq:
                 print("Target PESQ reached. Stopping.", flush=True)
                 break
             require_quota(kaggle, args.min_gpu_quota_hours)
@@ -362,15 +416,28 @@ def main():
                     stagnant += 1
                     print(f"NO IMPROVEMENT: rolling back; stagnant={stagnant}", flush=True)
                     SOURCE.write_text(champion_source, encoding="utf-8")
-                if stagnant >= args.max_stagnant:
+                consecutive_errors = 0
+                if args.max_stagnant and stagnant >= args.max_stagnant:
                     print("Too many non-improving rounds. Stopping.", flush=True)
                     break
-            except Exception:
+            except TimeoutError:
                 SOURCE.write_text(champion_source, encoding="utf-8")
-                print("Candidate source restored to last champion after failure.", flush=True)
+                print("Local timeout: GPU job may still run. Stopping to avoid duplicate GPU jobs.", flush=True)
                 raise
+            except Exception as exc:
+                SOURCE.write_text(champion_source, encoding="utf-8")
+                (folder / "error.txt").write_text(repr(exc), encoding="utf-8")
+                consecutive_errors += 1
+                print(f"ROUND {round_n} ERROR ({consecutive_errors}/{args.max_errors}): {exc}", flush=True)
+                if current_modified_paths() not in (set(), {"src/kaggle_train.py"}):
+                    print("Other tracked files changed; stopping rather than overwriting them.", flush=True)
+                    raise
+                recent = {"failed_round": round_n, "error": str(exc)}
+                if consecutive_errors >= args.max_errors:
+                    print("Too many consecutive errors; stopping.", flush=True)
+                    break
     finally:
-        SOURCE.write_text(champion_source, encoding="utf-8")
+        SOURCE.write_text(current, encoding="utf-8")
         print(f"FINAL best PESQ-WB={best['score']:.4f} ({best['origin']})", flush=True)
         print(f"Results and candidate sources: {output_root} (not committed to GitHub)", flush=True)
 
