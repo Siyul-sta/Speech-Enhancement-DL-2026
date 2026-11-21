@@ -232,6 +232,51 @@ class AdaptiveRalphTests(unittest.TestCase):
                     )
             self.assertEqual(len(pushes), 1)
 
+    def test_reconcile_unknown_kaggle_state_never_marks_safe(self):
+        import reconcile_ralph_v2 as recon
+        with tempfile.TemporaryDirectory() as tmp:
+            folder = Path(tmp)
+            state = folder / "remote_state.json"
+            info = {"ref": "owner/kernel", "status": "SUBMIT_PENDING"}
+            adaptive.json_write(state, info)
+            with patch.object(recon, "status", return_value=(None, "HTTP 404")):
+                recon.reconcile("kaggle", state, info, resolve=True)
+            saved = json.loads(state.read_text(encoding="utf-8"))
+            self.assertEqual(saved["status"], "SUBMIT_PENDING")
+
+    def test_reconcile_complete_needs_full_164_file_evidence(self):
+        import reconcile_ralph_v2 as recon
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            smoke = root / "smoke"
+            smoke.mkdir()
+            state = smoke / "remote_state.json"
+            info = {"ref": "owner/kernel", "status": "SUBMIT_PENDING"}
+            adaptive.json_write(state, info)
+            # An API COMPLETE without downloaded verified result is insufficient.
+            with patch.object(recon, "status", return_value=("COMPLETE", "complete")), \
+                 patch.object(recon.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
+                recon.reconcile("kaggle", state, info, resolve=True)
+            self.assertEqual(
+                json.loads(state.read_text(encoding="utf-8"))["status"], "SUBMIT_PENDING"
+            )
+            (smoke / "result.json").write_text(json.dumps({
+                "best_validation_pesq_wb": 1.9, "validation_files": 164,
+                "epochs_completed": 2,
+            }), encoding="utf-8")
+            (smoke / "best_model.pt").write_bytes(b"fake checkpoint")
+            (smoke / "validation_per_file.csv").write_text(
+                "index,pesq_wb\n" + "".join(f"{i},1.9\n" for i in range(164)),
+                encoding="utf-8"
+            )
+            with patch.object(recon, "status", return_value=("COMPLETE", "complete")), \
+                 patch.object(recon.subprocess, "run", return_value=SimpleNamespace(returncode=0)):
+                recon.reconcile("kaggle", state, info, resolve=True)
+            self.assertEqual(
+                json.loads(state.read_text(encoding="utf-8"))["status"], "COMPLETE"
+            )
+
     def test_result_source_persistence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
