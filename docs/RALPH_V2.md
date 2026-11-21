@@ -85,6 +85,33 @@ Codex가 실행 중 이 파일이나 다른 Git 추적 파일을 수정하면 �
 
 **따라서 로컬에서 수동으로 `git restore src/kaggle_train.py` 또는 `git reset --hard`를 실행할 필요가 없습니다.**
 
+## 2026-11-21 실제 오류: 노트북 ID와 Kaggle URL Slug 불일치
+
+원인 확정: 기존 adaptive 제어기가 제출한 `kernel-metadata.json`의 `id`는 `speech-enhancement-auto-v220261121052503-j0001`이었지만, Kaggle에 생성된 **실제** 노트북은 제목에서 정규화한 `adaptive-speech-v2-v220261121052503-job-1`이었습니다. 따라서 잘못된 ref에 대한 `kernels status` 조회가 `kernels.get denied`로 실패했으며, 이 메시지만으로 인증/권한 문제가 있다고 결론내리면 안 됩니다.
+
+이후 신규 제출의 `id`를 실제 제목 유래 URL slug와 일치하도록 고쳤습니다. 기존 잘못 기록된 `remote_state.json`에 대해서는 `kaggle kernels list --mine`에 해당 정규 ID가 **정확히 1개 존재**함을 검증한 경우에만 교정하고 실제 작업을 조회합니다.
+
+```powershell
+git pull --ff-only
+py -m unittest discover -s tests -p "test_ralph_v2.py" -v
+kaggle kernels status siyul1122/adaptive-speech-v2-v220261121052503-job-1
+py tools/reconcile_ralph_v2.py
+```
+
+실제 ID가 `COMPLETE` / `ERROR` / `CANCELLED`이고 해당 상태가 공식 상태 조회로 확인되면:
+
+```powershell
+py tools/reconcile_ralph_v2.py --resolve
+py tools/reconcile_ralph_v2.py
+```
+
+- `COMPLETE`: 164파일 점수 + 체크포인트 다운로드 후 기록을 `COMPLETE`로 전환. **2 Epoch 스모크 점수는 챔피언에 포함하지 않음.**
+- `ERROR/CANCELLED`: 안전한 종료 상태 확인 후 `ERROR_TERMINAL`로 기록.
+- `RUNNING/QUEUED/UNKNOWN`: 새 GPU 작업을 제출하지 않음. 조회만 수행.
+- `--resolve`는 GPU 제출이 아니라 기존 작업 상태 복구 작업입니다.
+
+복구된 후 다른 미해결 원격 작업이 없고 기존 controller 프로세스도 완전히 중단되었다면 `& .\\tools\\start_adaptive.ps1 -ConfirmedNoRemoteJob`로 **새 연구 반복**을 시작할 수 있습니다.
+
 ## Kaggle 상태 조회 오류 발생 시 복구 (새 실험 금지)
 
 `kaggle kernels push` 뒤 `kaggle kernels status`가 HTTP 404/연결 오류 등으로 실패할 수 있습니다. 새 Ralph Loop V2는 **일시적 상태 조회 실패 5회 재시도** 후에도 상태가 불명확할 경우 중복 GPU 제출을 방지하기 위해 중단합니다. **404가 곧 학습 중단을 의미하지는 않습니다.**
