@@ -74,6 +74,30 @@ class AdaptiveRalphTests(unittest.TestCase):
             self.assertIn('pesq_function(SAMPLE_RATE, reference, wave, "wb")', source)
             self.assertIn("length=noisy.shape[-1]", source)
 
+    def test_kaggle_jobs_are_private_and_separate_from_v1(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.object(adaptive, "ROOT", Path(temp)):
+                source = (ROOT / "src" / "kaggle_train_v3.py").read_text(encoding="utf-8")
+                args = SimpleNamespace(
+                    username="siyul1122", dataset="siyul1122/speech-data-private",
+                    batch_size=4,
+                )
+                folder, ref = adaptive.package_candidate(
+                    source=source, variant="V3_RESIDUAL_PHASE", args=args,
+                    run_tag="v220261121111111", job_id=2, epochs=2,
+                )
+                meta = json.loads(
+                    (folder / "kernel-metadata.json").read_text(encoding="utf-8")
+                )
+                self.assertTrue(meta["is_private"] == "true")
+                self.assertEqual(meta["dataset_sources"], [args.dataset])
+                self.assertIn("kaggle_run", folder.parts)
+                self.assertIn("ralph_v2", folder.parts)
+                self.assertNotIn("ralph_r02", str(folder))
+                self.assertEqual(ref, meta["id"])
+                self.assertIn("'epochs': 2", (folder / "run.py").read_text(encoding="utf-8"))
+
     def test_completed_score_requires_checkpoint_and_all_164_rows(self):
         with tempfile.TemporaryDirectory() as temp:
             folder = Path(temp)
