@@ -313,10 +313,13 @@ def package_candidate(*, source: str, variant: str, args, run_tag: str, job_id: 
     folder = ROOT / "kaggle_run" / "ralph_v2" / run_tag / f"job_{job_id:04d}"
     folder.mkdir(parents=True, exist_ok=False)
     (folder / "run.py").write_text(code, encoding="utf-8")
-    ref = f"{args.username}/speech-enhancement-auto-{run_tag}-j{job_id:04d}"
+    # Kaggle normalizes the notebook TITLE to its real URL slug.
+    # Keep the metadata id aligned with that slug (verified from --mine).
+    title = f"Adaptive Speech V2 {run_tag} job {job_id}"
+    ref = f"{args.username}/adaptive-speech-v2-{run_tag}-job-{job_id}"
     metadata = {
         "id": ref,
-        "title": f"Adaptive Speech V2 {run_tag} job {job_id}",
+        "title": title,
         "code_file": "run.py",
         "language": "python",
         "kernel_type": "script",
