@@ -85,6 +85,37 @@ Codex가 실행 중 이 파일이나 다른 Git 추적 파일을 수정하면 �
 
 **따라서 로컬에서 수동으로 `git restore src/kaggle_train.py` 또는 `git reset --hard`를 실행할 필요가 없습니다.**
 
+## Kaggle 상태 조회 오류 발생 시 복구 (새 실험 금지)
+
+`kaggle kernels push` 뒤 `kaggle kernels status`가 HTTP 404/연결 오류 등으로 실패할 수 있습니다. 새 Ralph Loop V2는 **일시적 상태 조회 실패 5회 재시도** 후에도 상태가 불명확할 경우 중복 GPU 제출을 방지하기 위해 중단합니다. **404가 곧 학습 중단을 의미하지는 않습니다.**
+
+기존 커널을 재제출하지 말고 다음 명령을 먼저 실행하세요.
+
+```powershell
+cd C:\Users\LG\Speech-Enhancement-DL-2026
+git pull --ff-only
+kaggle kernels status siyul1122/speech-enhancement-auto-v220261121052503-j0001
+kaggle kernels list --mine
+py tools/reconcile_ralph_v2.py
+```
+
+`reconcile_ralph_v2.py`는 기본적으로 **상태 확인만 수행**하고, Kaggle GPU 작업을 제출하지 않으며, 로컬 기록을 변경하지 않습니다.
+
+- `RUNNING/QUEUED`: 새 실험을 시작하지 않습니다. 종료를 기다리세요.
+- `COMPLETE`: 결과 파일을 가져와 안전하게 상태를 업데이트할 수 있습니다.
+- `ERROR/CANCELLED`: GPU 학습 종료가 확인된 경우에만 안전하게 완료 상태로 기록합니다.
+- `404/UNKNOWN/인증 실패`: 웹의 비공개 노트북과 계정 상태도 확인하기 전에는 절대로 중복 제출하지 않습니다.
+
+실제 상태가 `COMPLETE`나 `ERROR/CANCELLED`로 확인된 **후에만**:
+
+```powershell
+py tools/reconcile_ralph_v2.py --resolve
+```
+
+복구 스크립트는 `COMPLETE`인 작업의 `result.json`, `best_model.pt`, `validation_per_file.csv`를 확인하고, 164개 전부의 점수가 있어야 완료로 기록합니다. 스모크 결과는 글로벌 우승 모델로 채택하지 않습니다. `ERROR/CANCELLED`인 작업은 종료 상태로 표시하되 성공 결과로 간주하지 않습니다.
+
+이전 실행이 스모크 단계에서 끝났다면 자동화 새 실행은 **새로운 가설과 새로운 2 Epoch 스모크로 시작**할 수 있습니다. 이전 스모크 파일은 보존하지만 동일 후보를 자동 재사용하진 않습니다.
+
 ## 설치·테스트
 
 ```powershell
