@@ -384,10 +384,41 @@ def choose_family(family_index: int, stagnation: int, threshold: int) -> tuple[i
     return family_index, stagnation
 
 
-def preflight(args):
+def snapshot_existing_tracked_edits() -> dict[str, str]:
+    """Preserve the existing V1 trainer edit without touching or trusting its code.
+
+    Adaptive V2 builds models from validated run checkpoint/source pairs. A
+    historical local V1 trainer edit may remain in the worktree; allow ONLY
+    that path, recording a byte-for-byte digest to detect any later changes.
+    """
     modified = legacy.current_modified_paths()
-    if modified:
-        raise RuntimeError(f"Tracked source changes present {sorted(modified)}; protect them first")
+    disallowed = modified - {"src/kaggle_train.py"}
+    if disallowed:
+        raise RuntimeError(
+            f"Unrelated tracked changes {sorted(disallowed)}; refusing to touch user work"
+        )
+    snapshot = {}
+    if "src/kaggle_train.py" in modified:
+        path = ROOT / "src" / "kaggle_train.py"
+        if not path.is_file():
+            raise RuntimeError("Modified V1 trainer is missing; refusing to continue")
+        snapshot["src/kaggle_train.py"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        print("Found existing modified V1 trainer; preserving exact bytes.", flush=True)
+    return snapshot
+
+
+def assert_tracked_unchanged(snapshot: dict[str, str]) -> None:
+    """Abort if Codex (or another program) alters ANY tracked working-tree file."""
+    current = snapshot_existing_tracked_edits()
+    if current != snapshot:
+        raise RuntimeError(
+            f"Tracked working-tree changes detected: before={snapshot}, now={current}. "
+            "Stopping to protect existing files."
+        )
+
+
+def preflight(args):
+    initial_tracked = snapshot_existing_tracked_edits()
     if not all((ROOT / cfg[0]).is_file() for cfg in TEMPLATES.values()):
         raise RuntimeError("Missing family trainer template. Run git pull --ff-only.")
     no_uncertain_prior_jobs()
@@ -398,14 +429,14 @@ def preflight(args):
             "inspect processes before manual lock removal."
         )
     if not args.execute:
-        return None, None, None
+        return None, None, None, initial_tracked
     codex = shutil.which("codex") or shutil.which("codex.cmd")
     kaggle = shutil.which("kaggle")
     if not codex or not kaggle:
         raise RuntimeError("Both Codex CLI and Kaggle CLI must be installed and logged in")
     legacy.command([codex, "login", "status"])
     legacy.require_quota(kaggle, args.min_gpu_quota_hours)
-    return codex, kaggle, lock
+    return codex, kaggle, lock, initial_tracked
 
 
 def main():
@@ -455,7 +486,7 @@ def main():
         print("DRY RUN: no Codex edits and no Kaggle GPU submission", flush=True)
         return
 
-    codex, kaggle, lock = preflight(args)
+    codex, kaggle, lock, initial_tracked = preflight(args)
     try:
         fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -469,10 +500,20 @@ def main():
     rounds = range(1, args.max_rounds + 1) if args.max_rounds else itertools.count(1)
     family_index, stagnant, errors = 0, 0, 0
     tried = set()
+    if "src/kaggle_train.py" in initial_tracked:
+        # This is a copy, never a checkout/reset/overwrite of the V1 trainer.
+        source = ROOT / "src" / "kaggle_train.py"
+        backup = run_dir / "preserved_v1_trainer.py"
+        backup.write_bytes(source.read_bytes())
+        assert_tracked_unchanged(initial_tracked)
+        if hashlib.sha256(backup.read_bytes()).hexdigest() != initial_tracked["src/kaggle_train.py"]:
+            raise RuntimeError("V1 backup integrity check failed; stopping")
+        print(f"Preserved V1 trainer at {backup}", flush=True)
     save_state(run_dir, states, champion)
     print(f"RUN DIRECTORY: {run_dir}", flush=True)
     try:
         for i in rounds:
+            assert_tracked_unchanged(initial_tracked)
             try:
                 legacy.require_quota(kaggle, args.min_gpu_quota_hours)
             except legacy.QuotaGuardReached as exc:
@@ -506,8 +547,7 @@ def main():
                 )
                 candidate = candidate_file.read_text(encoding="utf-8")
                 entry["edits"] = validate_source(candidate, current["source"], family)
-                if legacy.current_modified_paths():
-                    raise RuntimeError("Codex changed tracked repository files; STOP")
+                assert_tracked_unchanged(initial_tracked)
                 entry["source_hash"] = hash_source(candidate)
                 entry["hypothesis"] = summary[:1000]
                 cpu_check(candidate_file)
@@ -592,9 +632,11 @@ def main():
                         flush=True,
                     )
                     raise
-                if legacy.current_modified_paths():
+                try:
+                    assert_tracked_unchanged(initial_tracked)
+                except RuntimeError:
                     append_history(run_dir / "experiments.jsonl", entry)
-                    print("Other tracked files modified; stop to protect user work", flush=True)
+                    print("Tracked files changed; stop to protect user work", flush=True)
                     raise
                 errors += 1
                 stagnant += 1
