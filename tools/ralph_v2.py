@@ -333,6 +333,78 @@ def package_candidate(*, source: str, variant: str, args, run_tag: str, job_id: 
     return folder, ref
 
 
+def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
+                         result_folder: Path, max_wait_seconds: int,
+                         *, sleep_seconds: float = 60,
+                         max_consecutive_status_errors: int = 5):
+    """Submit ONCE, retry transient Kaggle status failures, never duplicate push.
+
+    An unresolved status is NEVER treated as a cancelled job. After exhausting
+    retries we stop and keep remote_state.json unresolved for manual recovery.
+    """
+    legacy.command([kaggle, "kernels", "push", "-p", folder, "--accelerator", "NvidiaTeslaT4"])
+    deadline = time.monotonic() + max_wait_seconds
+    failed = 0
+    while time.monotonic() < deadline:
+        try:
+            proc = subprocess.run(
+                [str(kaggle), "kernels", "status", ref],
+                cwd=ROOT, text=True, capture_output=True,
+                timeout=90, check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            failed += 1
+            details = repr(exc)
+            output = ""
+        else:
+            output = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            details = output[-2500:].strip()
+            if proc.returncode != 0:
+                failed += 1
+            else:
+                status = re.search(r"KernelWorkerStatus\.([A-Z_]+)", output)
+                if not status:
+                    failed += 1
+                    details = "Unrecognized successful Kaggle status: " + details
+                elif status.group(1) == "COMPLETE":
+                    print(f"REMOTE COMPLETE: {ref}", flush=True)
+                    legacy.command([kaggle, "kernels", "output", ref,
+                                    "-p", result_folder, "-o"])
+                    result_file = result_folder / "result.json"
+                    if not result_file.exists():
+                        raise RuntimeError("Kaggle COMPLETE but result.json missing")
+                    return json.loads(result_file.read_text(encoding="utf-8"))
+                elif status.group(1) in ("ERROR", "CANCELLED", "CANCELED"):
+                    try:
+                        print(legacy.command([kaggle, "kernels", "logs", ref],
+                                             capture=True)[-12000:], flush=True)
+                    except Exception as exc:
+                        print("Could not download Kaggle error logs:", exc, flush=True)
+                    raise legacy.KaggleTerminalFailure(
+                        f"Kaggle job ended {status.group(1)}: {ref}"
+                    )
+                else:
+                    failed = 0
+                    print(f"Kaggle remote status={status.group(1)}: {ref}", flush=True)
+        if failed:
+            print(
+                f"Kaggle STATUS QUERY FAILED ({failed}/{max_consecutive_status_errors}): "
+                f"{details}",
+                flush=True,
+            )
+            if failed >= max_consecutive_status_errors:
+                raise RuntimeError(
+                    f"Kaggle state unknown after {failed} status attempts: {ref}. "
+                    "Do NOT start another GPU job. Inspect private Kaggle notebook."
+                )
+        remaining = deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(min(float(sleep_seconds if not failed else 20), remaining))
+    raise TimeoutError(
+        f"Kaggle status wait timeout: {ref}; remote job NOT cancelled."
+    )
+
+
 def remote_job(kaggle: str, *, source: str, variant: str, args, run_tag: str,
                job_id: int, result_dir: Path, is_smoke: bool):
     epochs = 2 if is_smoke else args.epochs
@@ -347,7 +419,7 @@ def remote_job(kaggle: str, *, source: str, variant: str, args, run_tag: str,
     })
     # If the local controller crashes after 'push', a new controller must
     # NOT resubmit before explicitly checking this remote notebook.
-    result = legacy.run_kaggle(
+    result = poll_adaptive_kernel(
         kaggle, job_dir, ref, result_dir, args.max_job_minutes * 60
     )
     json_write(state, {"ref": ref, "status": "COMPLETE", "epochs": epochs})
