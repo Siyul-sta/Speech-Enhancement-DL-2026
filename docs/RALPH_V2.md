@@ -77,6 +77,14 @@ kaggle quota
 
 `$job`이 어떤 노트북인지 실제 출력된 ref로 확인하세요. 다른 계정/작업의 GPU도 동시에 실행 중인 경우 Kaggle 내 목록을 확인하세요.
 
+## 기존 V1 파일이 수정된 상태인 경우
+
+기존 Ralph V1 실행 후 `src/kaggle_train.py`가 Git 추적 변경으로 남을 수 있습니다. Adaptive V2는 **이 파일 하나만 변경된 경우**, 기존 내용의 SHA-256 해시를 기록하고 `runs/ralph_v2/run_*/preserved_v1_trainer.py`로 바이트 단위 백업합니다. 파일 내용을 변경하거나 `git restore`를 실행하지 않습니다.
+
+Codex가 실행 중 이 파일이나 다른 Git 추적 파일을 수정하면 안전상 중단합니다. `src/kaggle_train.py` 이외의 추적 파일도 변경되었다면 이전과 동일하게 실행을 거부합니다. 과거 우승 2.4043 기록은 검증된 `runs/ralph`의 checkpoint와 `best_source.py`를 기반으로 복원합니다.
+
+**따라서 로컬에서 수동으로 `git restore src/kaggle_train.py` 또는 `git reset --hard`를 실행할 필요가 없습니다.**
+
 ## 설치·테스트
 
 ```powershell
