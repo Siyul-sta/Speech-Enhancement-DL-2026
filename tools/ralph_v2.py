@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import csv
 import hashlib
 import importlib.util
 import itertools
@@ -152,6 +153,26 @@ def initial_families() -> dict:
     return states
 
 
+def paired_diagnostics(candidate_folder: Path, reference_folder: Path) -> dict:
+    """Clip-by-clip PESQ improvement against the globally strongest baseline."""
+    def load_scores(path):
+        with path.open("r", newline="", encoding="utf-8") as handle:
+            records = list(csv.DictReader(handle))
+        scores = {int(row["index"]): float(row["pesq_wb"]) for row in records}
+        if len(records) != 164 or set(scores) != set(range(164)):
+            raise ValueError("Paired PESQ results must contain exactly 164 aligned clips")
+        return scores
+
+    current = load_scores(candidate_folder / "validation_per_file.csv")
+    reference = load_scores(reference_folder / "validation_per_file.csv")
+    deltas = sorted(current[i] - reference[i] for i in range(164))
+    return {
+        "win_rate": round(100 * sum(x > 0 for x in deltas) / 164, 2),
+        "worst10_mean_delta": round(sum(deltas[:16]) / 16, 5),
+        "mean_paired_delta": round(sum(deltas) / 164, 5),
+    }
+
+
 def record_for_json(record: dict) -> dict:
     return {k: v for k, v in record.items() if k != "source"}
 
@@ -217,7 +238,7 @@ def codex_propose(codex: str, *, workfile: Path, family: str,
                   champion: dict, family_state: dict, history: list[dict],
                   round_dir: Path, model: str) -> str:
     short_history = [
-        {k: entry.get(k) for k in ("round", "family", "score", "status", "hypothesis")}
+        {k: entry.get(k) for k in ("round", "family", "score", "status", "hypothesis", "win_rate", "worst10_mean_delta", "mean_paired_delta")}
         for entry in history[-15:]
     ]
     relative = workfile.relative_to(ROOT).as_posix()
@@ -521,6 +542,9 @@ def main():
                     "kernel": ref, "best_epoch": result.get("best_epoch"),
                     "epochs_completed": result.get("epochs_completed"),
                 })
+                entry.update(paired_diagnostics(
+                    full_dir, Path(champion["results"])
+                ))
                 new_record = accepted_record(
                     candidate, full_dir, name=ref, variant=variant
                 )
