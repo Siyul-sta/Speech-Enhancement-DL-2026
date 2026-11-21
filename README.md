@@ -112,3 +112,14 @@ python src/inference.py --input input --output output --checkpoint checkpoints/b
 - [시간 제한 없는 로컬 Ralph Loop 스크립트](tools/start_until_quota.ps1)
 - 기존 8시간 `start_overnight.ps1` 실행 중이면 **8시간 대기 창만 Ctrl+C로 중단**하고, 기존 3회 학습은 유지한 채 새 PowerShell 창에서 `& .\\tools\\start_until_quota.ps1`를 실행합니다.
 - Kaggle 무료 GPU 잔여 시간이 2시간 아래로 떨어지거나 안전 문제가 생기면 신규 학습을 중단합니다. 3.0점 도달이나 8시간 경과는 중단 사유가 아닙니다.
+
+## V2: 복소수 마스크 + 실험 이력 기반 전략 전환
+
+기존 Ralph Loop를 안전하게 중단한 다음 [V2 전환 실행 가이드](docs/V2_STRATEGY.md)를 따르세요.
+
+- [V2 복소수 마스크 U-Net 학습 코드](src/kaggle_train_v2.py)
+- [V2 Kaggle GPU 순차 실험 제어기](tools/kaggle_v2.py)
+- [V2 실험 164개 파일별 PESQ 비교](tools/compare_v2.py)
+- [V2 오프라인 테스트](tests/test_kaggle_v2.py)
+
+V1 학습 및 체크포인트는 유지되며, V2는 별도 비공개 Kaggle 작업과 결과 폴더를 사용합니다. V2는 아직 Kaggle 실행 검증 전이므로 2 Epoch 스모크를 먼저 수행해야 합니다.
