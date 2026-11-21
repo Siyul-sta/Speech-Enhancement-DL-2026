@@ -18,6 +18,41 @@ import ralph_v2 as adaptive
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def find_actual_ref(kaggle: str, recorded_ref: str) -> tuple[str | None, str]:
+    """Find the canonical Kaggle notebook slug from an authenticated --mine listing.
+
+    Older Ralph V2 metadata used a ref that disagreed with its actual title.
+    Require an exact match to the historically observed title-derived slug.
+    Do not treat missing or ambiguous entries as cancelled kernels.
+    """
+    match = re.fullmatch(
+        r"([A-Za-z0-9_-]+)/speech-enhancement-auto-(v2[0-9]{14})-j([0-9]{4})",
+        recorded_ref,
+    )
+    if match is None:
+        return None, "No recognized legacy slug mapping"
+    owner, tag, job_number = match.groups()
+    expected = f"{owner}/adaptive-speech-v2-{tag}-job-{int(job_number)}"
+    try:
+        listing = subprocess.run(
+            [str(kaggle), "kernels", "list", "--mine"],
+            text=True, capture_output=True, cwd=ROOT,
+            timeout=90, check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return None, f"Cannot list owned kernels: {exc}"
+    if listing.returncode:
+        return None, ((listing.stdout or "") + "\n" + (listing.stderr or ""))[-2500:]
+    refs = [
+        row.split()[0] for row in listing.stdout.splitlines()
+        if row.split() and re.fullmatch(r"[A-Za-z0-9_-]+/[A-Za-z0-9_-]+", row.split()[0])
+    ]
+    matches = [ref for ref in refs if ref == expected]
+    if len(matches) == 1:
+        return expected, "Verified exact canonical notebook ref from kaggle kernels list --mine"
+    return None, f"Expected {expected} not uniquely found in owned kernels"
+
+
 def status(kaggle: str, ref: str) -> tuple[str | None, str]:
     result = subprocess.run(
         [str(kaggle), "kernels", "status", ref],
@@ -42,14 +77,28 @@ def pending_states():
 
 
 def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
-    ref = info["ref"]
+    recorded_ref = info["ref"]
+    ref = recorded_ref
     worker, message = status(kaggle, ref)
+    if not worker:
+        actual_ref, hint = find_actual_ref(kaggle, recorded_ref)
+        if actual_ref:
+            print(f"LEGACY SLUG MISMATCH: {recorded_ref} -> {actual_ref}")
+            ref = actual_ref
+            worker, message = status(kaggle, ref)
+        else:
+            print(f"Could not verify alternate Kaggle slug: {hint}")
     print(f"\nKAGGLE: {ref}")
     print(f"local={info.get('status')} remote={worker or 'UNKNOWN'}")
     if not worker:
         print("Kaggle CLI diagnostic:", message[-4000:])
         print("NOT RESOLVED. Do not restart automatic GPU experiments.")
         return
+    if resolve and ref != recorded_ref:
+        info["original_ref"] = recorded_ref
+        info["ref"] = ref
+        adaptive.json_write(path, info)
+        print("Verified and saved corrected actual Kaggle notebook ref.")
     if worker in ("RUNNING", "QUEUED", "PENDING", "INITIALIZING"):
         print("Remote GPU may still be in use. NOT RESOLVED.")
         return
