@@ -153,6 +153,66 @@ def initial_families() -> dict:
     return states
 
 
+def recover_completed_smoke(states: dict) -> dict | None:
+    """Reuse a verified 2-epoch smoke candidate when its full run never started.
+
+    Read-only recovery. Reject any candidate that edits protected validation
+    or trainer sections, has a different source than the prior smoke run,
+    or has an ambiguous subsequent full-job directory.
+    """
+    eligible = []
+    for state_file in sorted(OUTPUT.glob("run_*/round_*/smoke/remote_state.json")):
+        smoke_dir = state_file.parent
+        round_dir = smoke_dir.parent
+        try:
+            info = json.loads(state_file.read_text(encoding="utf-8"))
+            if info.get("status") != "COMPLETE":
+                continue
+            # A previously started full job must never be re-submitted.
+            if (round_dir / "full").exists():
+                continue
+            result = valid_full_result(smoke_dir, min_epochs=1)
+            if result is None or int(result["epochs_completed"]) != 2:
+                continue
+            variant = str(result["experiment"])
+            family = next(
+                (name for name, cfg in TEMPLATES.items() if cfg[2] == variant),
+                None,
+            )
+            if family is None or states[family]["checkpoint"] is not None:
+                continue
+            source_path = round_dir / "candidate.py"
+            base_path = round_dir.parent / "families" / family / "best_source.py"
+            if not source_path.is_file() or not base_path.is_file():
+                continue
+            source = source_path.read_text(encoding="utf-8")
+            previous = base_path.read_text(encoding="utf-8")
+            validate_source(source, previous, family)
+            if result.get("model") != TEMPLATES[family][1]:
+                continue
+            eligible.append({
+                "source": source,
+                "family": family,
+                "variant": variant,
+                "source_hash": hash_source(source),
+                "smoke_dir": str(smoke_dir),
+                "prior_run": str(round_dir),
+            })
+        except (OSError, ValueError, KeyError, TypeError, StopIteration,
+                SyntaxError, json.JSONDecodeError) as exc:
+            print(f"Skipping unsafe recovered smoke {smoke_dir}: {exc}", flush=True)
+            continue
+    if not eligible:
+        return None
+    selected = eligible[-1]
+    print(
+        f"RECOVERED VERIFIED SMOKE: {selected['prior_run']} "
+        f"family={selected['family']}; skipping repeat 2-epoch GPU job",
+        flush=True,
+    )
+    return selected
+
+
 def paired_diagnostics(candidate_folder: Path, reference_folder: Path) -> dict:
     """Clip-by-clip PESQ improvement against the globally strongest baseline."""
     def load_scores(path):
@@ -544,6 +604,7 @@ def main():
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
     states = initial_families()
+    recovered_smoke = recover_completed_smoke(states)
     champion = max(
         (v for v in states.values() if math.isfinite(v["score"])),
         key=lambda v: v["score"],
@@ -573,7 +634,10 @@ def main():
     run_dir.mkdir(parents=True, exist_ok=False)
     history = read_history()
     rounds = range(1, args.max_rounds + 1) if args.max_rounds else itertools.count(1)
-    family_index, stagnant, errors = 0, 0, 0
+    family_index, stagnant, errors = (
+        FAMILIES.index(recovered_smoke["family"]) if recovered_smoke else 0,
+        0, 0,
+    )
     tried = set()
     if "src/kaggle_train.py" in initial_tracked:
         # This is a copy, never a checkout/reset/overwrite of the V1 trainer.
@@ -615,12 +679,25 @@ def main():
                 "timestamp_utc": datetime.now(timezone.utc).isoformat(),
             }
             try:
-                summary = codex_propose(
-                    codex, workfile=candidate_file, family=family,
-                    champion=champion, family_state=current, history=history,
-                    round_dir=round_dir, model=args.codex_model,
-                )
-                candidate = candidate_file.read_text(encoding="utf-8")
+                if i == 1 and recovered_smoke:
+                    # Use the EXACT source that previously passed the complete
+                    # 164-clip smoke validation; no new Codex edit and no smoke.
+                    candidate = recovered_smoke["source"]
+                    candidate_file.write_text(candidate, encoding="utf-8")
+                    summary = (
+                        "Continue verified prior 2-epoch smoke candidate from "
+                        + recovered_smoke["prior_run"]
+                    )
+                    entry["recovered_smoke"] = recovered_smoke["smoke_dir"]
+                    entry["smoke"] = "verified_prior_run"
+                    print("Using previously validated smoke candidate; no duplicate smoke GPU", flush=True)
+                else:
+                    summary = codex_propose(
+                        codex, workfile=candidate_file, family=family,
+                        champion=champion, family_state=current, history=history,
+                        round_dir=round_dir, model=args.codex_model,
+                    )
+                    candidate = candidate_file.read_text(encoding="utf-8")
                 entry["edits"] = validate_source(candidate, current["source"], family)
                 assert_tracked_unchanged(initial_tracked)
                 entry["source_hash"] = hash_source(candidate)
@@ -630,7 +707,9 @@ def main():
 
                 # First experiment for an untrained architecture receives a
                 # 2-epoch smoke test. Smoke scores can never become champions.
-                if family not in tried and current["checkpoint"] is None:
+                if family not in tried and current["checkpoint"] is None and not (
+                    i == 1 and recovered_smoke
+                ):
                     print(f"ROUND {i} new architecture: 2-epoch smoke first", flush=True)
                     smoke_dir = round_dir / "smoke"
                     smoke_dir.mkdir()
