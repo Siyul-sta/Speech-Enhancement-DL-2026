@@ -96,6 +96,8 @@ class AdaptiveRalphTests(unittest.TestCase):
                 self.assertIn("ralph_v2", folder.parts)
                 self.assertNotIn("ralph_r02", str(folder))
                 self.assertEqual(ref, meta["id"])
+                self.assertEqual(ref, "siyul1122/adaptive-speech-v2-v220261121111111-job-2")
+                self.assertEqual(meta["title"], "Adaptive Speech V2 v220261121111111 job 2")
                 self.assertIn("'epochs': 2", (folder / "run.py").read_text(encoding="utf-8"))
 
     def test_completed_score_requires_checkpoint_and_all_164_rows(self):
@@ -275,6 +277,52 @@ class AdaptiveRalphTests(unittest.TestCase):
                 recon.reconcile("kaggle", state, info, resolve=True)
             self.assertEqual(
                 json.loads(state.read_text(encoding="utf-8"))["status"], "COMPLETE"
+            )
+
+    def test_legacy_wrong_slug_is_resolved_only_from_owned_kaggle_list(self):
+        import reconcile_ralph_v2 as recon
+        from types import SimpleNamespace
+        old = "siyul1122/speech-enhancement-auto-v220261121052503-j0001"
+        actual = "siyul1122/adaptive-speech-v2-v220261121052503-job-1"
+        owned = (
+            "ref       title\n---\n" +
+            actual + "     Adaptive Speech V2 v220261121052503 job 1\n"
+        )
+        with patch.object(
+            recon.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout=owned, stderr="")
+        ) as mocked:
+            found, details = recon.find_actual_ref("kaggle", old)
+        self.assertEqual(found, actual)
+        self.assertIn("Verified exact", details)
+        self.assertEqual(mocked.call_args.args[0], ["kaggle", "kernels", "list", "--mine"])
+        with patch.object(
+            recon.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout="ref  title\n", stderr="")
+        ):
+            found, _ = recon.find_actual_ref("kaggle", old)
+        self.assertIsNone(found)
+
+    def test_legacy_reconcile_read_only_uses_canonical_ref_without_mutating(self):
+        import reconcile_ralph_v2 as recon
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "remote_state.json"
+            old = "siyul1122/speech-enhancement-auto-v220261121052503-j0001"
+            actual = "siyul1122/adaptive-speech-v2-v220261121052503-job-1"
+            info = {"ref": old, "status": "SUBMIT_PENDING"}
+            adaptive.json_write(path, info)
+            def mocked_status(kaggle, ref):
+                if ref == old:
+                    return None, "Permission kernels.get denied"
+                if ref == actual:
+                    return "RUNNING", "KernelWorkerStatus.RUNNING"
+                raise AssertionError("Unexpected ref: " + ref)
+            with patch.object(recon, "status", side_effect=mocked_status), \
+                 patch.object(recon, "find_actual_ref", return_value=(actual, "unique")):
+                recon.reconcile("kaggle", path, info, resolve=False)
+            self.assertEqual(
+                json.loads(path.read_text(encoding="utf-8")),
+                {"ref": old, "status": "SUBMIT_PENDING"}
             )
 
     def test_result_source_persistence(self):
