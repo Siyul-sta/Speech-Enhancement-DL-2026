@@ -176,6 +176,62 @@ class AdaptiveRalphTests(unittest.TestCase):
             self.assertEqual(adaptive.snapshot_existing_tracked_edits(), {})
             adaptive.assert_tracked_unchanged({})
 
+    def test_kaggle_status_transient_404_is_retried_without_resubmitting(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            folder = root / "job"
+            folder.mkdir()
+            result_dir = root / "output"
+            result_dir.mkdir()
+            statuses = [
+                SimpleNamespace(returncode=1, stdout="", stderr="Not Found"),
+                SimpleNamespace(returncode=0, stdout="KernelWorkerStatus.RUNNING", stderr=""),
+                SimpleNamespace(returncode=0, stdout="KernelWorkerStatus.COMPLETE", stderr=""),
+            ]
+            pushes = []
+            def command(argv, **kwargs):
+                if "push" in argv:
+                    pushes.append(argv)
+                if "output" in argv:
+                    (result_dir / "result.json").write_text(
+                        '{"best_validation_pesq_wb": 2.5}', encoding="utf-8"
+                    )
+                return ""
+            with patch.object(adaptive.legacy, "command", side_effect=command), \
+                 patch.object(adaptive.subprocess, "run", side_effect=statuses) as fake_status, \
+                 patch.object(adaptive.time, "sleep"):
+                result = adaptive.poll_adaptive_kernel(
+                    "kaggle", folder, "owner/ref", result_dir,
+                    max_wait_seconds=30, sleep_seconds=0,
+                )
+            self.assertEqual(fake_status.call_count, 3)
+            self.assertEqual(len(pushes), 1)
+            self.assertEqual(result["best_validation_pesq_wb"], 2.5)
+
+    def test_kaggle_status_repeated_failure_blocks_new_submission(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            result_dir = Path(tmp)
+            statuses = [
+                SimpleNamespace(returncode=1, stdout="", stderr="HTTP 404")
+                for _ in range(5)
+            ]
+            pushes = []
+            def command(argv, **kwargs):
+                if "push" in argv:
+                    pushes.append(argv)
+                return ""
+            with patch.object(adaptive.legacy, "command", side_effect=command), \
+                 patch.object(adaptive.subprocess, "run", side_effect=statuses), \
+                 patch.object(adaptive.time, "sleep"):
+                with self.assertRaisesRegex(RuntimeError, "unknown after 5"):
+                    adaptive.poll_adaptive_kernel(
+                        "kaggle", result_dir, "owner/ref", result_dir,
+                        max_wait_seconds=30, sleep_seconds=0,
+                    )
+            self.assertEqual(len(pushes), 1)
+
     def test_result_source_persistence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
