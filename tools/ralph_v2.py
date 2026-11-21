@@ -272,12 +272,52 @@ def cpu_check(candidate_file: Path):
     print("Candidate CPU self-test passed", flush=True)
 
 
+def package_candidate(*, source: str, variant: str, args, run_tag: str, job_id: int, epochs: int):
+    """Write an isolated PRIVATE Kaggle job without overwriting any V1 packages."""
+    config = {
+        "id": variant, "epochs": epochs, "batch_size": args.batch_size,
+        "patience": 7, "seed": 42,
+    }
+    code, config_count = re.subn(
+        r"^EXPERIMENT_CONFIG = .+$",
+        "EXPERIMENT_CONFIG = " + repr(config),
+        source, count=1, flags=re.MULTILINE,
+    )
+    code, dataset_count = re.subn(
+        r"^DATASET_SLUG = .+$", "DATASET_SLUG = " + repr(args.dataset),
+        code, count=1, flags=re.MULTILINE,
+    )
+    if config_count != 1 or dataset_count != 1:
+        raise RuntimeError("Cannot inject Kaggle private-data or experiment configuration")
+    folder = ROOT / "kaggle_run" / "ralph_v2" / run_tag / f"job_{job_id:04d}"
+    folder.mkdir(parents=True, exist_ok=False)
+    (folder / "run.py").write_text(code, encoding="utf-8")
+    ref = f"{args.username}/speech-enhancement-auto-{run_tag}-j{job_id:04d}"
+    metadata = {
+        "id": ref,
+        "title": f"Adaptive Speech V2 {run_tag} job {job_id}",
+        "code_file": "run.py",
+        "language": "python",
+        "kernel_type": "script",
+        "is_private": "true",
+        "enable_gpu": "true",
+        "enable_internet": "true",
+        "machine_shape": "NvidiaTeslaT4",
+        "dataset_sources": [args.dataset],
+        "competition_sources": [],
+        "kernel_sources": [],
+        "model_sources": [],
+    }
+    json_write(folder / "kernel-metadata.json", metadata)
+    return folder, ref
+
+
 def remote_job(kaggle: str, *, source: str, variant: str, args, run_tag: str,
                job_id: int, result_dir: Path, is_smoke: bool):
     epochs = 2 if is_smoke else args.epochs
-    job_dir, ref = legacy.package(
-        job_id, args.dataset, args.username, epochs, args.batch_size,
-        source, variant, run_tag,
+    job_dir, ref = package_candidate(
+        source=source, variant=variant, args=args, run_tag=run_tag,
+        job_id=job_id, epochs=epochs,
     )
     state = result_dir / "remote_state.json"
     json_write(state, {
