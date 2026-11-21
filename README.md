@@ -123,3 +123,24 @@ python src/inference.py --input input --output output --checkpoint checkpoints/b
 - [V2 오프라인 테스트](tests/test_kaggle_v2.py)
 
 V1 학습 및 체크포인트는 유지되며, V2는 별도 비공개 Kaggle 작업과 결과 폴더를 사용합니다. V2는 아직 Kaggle 실행 검증 전이므로 2 Epoch 스모크를 먼저 수행해야 합니다.
+
+## Adaptive Ralph Loop V2: 성능 정체 시 자동 모델 전환
+
+이전 V1 자동화와 다르게, **검증 PESQ가 연속 2회 개선되지 않으면** 모델 계열을 자동으로 전환합니다.
+
+- 새로운 `ResidualPhaseUNet` → 기존 V1 진폭 마스크 → V2 복소수 마스크 순환
+- 계열별 우승 소스/체크포인트 보존, 이전 실험의 성공·실패 및 파일별 PESQ 퇴행 반영
+- Kaggle 비공개 데이터·전체 164개 Validation 평가 유지, GPU 잔여 2시간 보호
+- 무제한 시간 실행 가능하지만 GPU 사용량/반복 오류/안전 가드에 도달하면 중단
+- 이전 `start_until_quota.ps1`은 **자동 모델 전환을 지원하지 않습니다.** 새로운 제어기를 사용해야 합니다.
+
+**실행 가이드:** [Ralph Loop V2](docs/RALPH_V2.md)
+
+```powershell
+cd C:\Users\LG\Speech-Enhancement-DL-2026
+git pull --ff-only
+py -m unittest discover -s tests -p "test_ralph_v2.py" -v
+# 기존 로컬 Ralph 및 Kaggle 원격 작업이 모두 종료된 것 확인 후:
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
+& .\tools\start_adaptive.ps1 -ConfirmedNoRemoteJob
+```
