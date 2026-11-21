@@ -31,7 +31,7 @@ import ralph_loop as legacy
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "runs" / "ralph_v2"
-FAMILIES = ("magnitude", "residual_phase", "complex")
+FAMILIES = ("residual_phase", "magnitude", "complex")
 TEMPLATES = {
     "magnitude": ("src/kaggle_train.py", "SpectrogramUNet", "E02_UNET"),
     "residual_phase": ("src/kaggle_train_v3.py", "ResidualPhaseUNet", "V3_RESIDUAL_PHASE"),
