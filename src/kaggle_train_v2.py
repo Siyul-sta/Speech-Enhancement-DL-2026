@@ -1,0 +1,379 @@
+"""V2: complex-ratio-mask U-Net speech denoising on Kaggle GPUs.
+
+Hypothesis: jointly correcting magnitude and phase can improve over V1's
+nonnegative 0..1 magnitude mask with noisy phase fixed.
+Input: noisy mono 16 kHz WAV only, output: same-length enhanced waveform.
+Train paired noisy/clean, validation clean for evaluation ONLY (164 files).
+Standalone script: model, dataset loader, training/evaluation and artifacts.
+No private WAVs are copied into outputs.
+"""
+from __future__ import annotations
+
+import csv
+import importlib
+import json
+import random
+import subprocess
+import sys
+import time
+import zipfile
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
+import soundfile as sf
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+
+EXPERIMENT_CONFIG = {"id": "V2_CRM_PHASE", "epochs": 25, "batch_size": 4, "patience": 7, "seed": 42}
+DATASET_SLUG = "PRIVATE_DATASET_SLUG"
+SAMPLE_RATE = 16000
+N_FFT = 512
+HOP = 128
+WORK = Path("/kaggle/working") if Path("/kaggle").exists() else Path("local_test_output")
+
+
+def seed_everything(seed: int) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def locate_data_root() -> Path:
+    """Private Kaggle dataset contains one speech-data.zip or unpacked train/val."""
+    if DATASET_SLUG == "PRIVATE_DATASET_SLUG":
+        raise RuntimeError("Configure DATASET_SLUG using tools/kaggle_loop.py first.")
+    slug = DATASET_SLUG.rsplit("/", 1)[-1]
+    mount = Path("/kaggle/input") / slug
+    if not mount.exists():
+        # On some Kaggle runs datasets may be mounted under another parent.
+        # Print a bounded diagnostic before failing rather than silently blaming CUDA.
+        input_root = Path("/kaggle/input")
+        top_levels = sorted(p.name for p in input_root.iterdir()) if input_root.exists() else []
+        print(f"DATASET_MOUNT_DIAGNOSTIC expected={mount} mounted_roots={top_levels[:30]}", flush=True)
+        if input_root.exists():
+            for manifest in input_root.rglob("train/samples.csv"):
+                candidate = manifest.parent.parent
+                if (candidate / "validation/samples.csv").is_file():
+                    print(f"DATASET_MOUNT_DIAGNOSTIC found_alternative_root={candidate}", flush=True)
+                    return candidate
+        raise FileNotFoundError(
+            f"Private dataset not mounted in Kaggle run: {mount}. "
+            "Check notebook Inputs/Add Input and kernel-metadata.json dataset_sources."
+        )
+    if (mount / "train/samples.csv").is_file() and (mount / "validation/samples.csv").is_file():
+        return mount
+    matches = list(mount.rglob("train/samples.csv"))
+    for path in matches:
+        root = path.parent.parent
+        if (root / "validation/samples.csv").is_file():
+            return root
+
+    archives = sorted(mount.glob("*.zip"))
+    if len(archives) != 1:
+        raise RuntimeError(f"Expected one .zip containing train/ and validation/ in {mount}; found {len(archives)}")
+    target = WORK / "speech_data"
+    target.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(archives[0]) as zf:
+        for member in zf.infolist():
+            resolved = (target / member.filename).resolve()
+            if not resolved.is_relative_to(target.resolve()):
+                raise ValueError(f"Unsafe ZIP member path: {member.filename}")
+        zf.extractall(target)
+    for p in [target] + [x.parent.parent for x in target.rglob("train/samples.csv")]:
+        if (p / "train/samples.csv").is_file() and (p / "validation/samples.csv").is_file():
+            return p
+    raise FileNotFoundError("ZIP must contain train/samples.csv and validation/samples.csv")
+
+
+class SpeechPairs(Dataset):
+    def __init__(self, root: Path, split: str):
+        manifest = pd.read_csv(root / split / "samples.csv")
+        for col in ("noisy_path", "clean_path", "segment_id"):
+            if col not in manifest.columns:
+                raise ValueError(f"Missing {col} from {split}/samples.csv")
+        self.manifest = manifest
+        self.noisy = np.empty((len(manifest), 48000), np.float32)
+        self.clean = np.empty((len(manifest), 48000), np.float32)
+        for idx, row in enumerate(manifest.itertuples(index=False)):
+            for col, dest in (("noisy_path", self.noisy), ("clean_path", self.clean)):
+                path = (root / getattr(row, col)).resolve()
+                if not path.is_relative_to(root.resolve()):
+                    raise ValueError("Manifest references file outside the dataset root")
+                y, sr = sf.read(path, dtype="float32", always_2d=True)
+                if sr != SAMPLE_RATE or y.shape != (48000, 1):
+                    raise ValueError(f"Expected 16 kHz, mono, 48000 samples: {path}")
+                dest[idx] = y[:, 0]
+        print(f"{split}: {len(manifest)} pairs loaded", flush=True)
+
+    def __len__(self):
+        return len(self.noisy)
+
+    def __getitem__(self, i):
+        return torch.from_numpy(self.noisy[i]), torch.from_numpy(self.clean[i])
+
+
+class ConvBlock(nn.Module):
+    def __init__(self, input_ch: int, output_ch: int):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(input_ch, output_ch, 3, padding=1),
+            nn.GroupNorm(min(8, output_ch), output_ch),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(output_ch, output_ch, 3, padding=1),
+            nn.GroupNorm(min(8, output_ch), output_ch),
+            nn.ReLU(inplace=True),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
+class ComplexMaskUNet(nn.Module):
+    """Real-valued U-Net predicting a complex ratio mask.
+
+    3 input channels: log magnitude, normalized real, normalized imaginary.
+    2 output channels: real/imag mask residuals, starting at identity.
+    Bounded mask: real in (0,2), imaginary in (-1,1).
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.enc1 = ConvBlock(3, 16)
+        self.enc2 = ConvBlock(16, 32)
+        self.enc3 = ConvBlock(32, 64)
+        self.middle = ConvBlock(64, 96)
+        self.dec3 = ConvBlock(96 + 64, 64)
+        self.dec2 = ConvBlock(64 + 32, 32)
+        self.dec1 = ConvBlock(32 + 16, 16)
+        self.head = nn.Conv2d(16, 2, 1)
+        # Start from unity mask: refined STFT initially equals noisy STFT.
+        nn.init.zeros_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+        self.register_buffer("window", torch.hann_window(N_FFT))
+
+    @staticmethod
+    def upcat(x, shortcut):
+        return torch.cat(
+            [F.interpolate(x, size=shortcut.shape[-2:], mode="bilinear", align_corners=False), shortcut],
+            dim=1,
+        )
+
+    def forward(self, noisy):
+        spec = torch.stft(
+            noisy, n_fft=N_FFT, hop_length=HOP, window=self.window, return_complex=True
+        )
+        mag = spec.abs()
+        inputs = torch.stack(
+            (torch.log1p(mag), spec.real / (mag + 1.0), spec.imag / (mag + 1.0)),
+            dim=1,
+        )
+        a = self.enc1(inputs)
+        b = self.enc2(F.avg_pool2d(a, 2, ceil_mode=True))
+        c = self.enc3(F.avg_pool2d(b, 2, ceil_mode=True))
+        d = self.middle(F.avg_pool2d(c, 2, ceil_mode=True))
+        d = self.dec3(self.upcat(d, c))
+        d = self.dec2(self.upcat(d, b))
+        d = self.dec1(self.upcat(d, a))
+        mask_logits = self.head(d)
+        mask_real = 1.0 + torch.tanh(mask_logits[:, 0])
+        mask_imag = torch.tanh(mask_logits[:, 1])
+        complex_mask = torch.complex(mask_real, mask_imag)
+        return torch.istft(
+            spec * complex_mask,
+            n_fft=N_FFT, hop_length=HOP, window=self.window,
+            length=noisy.shape[-1],
+        )
+
+
+def enhancement_loss(pred, clean, variant: str):
+    """Phase-aware complex STFT + multi-resolution magnitude + waveform losses."""
+    resolutions = ((256, 64), (512, 128), (1024, 256))
+    spec_loss = pred.new_zeros(())
+    complex_loss = pred.new_zeros(())
+    for size, hop in resolutions:
+        window = torch.hann_window(size, device=pred.device, dtype=pred.dtype)
+        a = torch.stft(pred, size, hop_length=hop, window=window, return_complex=True)
+        b = torch.stft(clean, size, hop_length=hop, window=window, return_complex=True)
+        spec_loss = spec_loss + F.l1_loss(torch.log1p(a.abs()), torch.log1p(b.abs()))
+        if size == 512:
+            complex_delta = torch.view_as_real(a - b)
+            normalizer = b.abs().mean().detach().clamp_min(0.1)
+            complex_loss = complex_delta.abs().mean() / normalizer
+    loss = (
+        0.20 * F.l1_loss(pred, clean)
+        + 0.60 * spec_loss / len(resolutions)
+        + 0.20 * complex_loss
+    )
+    if variant == "V2_CRM_SISDR":
+        clean_centered = clean - clean.mean(dim=-1, keepdim=True)
+        pred_centered = pred - pred.mean(dim=-1, keepdim=True)
+        projection = (
+            (pred_centered * clean_centered).sum(dim=-1, keepdim=True)
+            / clean_centered.square().sum(dim=-1, keepdim=True).clamp_min(1e-8)
+        ) * clean_centered
+        noise_residue = pred_centered - projection
+        ratio = (projection.square().sum(dim=-1) + 1e-8) / (
+            noise_residue.square().sum(dim=-1) + 1e-8
+        )
+        si_sdr = 10.0 * torch.log10(ratio)
+        loss = loss - 0.01 * si_sdr.mean()
+    return loss
+
+def ensure_pesq():
+    try:
+        return importlib.import_module("pesq").pesq
+    except ImportError:
+        print("Installing pesq==0.0.4 (Kaggle Internet must be enabled)", flush=True)
+        subprocess.run([sys.executable, "-m", "pip", "install", "-q", "pesq==0.0.4"], check=True)
+        return importlib.import_module("pesq").pesq
+
+
+@torch.no_grad()
+def evaluate(model, loader, device, pesq_function, save_rows=False):
+    model.eval()
+    values, rows, index = [], [], 0
+    for noisy, clean in loader:
+        pred = model(noisy.to(device)).cpu().numpy()
+        noisy_np, clean_np = noisy.numpy(), clean.numpy()
+        for j in range(len(pred)):
+            # Match the output WAV's PCM16 domain when scoring.
+            wave = np.clip(pred[j], -1.0, 1.0)
+            reference = np.clip(clean_np[j], -1.0, 1.0)
+            score = float(pesq_function(SAMPLE_RATE, reference, wave, "wb"))
+            if not np.isfinite(score):
+                raise RuntimeError(f"Non-finite PESQ at validation file {index}")
+            values.append(score)
+            if save_rows:
+                rows.append([index, score])
+            index += 1
+    if index != len(loader.dataset):
+        raise RuntimeError("Validation is incomplete")
+    return float(np.mean(values)), rows
+
+
+def write_csv(path: Path, fields, records):
+    with path.open("w", newline="", encoding="utf-8") as f:
+        writer = csv.writer(f)
+        writer.writerow(fields)
+        writer.writerows(records)
+
+
+def run():
+    cfg = EXPERIMENT_CONFIG
+    variant = cfg["id"]
+    if variant not in ("V2_CRM_PHASE", "V2_CRM_SISDR"):
+        raise ValueError(f"Unknown experiment: {variant}")
+    WORK.mkdir(parents=True, exist_ok=True)
+    seed_everything(int(cfg["seed"]))
+    print(
+        f"CUDA_DIAGNOSTIC torch={torch.__version__} "
+        f"cuda_build={torch.version.cuda} "
+        f"cuda_available={torch.cuda.is_available()} "
+        f"device_count={torch.cuda.device_count()}",
+        flush=True,
+    )
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda" and Path("/kaggle").exists():
+        raise RuntimeError("Kaggle GPU unavailable; refusing CPU full training")
+    print(f"EXPERIMENT={variant} device={device} seed={cfg['seed']}", flush=True)
+
+    root = locate_data_root()
+    train_set = SpeechPairs(root, "train")
+    val_set = SpeechPairs(root, "validation")
+    train_loader = DataLoader(
+        train_set, batch_size=cfg["batch_size"], shuffle=True, num_workers=0
+    )
+    val_loader = DataLoader(
+        val_set, batch_size=cfg["batch_size"], shuffle=False, num_workers=0
+    )
+    pesq_function = ensure_pesq()
+    model = ComplexMaskUNet().to(device)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00035, weight_decay=0.0001)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
+    )
+    best_score, best_epoch, stale = float("-inf"), 0, 0
+    history = []
+    started = time.monotonic()
+    for epoch in range(1, int(cfg["epochs"]) + 1):
+        model.train()
+        losses = []
+        for noisy, clean in train_loader:
+            noisy, clean = noisy.to(device), clean.to(device)
+            optimizer.zero_grad(set_to_none=True)
+            pred = model(noisy)
+            loss = enhancement_loss(pred, clean, variant)
+            if not torch.isfinite(loss):
+                raise RuntimeError(f"Non-finite train loss at epoch={epoch}")
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+            optimizer.step()
+            losses.append(float(loss.detach()))
+        scheduler.step()
+        val_pesq, _ = evaluate(model, val_loader, device, pesq_function)
+        if val_pesq > best_score + 0.001:
+            best_score, best_epoch, stale = val_pesq, epoch, 0
+            torch.save(model.state_dict(), WORK / "best_model.pt")
+        else:
+            stale += 1
+        history.append([epoch, float(np.mean(losses)), val_pesq, best_score, stale])
+        write_csv(WORK / "history.csv",
+                  ["epoch", "train_loss", "validation_pesq_wb", "best_pesq_wb", "stale_epochs"],
+                  history)
+        print(f"epoch={epoch} loss={np.mean(losses):.5f} val_pesq={val_pesq:.4f} best={best_score:.4f}", flush=True)
+        if epoch >= 5 and stale >= int(cfg["patience"]):
+            break
+
+    model.load_state_dict(torch.load(WORK / "best_model.pt", map_location=device, weights_only=True))
+    best_score, rows = evaluate(model, val_loader, device, pesq_function, save_rows=True)
+    write_csv(WORK / "validation_per_file.csv", ["index", "pesq_wb"], rows)
+    result = {
+        "experiment": variant,
+        "best_epoch": best_epoch,
+        "epochs_completed": len(history),
+        "best_validation_pesq_wb": best_score,
+        "validation_files": len(val_set),
+        "baseline_validation_pesq_wb": 1.6961209534144983,
+        "delta_over_baseline": best_score - 1.6961209534144983,
+        "seed": cfg["seed"],
+        "elapsed_seconds": round(time.monotonic() - started, 2),
+        "model": "ComplexMaskUNet",
+        "architecture": "3-channel complex STFT input, 2-channel complex ratio mask",
+        "optimizer": "AdamW+CosineAnnealingLR",
+        "loss_variant": variant,
+        "checkpoint": "best_model.pt",
+    }
+    (WORK / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    print("FINAL_RESULT " + json.dumps(result, ensure_ascii=False), flush=True)
+
+
+def self_test():
+    torch.manual_seed(42)
+    model = ComplexMaskUNet()
+    noisy = torch.randn(1, 4096) * 0.1
+    clean = noisy * 0.9
+    output = model(noisy)
+    assert output.shape == noisy.shape
+    assert torch.isfinite(output).all()
+    # With zero-initialized complex mask head, initial output matches noisy.
+    assert torch.allclose(output, noisy, atol=1e-4, rtol=1e-4)
+    for variant in ("V2_CRM_PHASE", "V2_CRM_SISDR"):
+        model.zero_grad(set_to_none=True)
+        loss = enhancement_loss(output, clean, variant)
+        assert torch.isfinite(loss)
+        loss.backward(retain_graph=True)
+        assert any(p.grad is not None and torch.isfinite(p.grad).all()
+                   for p in model.parameters())
+    print("SELF_TEST_PASSED: noisy-only shape, identity init, finite loss and gradients")
+
+
+if __name__ == "__main__":
+    if "--self-test" in sys.argv:
+        self_test()
+    else:
+        run()
