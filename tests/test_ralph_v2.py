@@ -325,6 +325,67 @@ class AdaptiveRalphTests(unittest.TestCase):
                 {"ref": old, "status": "SUBMIT_PENDING"}
             )
 
+    def test_recovered_completed_smoke_skips_duplicate_gpu(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            run = root / "run_v220261121052503"
+            round_dir = run / "round_0001"
+            smoke = round_dir / "smoke"
+            smoke.mkdir(parents=True)
+            bestsource = run / "families" / "residual_phase" / "best_source.py"
+            bestsource.parent.mkdir(parents=True)
+            baseline = (ROOT / "src" / "kaggle_train_v3.py").read_text(encoding="utf-8")
+            candidate = baseline.replace(
+                "phase_delta = 0.5 * torch.tanh",
+                "phase_delta = 0.4 * torch.tanh",
+            )
+            self.assertNotEqual(candidate, baseline)
+            bestsource.write_text(baseline, encoding="utf-8")
+            (round_dir / "candidate.py").write_text(candidate, encoding="utf-8")
+            adaptive.json_write(smoke / "remote_state.json", {
+                "ref": "siyul1122/adaptive-speech-v2-v220261121052503-job-1",
+                "status": "COMPLETE", "epochs": 2
+            })
+            adaptive.json_write(smoke / "result.json", {
+                "best_validation_pesq_wb": 1.8654,
+                "experiment": "V3_RESIDUAL_PHASE",
+                "model": "ResidualPhaseUNet",
+                "validation_files": 164,
+                "epochs_completed": 2,
+            })
+            (smoke / "best_model.pt").write_bytes(b"test")
+            (smoke / "validation_per_file.csv").write_text(
+                "index,pesq_wb\n" +
+                "".join(f"{i},1.8654\n" for i in range(164)), encoding="utf-8"
+            )
+            state = {
+                "residual_phase": {
+                    "checkpoint": None, "score": float("-inf"),
+                    "source": baseline,
+                    "variant": "V3_RESIDUAL_PHASE"
+                }
+            }
+            with patch.object(adaptive, "OUTPUT", root):
+                reused = adaptive.recover_completed_smoke(state)
+                self.assertIsNotNone(reused)
+                self.assertEqual(reused["source"], candidate)
+                self.assertEqual(reused["family"], "residual_phase")
+                # A known completed smoke must not be selected if a full
+                # run was even prepared, since its status may be ambiguous.
+                (round_dir / "full").mkdir()
+                self.assertIsNone(adaptive.recover_completed_smoke(state))
+
+    def test_smoke_requires_confirmed_completion_not_pending(self):
+        with tempfile.TemporaryDirectory() as temp:
+            smoke = Path(temp) / "run_test" / "round_0001" / "smoke"
+            smoke.mkdir(parents=True)
+            adaptive.json_write(
+                smoke / "remote_state.json",
+                {"ref": "owner/smoke", "status": "SUBMIT_PENDING", "epochs": 2}
+            )
+            with patch.object(adaptive, "OUTPUT", Path(temp)):
+                self.assertIsNone(adaptive.recover_completed_smoke({}))
+
     def test_result_source_persistence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
