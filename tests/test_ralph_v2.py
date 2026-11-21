@@ -147,6 +147,35 @@ class AdaptiveRalphTests(unittest.TestCase):
                 adaptive.json_write(path, {"ref": "test", "status": "COMPLETE"})
                 adaptive.no_uncertain_prior_jobs()
 
+    def test_preexisting_modified_v1_trainer_is_preserved(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            trainer = root / "src" / "kaggle_train.py"
+            trainer.parent.mkdir(parents=True)
+            trainer.write_text("modified historical champion source", encoding="utf-8")
+            with patch.object(adaptive, "ROOT", root), patch.object(
+                adaptive.legacy, "current_modified_paths", return_value={"src/kaggle_train.py"}
+            ):
+                snapshot = adaptive.snapshot_existing_tracked_edits()
+                self.assertEqual(set(snapshot), {"src/kaggle_train.py"})
+                adaptive.assert_tracked_unchanged(snapshot)
+                self.assertEqual(trainer.read_text(encoding="utf-8"),
+                                 "modified historical champion source")
+                trainer.write_text("unexpected external edit", encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "Tracked working-tree changes"):
+                    adaptive.assert_tracked_unchanged(snapshot)
+
+    def test_unrelated_tracked_edits_are_still_rejected(self):
+        with patch.object(
+            adaptive.legacy, "current_modified_paths",
+            return_value={"src/kaggle_train.py", "README.md"}
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Unrelated tracked changes"):
+                adaptive.snapshot_existing_tracked_edits()
+        with patch.object(adaptive.legacy, "current_modified_paths", return_value=set()):
+            self.assertEqual(adaptive.snapshot_existing_tracked_edits(), {})
+            adaptive.assert_tracked_unchanged({})
+
     def test_result_source_persistence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
