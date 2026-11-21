@@ -143,6 +143,30 @@ py tools/reconcile_ralph_v2.py --resolve
 
 이전 실행이 스모크 단계에서 끝났다면 자동화 새 실행은 **새로운 가설과 새로운 2 Epoch 스모크로 시작**할 수 있습니다. 이전 스모크 파일은 보존하지만 동일 후보를 자동 재사용하진 않습니다.
 
+## 완료된 V3 2 Epoch 스모크 재사용 (2026-11-21)
+
+`run_v220261121052503/round_0001/smoke`의 Kaggle 테스트가 완료되었고 `V3_RESIDUAL_PHASE`의 2 Epoch PESQ-WB는 **1.8653953**입니다. 이는 정상 작동 검증이며 25 Epoch 성능으로 간주하지 않습니다. 이 파일들은 앞서 `reconcile_ralph_v2.py --resolve`로 164개 Validation 점수와 체크포인트까지 확인되었습니다.
+
+Adaptive 제어기 최신 버전은 **완료된 스모크 기록이 있고 해당 후보의 전체 학습이 제출된 적이 없으면** `candidate.py`를 안전하게 복원하여 **다음 실행의 첫 라운드에서 바로 25 Epoch 본 학습**을 시작합니다. 같은 2 Epoch GPU 스모크를 다시 제출하지 않습니다.
+
+복원 전 검사:
+- `smoke/remote_state.json`이 `COMPLETE`
+- `result.json`이 `V3_RESIDUAL_PHASE`, 정확히 2 Epoch, Validation 164개
+- 164개 PESQ 파일, 스모크 체크포인트 존재
+- 당시 생성된 `round_0001/candidate.py`가 보호된 데이터/평가/훈련 코드를 변경하지 않음
+- 이전 `round_0001/full` 폴더가 존재하지 않음 (중복 제출 방지)
+- 동일 계열에 이미 채택한 25 Epoch 모델이 없는 경우
+
+로그에서 다음을 확인할 수 있습니다.
+
+```text
+RECOVERED VERIFIED SMOKE: ... family=residual_phase; skipping repeat 2-epoch GPU job
+Using previously validated smoke candidate; no duplicate smoke GPU
+ROUND 1: model family=residual_phase ...
+```
+
+**중요:** 스모크에서 학습된 2 Epoch *가중치*를 이어 학습하지는 않습니다. 검증을 통과한 *코드 및 실험 설정*을 그대로 사용해서 25 Epoch를 새로 학습합니다. 25 Epoch 결과가 검증되면 기존 2.4043과 비교 후 자동 개선 루프가 다음 모델/가설로 진행합니다.
+
 ## 설치·테스트
 
 ```powershell
