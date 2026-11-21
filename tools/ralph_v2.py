@@ -341,7 +341,7 @@ def no_uncertain_prior_jobs() -> None:
             value = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             raise RuntimeError(f"Unparseable prior remote state: {path}")
-        if value.get("status") != "COMPLETE":
+        if value.get("status") not in ("COMPLETE", "ERROR_TERMINAL"):
             raise RuntimeError(
                 f"Unresolved previous Kaggle job {value.get('ref')} ({path}); "
                 "inspect Kaggle manually before starting new work."
@@ -553,6 +553,14 @@ def main():
             except Exception as exc:
                 entry.update({"status": "ERROR", "error": str(exc)})
                 (round_dir / "error.txt").write_text(repr(exc), encoding="utf-8")
+                if isinstance(exc, legacy.KaggleTerminalFailure):
+                    # Kaggle returned a terminal ERROR/CANCELLED state: safe to
+                    # retry a different hypothesis without an orphan-job alarm.
+                    for status_file in round_dir.glob("*/remote_state.json"):
+                        status = json.loads(status_file.read_text(encoding="utf-8"))
+                        if status.get("status") == "SUBMIT_PENDING":
+                            status["status"] = "ERROR_TERMINAL"
+                            json_write(status_file, status)
                 if submitted and not isinstance(exc, legacy.KaggleTerminalFailure):
                     append_history(run_dir / "experiments.jsonl", entry)
                     print(
