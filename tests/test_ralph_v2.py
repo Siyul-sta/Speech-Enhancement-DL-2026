@@ -24,7 +24,7 @@ spec.loader.exec_module(adaptive)
 class AdaptiveRalphTests(unittest.TestCase):
     def test_three_distinct_model_families(self):
         self.assertEqual(
-            adaptive.FAMILIES, ("magnitude", "residual_phase", "complex")
+            adaptive.FAMILIES, ("residual_phase", "magnitude", "complex")
         )
         models = [adaptive.TEMPLATES[x][1] for x in adaptive.FAMILIES]
         self.assertEqual(len(set(models)), 3)
