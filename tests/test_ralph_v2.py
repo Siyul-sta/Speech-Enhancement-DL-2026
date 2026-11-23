@@ -386,6 +386,69 @@ class AdaptiveRalphTests(unittest.TestCase):
             with patch.object(adaptive, "OUTPUT", Path(temp)):
                 self.assertIsNone(adaptive.recover_completed_smoke({}))
 
+    def test_recovered_full_job_becomes_champion_without_gpu_submit(self):
+        from types import SimpleNamespace
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "runs" / "ralph_v2"
+            tag = "v220261121054951"
+            rundir = output / ("run_" + tag)
+            trial = rundir / "round_0005"
+            full = trial / "full"
+            full.mkdir(parents=True)
+            base = (ROOT / "src" / "kaggle_train_v3.py").read_text(encoding="utf-8")
+            candidate = base.replace("phase_delta = 0.5 * torch.tanh",
+                                     "phase_delta = 0.4 * torch.tanh")
+            self.assertNotEqual(base, candidate)
+            (trial / "candidate.py").write_text(candidate, encoding="utf-8")
+            best_source = rundir / "families" / "residual_phase" / "best_source.py"
+            best_source.parent.mkdir(parents=True)
+            best_source.write_text(base, encoding="utf-8")
+            args = SimpleNamespace(
+                username="siyul1122",
+                dataset="siyul1122/speech-data-private",
+                batch_size=4,
+            )
+            with patch.object(adaptive, "ROOT", root):
+                job_folder, ref = adaptive.package_candidate(
+                    source=candidate, variant="V3_RESIDUAL_PHASE",
+                    args=args, run_tag=tag, job_id=10, epochs=25,
+                )
+            adaptive.json_write(full / "remote_state.json", {
+                "status": "COMPLETE", "ref": ref, "epochs": 25
+            })
+            adaptive.json_write(full / "result.json", {
+                "experiment": "V3_RESIDUAL_PHASE",
+                "model": "ResidualPhaseUNet",
+                "best_validation_pesq_wb": 2.48,
+                "validation_files": 164, "epochs_completed": 25,
+            })
+            (full / "best_model.pt").write_bytes(b"dummy checkpoint")
+            (full / "validation_per_file.csv").write_text(
+                "index,pesq_wb\n" +
+                "".join(f"{i},2.48\n" for i in range(164)),
+                encoding="utf-8",
+            )
+            baseline_state = {
+                "residual_phase": {
+                    "score": 2.329, "checkpoint": "previous.pt",
+                    "source": base, "variant": "V3_RESIDUAL_PHASE"
+                }
+            }
+            with patch.object(adaptive, "ROOT", root), \
+                 patch.object(adaptive, "OUTPUT", output):
+                recovered = adaptive.recovered_full_runs(baseline_state)
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["status"], "RECOVERED_COMPLETE")
+            self.assertAlmostEqual(baseline_state["residual_phase"]["score"], 2.48)
+            self.assertEqual(baseline_state["residual_phase"]["source"], candidate)
+            # Do not trust a tampered package, even if the downloaded PESQ
+            # artifacts and checkpoint still exist.
+            (job_folder / "run.py").write_text("print('tampered')", encoding="utf-8")
+            with patch.object(adaptive, "ROOT", root), \
+                 patch.object(adaptive, "OUTPUT", output):
+                self.assertEqual(adaptive.recovered_full_runs(baseline_state), [])
+
     def test_result_source_persistence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
