@@ -13,6 +13,7 @@ import json
 import math
 from pathlib import Path
 import re
+import webbrowser
 from urllib.parse import urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -222,6 +223,10 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", args.port), Handler)
     print("Ralph dashboard: http://127.0.0.1:%d" % args.port, flush=True)
     print("Read-only. Press Ctrl+C to close the dashboard server.", flush=True)
+    try:
+        webbrowser.open("http://127.0.0.1:%d" % args.port)
+    except Exception:
+        pass
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
