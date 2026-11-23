@@ -40,6 +40,11 @@ try {
     if ($LASTEXITCODE -ne 0) { throw "Adaptive offline tests failed; no GPU job submitted." }
     & py -m unittest discover -s tests -p "test_kaggle_v2.py" -v
     if ($LASTEXITCODE -ne 0) { throw "V2 architecture tests failed; no GPU job submitted." }
+    Write-Host "Checking interrupted Kaggle jobs and recovering verified terminal results..."
+    & py tools/reconcile_ralph_v2.py --resolve
+    if ($LASTEXITCODE -ne 0) {
+        throw "Remote recovery failed; no new GPU job submitted."
+    }
     $RalphArgs = @(
         "tools/ralph_v2.py",
         "--username", "siyul1122",
