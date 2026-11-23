@@ -295,14 +295,16 @@ def collect():
     if latest and active_round is not None:
         try:
             round_dir = latest / ("round_%04d" % int(active_round))
-            for file in (round_dir / "full" / "result.json",
-                         round_dir / "smoke" / "result.json"):
-                data = read_json(file)
-                if isinstance(data, dict):
-                    if epoch is None:
-                        epoch = data.get("epochs_completed")
-                    total = total or data.get("epochs_completed")
-                    break
+            # Never display a completed 2-epoch smoke result as the progress
+            # of the current full 25-epoch GPU job.
+            mode = "smoke" if stage == "smoke" else "full"
+            if job and job[0] == int(active_round):
+                mode = job[2].parent.name
+            data = read_json(round_dir / mode / "result.json")
+            if isinstance(data, dict):
+                if epoch is None:
+                    epoch = data.get("epochs_completed")
+                total = total or data.get("epochs_completed")
         except (ValueError, TypeError, OverflowError):
             pass
     return {
