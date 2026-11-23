@@ -11,6 +11,10 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import math
+import shutil
+import subprocess
+import threading
+import time
 from pathlib import Path
 import re
 import webbrowser
@@ -40,6 +44,99 @@ def number(value):
         return v if math.isfinite(v) else None
     except (TypeError, ValueError):
         return None
+
+
+
+# Read-only Kaggle observations are cached to avoid making a remote API call
+# on every browser refresh. The UI does not submit/stop any GPU work.
+_STATUS_CACHE = {}
+_LOG_CACHE = {}
+_REMOTE_LOCK = threading.Lock()
+_REMOTE_TTL = 35.0
+_SAFE_REF = re.compile(r"^[A-Za-z0-9_-]+/[A-Za-z0-9_-]+$")
+
+
+def _cached_kaggle_probe(ref, command, cache, extractor):
+    if not isinstance(ref, str) or len(ref) > 180 or not _SAFE_REF.fullmatch(ref):
+        return None
+    with _REMOTE_LOCK:
+        now = time.monotonic()
+        previous = cache.get(ref)
+        if previous is not None and now - previous[0] < _REMOTE_TTL:
+            return previous[1]
+        cli = shutil.which("kaggle")
+        value = None
+        if cli:
+            try:
+                proc = subprocess.run(
+                    [cli, "kernels", command, ref],
+                    capture_output=True, text=True, timeout=12, check=False,
+                    cwd=ROOT,
+                )
+                if proc.returncode == 0:
+                    value = extractor(proc.stdout or "")
+            except (OSError, subprocess.TimeoutExpired, ValueError):
+                value = None
+        cache[ref] = (time.monotonic(), value)
+        return value
+
+
+def kaggle_worker_status(ref):
+    def extract(output):
+        match = re.search(r"KernelWorkerStatus\.([A-Z_]+)", output)
+        return match.group(1) if match else None
+    return _cached_kaggle_probe(ref, "status", _STATUS_CACHE, extract)
+
+
+def kaggle_live_epoch(ref):
+    def extract(output):
+        matches = re.findall(
+            r"epoch=(\d+)\s+loss=[0-9.eE+-]+\s+val_pesq=([0-9.]+)",
+            output[-250000:],
+        )
+        if not matches:
+            return None
+        epoch, pesq = matches[-1]
+        value = number(pesq)
+        if 0 < int(epoch) <= 1000 and value is not None:
+            return {"epoch": int(epoch), "pesq": value}
+        return None
+    return _cached_kaggle_probe(ref, "logs", _LOG_CACHE, extract)
+
+
+def most_recent_job(run):
+    if not run:
+        return None
+    options = []
+    for path in run.glob("round_*/**/remote_state.json"):
+        info = read_json(path)
+        if not isinstance(info, dict):
+            continue
+        try:
+            round_id = int(path.parent.parent.name.removeprefix("round_"))
+        except ValueError:
+            continue
+        mode = path.parent.name
+        priority = 1 if mode == "full" else 0
+        options.append((round_id, priority, path, info))
+    return max(options, key=lambda x: (x[0], x[1])) if options else None
+
+
+def infer_family(run, round_id):
+    if not run or round_id is None:
+        return ""
+    source_path = run / ("round_%04d" % round_id) / "candidate.py"
+    try:
+        code = source_path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError):
+        return ""
+    if "class ResidualPhaseUNet(" in code:
+        return "residual_phase"
+    if "class ComplexMaskUNet(" in code:
+        return "complex"
+    if "class SpectrogramUNet(" in code:
+        return "magnitude"
+    return ""
 
 
 def log_tail():
@@ -146,19 +243,58 @@ def collect():
         stage = "offline"
     ref = str(state.get("ref", ""))[:150]
     remote = str(state.get("remote_status", ""))[:30]
-    if latest and not remote:
-        jobs = sorted(latest.glob("round_*/**/remote_state.json"))
-        if jobs:
-            last = read_json(jobs[-1])
-            if isinstance(last, dict):
-                remote = str(last.get("status", ""))[:40]
-                ref = ref or str(last.get("ref", ""))[:150]
+    family = str(state.get("family", ""))[:40]
+    active_round = state.get("round")
+    message = str(state.get("message", ""))[:200]
+    remote_live = False
+    remote_checked = False
+
+    # Older controllers do not publish ui_state.json. Recover the current
+    # experiment from the last persisted submission instead of claiming idle.
+    job = most_recent_job(latest)
+    if job:
+        round_id, _, path, info = job
+        ref = ref or str(info.get("ref", ""))[:150]
+        active_round = active_round if active_round is not None else round_id
+        family = family or infer_family(latest, round_id)
+        local_status = str(info.get("status", ""))[:36]
+        if not remote:
+            remote = local_status
+        if local_status == "SUBMIT_PENDING":
+            actual = kaggle_worker_status(str(info.get("ref", "")))
+            remote_checked = True
+            if actual:
+                remote = actual
+                remote_live = actual in ("RUNNING", "QUEUED", "PENDING", "INITIALIZING")
+                if not alive:
+                    if actual in ("RUNNING", "QUEUED", "PENDING", "INITIALIZING"):
+                        stage = "training" if path.parent.name == "full" else "smoke"
+                        message = "Kaggle 작업 %s · 로컬 제어기 상태는 미확인" % actual
+                    elif actual == "COMPLETE":
+                        stage = "recover"
+                        message = "Kaggle 학습 완료 · 로컬 결과 회수 필요"
+                    elif actual in ("ERROR", "CANCELLED", "CANCELED"):
+                        stage = "error"
+                        message = "Kaggle 원격 작업 종료/실패 · 로그 확인 필요"
+            elif not alive:
+                stage = "checking"
+                message = "원격 작업 조회 불가 · 실행/중단 여부 확인 필요"
+        elif not alive and stage == "offline" and local_status == "COMPLETE":
+            stage = "complete"
+            message = "마지막 Kaggle 작업 완료 · 새 실행은 확인되지 않음"
     epoch = number(state.get("current_epoch"))
     total = state.get("epochs")
     live_pesq = number(state.get("live_pesq"))
-    if latest and state.get("round") is not None:
+    if remote_live and remote == "RUNNING" and epoch is None:
+        progress = kaggle_live_epoch(ref)
+        if progress:
+            epoch = progress["epoch"]
+            live_pesq = progress["pesq"]
+            if total is None:
+                total = info.get("epochs") if job else None
+    if latest and active_round is not None:
         try:
-            round_dir = latest / ("round_%04d" % int(state["round"]))
+            round_dir = latest / ("round_%04d" % int(active_round))
             for file in (round_dir / "full" / "result.json",
                          round_dir / "smoke" / "result.json"):
                 data = read_json(file)
@@ -171,9 +307,9 @@ def collect():
             pass
     return {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "alive": alive, "stage": stage, "message": str(state.get("message", ""))[:200],
-        "family": str(state.get("family", ""))[:40],
-        "round": state.get("round"), "ref": ref, "remote": remote,
+        "alive": alive, "remoteLive": remote_live, "remoteChecked": remote_checked,
+        "stage": stage, "message": message, "family": family,
+        "round": active_round, "ref": ref, "remote": remote,
         "run": latest.name if latest else "No runs yet",
         "updated": updated,
         "epoch": epoch, "total": total, "livePESQ": live_pesq,
