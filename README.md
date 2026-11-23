@@ -144,3 +144,18 @@ py -m unittest discover -s tests -p "test_ralph_v2.py" -v
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force
 & .\tools\start_adaptive.ps1 -ConfirmedNoRemoteJob
 ```
+
+
+## Ralph Speech Lab — 실시간 웹 대시보드
+
+Adaptive Ralph Loop V2의 현재 라운드, Codex→Kaggle 단계, 최고 PESQ-WB, 모델 계열별 최고 성능, 검증 점수 그래프와 실행 로그를 브라우저에서 확인할 수 있습니다. [사용 방법과 스크린별 설명](docs/RALPH_DASHBOARD.md)
+
+기존 Ralph를 실행 중이라면 새 PowerShell 창에서 **모니터링만** 시작하세요 (GPU 작업 추가 제출 없음).
+
+~~~powershell
+cd C:\Users\LG\Speech-Enhancement-DL-2026
+git pull --ff-only
+& .\tools\start_dashboard.ps1
+~~~
+
+브라우저 주소는 http://127.0.0.1:8765 이며, Ralph의 새 실행은 기존 명령인 tools/start_adaptive.ps1 -ConfirmedNoRemoteJob을 사용하면 대시보드도 함께 자동으로 켜집니다. 이미 실행 중인 기존 GPU 작업을 강제로 중단하지 마세요.
