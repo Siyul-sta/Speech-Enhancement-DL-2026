@@ -509,6 +509,34 @@ def package_candidate(*, source: str, variant: str, args, run_tag: str, job_id: 
     return folder, ref
 
 
+def read_running_epoch(kaggle: str, ref: str):
+    """Optional observation of genuine Epoch/PESQ from Kaggle stdout.
+
+    Failure never affects the training job, validation result or retry budget.
+    Do not download private audio. Only return the public scalar log fields.
+    """
+    try:
+        proc = subprocess.run(
+            [str(kaggle), "kernels", "logs", ref],
+            cwd=ROOT, text=True, capture_output=True,
+            timeout=20, check=False,
+        )
+        if proc.returncode != 0:
+            return None
+        found = re.findall(
+            r"epoch=(\d+)\s+loss=[0-9.eE+-]+\s+val_pesq=([0-9.]+)",
+            (proc.stdout or "")[-250000:],
+        )
+        if not found:
+            return None
+        epoch, val = found[-1]
+        if int(epoch) <= 0 or not math.isfinite(float(val)):
+            return None
+        return {"current_epoch": int(epoch), "live_pesq": float(val)}
+    except (subprocess.TimeoutExpired, OSError, ValueError, OverflowError):
+        return None
+
+
 def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
                          result_folder: Path, max_wait_seconds: int,
                          *, sleep_seconds: float = 60,
@@ -568,6 +596,10 @@ def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
                     failed = 0
                     if status_hook:
                         status_hook(status.group(1))
+                        if status.group(1) == "RUNNING":
+                            current = read_running_epoch(kaggle, ref)
+                            if current:
+                                status_hook(status.group(1), **current)
                     print(f"Kaggle remote status={status.group(1)}: {ref}", flush=True)
         if failed:
             print(
@@ -608,7 +640,9 @@ def remote_job(kaggle: str, *, source: str, variant: str, args, run_tag: str,
     result = poll_adaptive_kernel(
         kaggle, job_dir, ref, result_dir, args.max_job_minutes * 60,
         status_hook=(
-            (lambda status: progress_cb(ref=ref, remote_status=status, epochs=epochs))
+            (lambda status, **updates: progress_cb(
+                ref=ref, remote_status=status, epochs=epochs, **updates
+            ))
             if progress_cb else None
         ),
     )
@@ -981,8 +1015,12 @@ def main():
         stop_heartbeat.set()
         heartbeat.join(timeout=2)
         dashboard_event(
-            run_dir, "stopped",
-            message=f"Ralph 실행 종료 · 최고 PESQ {champion['score']:.4f}",
+            run_dir, "error" if sys.exc_info()[0] else "stopped",
+            message=(
+                f"오류 또는 중단 · 마지막 최고 PESQ {champion['score']:.4f}"
+                if sys.exc_info()[0] else
+                f"실험 종료 · 마지막 최고 PESQ {champion['score']:.4f}"
+            ),
             remote_status="FINISHED",
         )
         save_state(run_dir, states, champion)
