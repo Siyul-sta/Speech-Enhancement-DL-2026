@@ -162,6 +162,31 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(result["total"], 25)
             self.assertEqual(result["livePESQ"], 2.204)
 
+    def test_ongoing_full_run_never_uses_old_smoke_epoch(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "runs" / "ralph_v2"
+            round_dir = output / "run_v220261123064255" / "round_0001"
+            full = round_dir / "full"
+            smoke = round_dir / "smoke"
+            full.mkdir(parents=True)
+            smoke.mkdir(parents=True)
+            (full / "remote_state.json").write_text(
+                json.dumps({"ref": "siyul1122/kernel", "status": "SUBMIT_PENDING",
+                            "epochs": 25}), encoding="utf-8"
+            )
+            (smoke / "result.json").write_text(
+                json.dumps({"epochs_completed": 2}), encoding="utf-8"
+            )
+            with patch.object(dashboard, "ROOT", root), \
+                 patch.object(dashboard, "OUTPUT", output), \
+                 patch.object(dashboard, "kaggle_worker_status", return_value="RUNNING"), \
+                 patch.object(dashboard, "kaggle_live_epoch", return_value=None):
+                result = dashboard.collect()
+            self.assertEqual(result["stage"], "training")
+            self.assertIsNone(result["epoch"])
+            self.assertIsNone(result["total"])
+
     def test_legacy_pending_remote_complete_does_not_fake_training(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
