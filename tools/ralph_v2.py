@@ -572,9 +572,10 @@ def remote_job(kaggle: str, *, source: str, variant: str, args, run_tag: str,
     result = poll_adaptive_kernel(
         kaggle, job_dir, ref, result_dir, args.max_job_minutes * 60
     )
-    json_write(state, {"ref": ref, "status": "COMPLETE", "epochs": epochs})
     if valid_full_result(result_dir, min_epochs=1 if is_smoke else 5) is None:
         raise RuntimeError("Remote job output invalid (missing full PESQ/checkpoint)")
+    # Mark COMPLETE only after all 164 PESQ values and checkpoint are validated.
+    json_write(state, {"ref": ref, "status": "COMPLETE", "epochs": epochs})
     return result, ref
 
 
