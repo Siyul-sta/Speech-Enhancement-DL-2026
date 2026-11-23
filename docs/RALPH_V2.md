@@ -143,6 +143,25 @@ py tools/reconcile_ralph_v2.py --resolve
 
 이전 실행이 정상 완료된 2 Epoch 스모크 단계에서 끝났고 동일 코드에 대한 본 학습을 아직 제출하지 않았다면, 검증된 기존 후보를 자동 재사용해 **중복 스모크 없이 25 Epoch 학습**으로 진입합니다. 복구가 불완전하거나 이미 본 학습이 제출된 경우에는 안전상 재사용하지 않습니다.
 
+## 컴퓨터 재시작 후 자동 복구 (2026-11-23)
+
+Kaggle GPU 학습 중 컴퓨터 또는 PowerShell이 종료되면 원격 Kaggle 작업은 완료되더라도 로컬 `remote_state.json`이 `SUBMIT_PENDING`으로 남을 수 있습니다. **기존 `& .\\tools\\start_adaptive.ps1 -ConfirmedNoRemoteJob` 실행 명령은 그대로 사용**합니다.
+
+업데이트된 시작 스크립트는 자동으로 `py tools/reconcile_ralph_v2.py --resolve`을 먼저 실행합니다. 실제 원격 작업이 `COMPLETE`인 경우 결과와 검증 164개 점수, 모델 파일을 내려받아 `COMPLETE`로 기록합니다. `ERROR/CANCELLED` 작업은 실제 Kaggle 상태가 확인된 경우에만 종료 처리합니다. `RUNNING/QUEUED/UNKNOWN`이면 제어기의 기존 중복 제출 보호가 계속 작동하여 새 실험을 시작하지 않습니다.
+
+또한 Ralph 제어기는 이전 실행의 `round_*/full` 결과 중 **파일이 실제로 검증되었고 원래 제출된 모델 코드가 로컬 Kaggle 패키지와 일치하는 경우**에만 점수를 다시 읽어 계열별 최상위 모델과 전체 우승 모델 후보로 반영합니다. 예를 들어 `run_v220261121054951/round_0005/full`을 복구해도 새 실행은 그 점수를 무시하거나 같은 원격 작업을 다시 제출하지 않습니다.
+
+실행 예시:
+
+```powershell
+cd C:\Users\LG\Speech-Enhancement-DL-2026
+git pull --ff-only
+py -m unittest discover -s tests -p "test_ralph_v2.py" -v
+& .\\tools\\start_adaptive.ps1 -ConfirmedNoRemoteJob
+```
+
+**사용자가 확인한 상태(2026-11-23):** `job-10`은 `RESOLVED COMPLETE. Verified checkpoint, result, 164 PESQ rows.`로 복구되었으며, 그 직후 `No unresolved Ralph V2 remote jobs recorded.`가 출력되었습니다. `job-10`의 실제 PESQ는 로컬 `runs/ralph_v2/run_v220261121054951/round_0005/full/result.json` 파일에서 확인합니다.
+
 ## 완료된 V3 2 Epoch 스모크 재사용 (2026-11-21)
 
 `run_v220261121052503/round_0001/smoke`의 Kaggle 테스트가 완료되었고 `V3_RESIDUAL_PHASE`의 2 Epoch PESQ-WB는 **1.8653953**입니다. 이는 정상 작동 검증이며 25 Epoch 성능으로 간주하지 않습니다. 이 파일들은 앞서 `reconcile_ralph_v2.py --resolve`로 164개 Validation 점수와 체크포인트까지 확인되었습니다.
