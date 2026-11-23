@@ -8,6 +8,7 @@ Before running:
 [CmdletBinding()]
 param(
     [switch]$ConfirmedNoRemoteJob,
+    [switch]$NoDashboard,
     [ValidateRange(2,100)]
     [int]$Epochs = 25,
     [ValidateRange(1,20)]
@@ -27,6 +28,38 @@ if ($existing.Count -gt 0) {
     $pids = ($existing | ForEach-Object { $_.ProcessId }) -join ","
     throw "A local Ralph process is still running (PID $pids). Stop old controller first."
 }
+if (-not $NoDashboard) {
+    try {
+        $dashPort = 8765
+        $dashUrl = "http://127.0.0.1:$dashPort"
+        $tcp = New-Object System.Net.Sockets.TcpClient
+        $alreadyOpen = $false
+        try {
+            $tcp.Connect("127.0.0.1", $dashPort)
+            $alreadyOpen = $true
+        }
+        catch {
+            $alreadyOpen = $false
+        }
+        finally {
+            $tcp.Dispose()
+        }
+        if ($alreadyOpen) {
+            Write-Host "Existing Ralph dashboard: $dashUrl" -ForegroundColor Cyan
+            Start-Process $dashUrl
+        }
+        else {
+            $dashboardScript = Join-Path $PSScriptRoot "start_dashboard.ps1"
+            $launchArgs = '-NoProfile -ExecutionPolicy Bypass -File "' + $dashboardScript + '"'
+            Start-Process -FilePath "powershell.exe" -ArgumentList $launchArgs -WorkingDirectory $Root -WindowStyle Minimized
+            Write-Host "Starting Ralph visual dashboard: $dashUrl" -ForegroundColor Cyan
+        }
+    }
+    catch {
+        Write-Warning "Dashboard couldn't start, but the experiment controller can continue: $_"
+    }
+}
+
 $RunRoot = Join-Path $Root "runs\ralph_v2"
 New-Item -ItemType Directory -Force -Path $RunRoot | Out-Null
 $log = Join-Path $RunRoot ("adaptive_" + (Get-Date -Format "yyyyMMdd_HHmmss") + ".log")
