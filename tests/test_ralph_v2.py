@@ -449,6 +449,44 @@ class AdaptiveRalphTests(unittest.TestCase):
                  patch.object(adaptive, "OUTPUT", output):
                 self.assertEqual(adaptive.recovered_full_runs(baseline_state), [])
 
+    def test_kaggle_running_epoch_parser_is_optional_and_read_only(self):
+        from types import SimpleNamespace
+        log = (
+            "epoch=1 loss=0.12345 val_pesq=1.9415 best=1.9415\n"
+            "epoch=2 loss=0.09754 val_pesq=2.0123 best=2.0123\n"
+        )
+        with patch.object(
+            adaptive.subprocess, "run",
+            return_value=SimpleNamespace(returncode=0, stdout=log, stderr="")
+        ) as call:
+            info = adaptive.read_running_epoch("kaggle", "siyul1122/test")
+        self.assertEqual(info, {"current_epoch": 2, "live_pesq": 2.0123})
+        self.assertEqual(call.call_args.args[0][1:3], ["kernels", "logs"])
+        with patch.object(
+            adaptive.subprocess, "run",
+            return_value=SimpleNamespace(returncode=1, stdout="", stderr="not ready")
+        ):
+            self.assertIsNone(adaptive.read_running_epoch("kaggle", "siyul1122/test"))
+
+    def test_dashboard_telemetry_is_observational(self):
+        with tempfile.TemporaryDirectory() as temp:
+            folder = Path(temp)
+            adaptive.dashboard_event(
+                folder, "training",
+                family="residual_phase", round=3, epochs=25,
+                message="GPU train", remote_status="RUNNING",
+            )
+            data = json.loads((folder / "ui_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["stage"], "training")
+            self.assertEqual(data["round"], 3)
+            self.assertEqual(data["epochs"], 25)
+            self.assertIn("updated_at", data)
+            adaptive.dashboard_event(folder, remote_status="COMPLETE", current_epoch=25)
+            data = json.loads((folder / "ui_state.json").read_text(encoding="utf-8"))
+            self.assertEqual(data["stage"], "training")
+            self.assertEqual(data["remote_status"], "COMPLETE")
+            self.assertEqual(data["current_epoch"], 25)
+
     def test_result_source_persistence(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
