@@ -837,7 +837,7 @@ def main():
             family = FAMILIES[family_index]
             dashboard_event(
                 run_dir, "codex", round=i, family=family, remote_status="",
-                ref="", epochs=args.epochs,
+                ref="", epochs=args.epochs, current_epoch=None, live_pesq=None,
                 message=f"Round {i}: {family} 모델 개선 가설 생성",
             )
             current = states[family]
@@ -897,6 +897,7 @@ def main():
                         run_dir, "smoke",
                         message=f"Round {i}: 2 Epoch 모델 동작 검증 중",
                         ref="", remote_status="SUBMIT_PENDING", epochs=2,
+                        current_epoch=None, live_pesq=None,
                     )
                     submitted = True
                     remote_job(
@@ -914,6 +915,7 @@ def main():
                     run_dir, "training",
                     message=f"Round {i}: Kaggle GPU 모델 학습 및 검증 진행 중",
                     ref="", remote_status="SUBMIT_PENDING", epochs=args.epochs,
+                    current_epoch=None, live_pesq=None,
                 )
                 submitted = True
                 result, ref = remote_job(
