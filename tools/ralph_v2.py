@@ -213,6 +213,93 @@ def recover_completed_smoke(states: dict) -> dict | None:
     return selected
 
 
+def recovered_full_runs(states: dict) -> list[dict]:
+    """Import verified full Kaggle jobs whose scoring was interrupted locally.
+
+    Requires local 164-file output, the exact originally submitted run.py,
+    the metadata ID, and the editable-only source AST policy. An unresolved
+    remote_state is NOT accepted even if files appear on disk.
+    """
+    recovered = []
+    for state_path in sorted(OUTPUT.glob("run_*/round_*/full/remote_state.json")):
+        folder = state_path.parent
+        round_dir = folder.parent
+        run_dir = round_dir.parent
+        try:
+            info = json.loads(state_path.read_text(encoding="utf-8"))
+            if info.get("status") != "COMPLETE":
+                continue
+            result = valid_full_result(folder)
+            if result is None:
+                continue
+            variant = str(result["experiment"])
+            family = next((name for name in FAMILIES
+                           if TEMPLATES[name][2] == variant), None)
+            if family is None:
+                continue
+            candidate_path = round_dir / "candidate.py"
+            base_path = run_dir / "families" / family / "best_source.py"
+            if not candidate_path.is_file() or not base_path.is_file():
+                continue
+            candidate = candidate_path.read_text(encoding="utf-8")
+            reference = base_path.read_text(encoding="utf-8")
+            if candidate != reference:
+                validate_source(candidate, reference, family)
+            else:
+                ast.parse(candidate)
+            tag = run_dir.name.removeprefix("run_")
+            round_number = int(round_dir.name.removeprefix("round_"))
+            job_folder = ROOT / "kaggle_run" / "ralph_v2" / tag / f"job_{2 * round_number:04d}"
+            packed = (job_folder / "run.py").read_text(encoding="utf-8")
+            metadata = json.loads((job_folder / "kernel-metadata.json").read_text(encoding="utf-8"))
+            if metadata.get("id") != info.get("ref"):
+                continue
+            # Compare the exact submitted source, allowing only original
+            # run packaging to inject experiment config and dataset slug.
+            expected = candidate
+            for field in ("EXPERIMENT_CONFIG", "DATASET_SLUG"):
+                found = re.search(r"^" + field + r" = .+$", packed, flags=re.M)
+                if found is None:
+                    raise ValueError(f"Packaged script missing {field}")
+                expected, count = re.subn(
+                    r"^" + field + r" = .+$",
+                    lambda _: found.group(0), expected, count=1, flags=re.M,
+                )
+                if count != 1:
+                    raise ValueError(f"Candidate script missing {field}")
+            if expected != packed:
+                print(f"RECOVERY SKIPPED: source mismatch for {state_path}", flush=True)
+                continue
+            if result.get("model") != TEMPLATES[family][1]:
+                continue
+            record = accepted_record(
+                candidate, folder, name=str(info["ref"]), variant=variant
+            )
+            if record is None:
+                continue
+            entry = {
+                "status": "RECOVERED_COMPLETE",
+                "family": family,
+                "score": record["score"],
+                "hypothesis": f"Recovered completed GPU job {info['ref']} (no resubmission)",
+                "source_hash": record["source_hash"],
+                "round": round_number,
+                "result_dir": str(folder),
+            }
+            recovered.append(entry)
+            if record["score"] > states[family]["score"]:
+                states[family] = record
+                print(
+                    f"RECOVERED FAMILY BEST: {family} PESQ-WB={record['score']:.4f} "
+                    f"from {info['ref']}",
+                    flush=True,
+                )
+        except (OSError, KeyError, ValueError, TypeError, SyntaxError,
+                json.JSONDecodeError) as exc:
+            print(f"RECOVERY SKIPPED: {state_path}: {exc}", flush=True)
+    return recovered
+
+
 def paired_diagnostics(candidate_folder: Path, reference_folder: Path) -> dict:
     """Clip-by-clip PESQ improvement against the globally strongest baseline."""
     def load_scores(path):
@@ -604,6 +691,7 @@ def main():
 
     OUTPUT.mkdir(parents=True, exist_ok=True)
     states = initial_families()
+    recovered_full = recovered_full_runs(states)
     recovered_smoke = recover_completed_smoke(states)
     champion = max(
         (v for v in states.values() if math.isfinite(v["score"])),
@@ -633,6 +721,7 @@ def main():
     run_dir = OUTPUT / ("run_" + tag)
     run_dir.mkdir(parents=True, exist_ok=False)
     history = read_history()
+    history.extend(recovered_full)
     rounds = range(1, args.max_rounds + 1) if args.max_rounds else itertools.count(1)
     family_index, stagnant, errors = (
         FAMILIES.index(recovered_smoke["family"]) if recovered_smoke else 0,
