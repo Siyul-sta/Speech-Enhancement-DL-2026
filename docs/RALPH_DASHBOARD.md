@@ -54,9 +54,34 @@ UI를 자동 실행하지 않으려면 다음과 같이 실행합니다.
 & .\tools\start_adaptive.ps1 -ConfirmedNoRemoteJob -NoDashboard
 ~~~
 
+## 기존 Ralph가 실행 중인데 '대기 중'으로 표시되는 문제
+
+Ralph가 `ui_state.json` 기록 기능보다 먼저 시작된 프로세스라면, 예전 대시보드는 실제로 Kaggle 작업을 진행 중이어도 `OFFLINE · HISTORY`와 `대기 중`으로 보여 주었습니다. 이는 학습이 멈췄다는 증거가 아닙니다.
+
+최신 대시보드는 하트비트가 없는 기존 Ralph도 모니터링하도록 개선했습니다.
+
+- 해당 실행의 **가장 최근 `remote_state.json`**에서 실제 Kaggle 노트북 ID를 확인
+- 파일이 `SUBMIT_PENDING`이면 `kaggle kernels status <ID>`로 **실제 원격 상태 조회** (35초 캐시)
+- `RUNNING / QUEUED`: 화면에서 `LIVE · KAGGLE`, 현재 라운드 및 학습 단계를 표시. 단 **로컬 Ralph 프로세스의 정상 동작은 별도 확인되지 않은 상태**임을 알림
+- `COMPLETE`: `결과 회수 필요`로 표시. 컨트롤러 재시작이 아니라 `py tools/reconcile_ralph_v2.py --resolve`로 결과를 회수
+- `UNKNOWN / 조회 실패`: `상태 확인 필요`로 표시. 실제 학습 여부를 추측하거나 자동 중단하지 않음
+- 로그가 제공되면 실제 Epoch와 Validation PESQ 표시. 확보하지 못하면 추정 진행률 대신 애니메이션
+
+**기존 Ralph GPU 작업을 중단하지 마세요.** 이미 열린 대시보드 서버만 `Ctrl+C`로 종료한 뒤 최신 코드로 다시 시작하면 됩니다.
+
+~~~powershell
+cd C:\Users\LG\Speech-Enhancement-DL-2026
+git pull --ff-only
+py -m unittest discover -s tests -p "test_ralph_dashboard.py" -v
+& .\tools\start_dashboard.ps1
+~~~
+
+웹 화면은 로컬 서버가 아닌 **Kaggle에 실제로 조회한 상태**를 명확히 구분하여 표시합니다. `SUBMIT_PENDING`이라는 로컬 기록만으로 실시간 학습 중이라고 표시하지 않습니다.
+
 ## 표시되는 값의 의미
 
-- LIVE: 최근 155초 안에 로컬 제어기의 하트비트가 기록되었을 때. 서버가 꺼져 있거나 컴퓨터를 종료하면 이후 OFFLINE으로 표시됩니다.
+- LIVE · CONTROLLER: 최근 155초 안에 로컬 Ralph 제어기의 하트비트 기록.
+- LIVE · KAGGLE: 제어기 하트비트는 없지만 Kaggle 원격 작업의 RUNNING/QUEUED 상태를 실제로 조회함. 로컬 제어기 정상 동작까지 의미하지는 않습니다.
 - Training: 원격 Kaggle 상태를 주기적으로 확인하는 단계입니다. 실제 Epoch 로그를 확보한 경우에만 퍼센트를 계산합니다.
 - PESQ 최고 기록: 로컬 우승 모델 정보입니다. 2 Epoch 스모크 점수로 갱신하지 않습니다.
 - 실험 그래프: 완료된 라운드의 결과 및 검증된 복구 작업의 결과를 포함합니다.
