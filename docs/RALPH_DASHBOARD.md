@@ -67,7 +67,7 @@ Ralph가 `ui_state.json` 기록 기능보다 먼저 시작된 프로세스라면
 - `UNKNOWN / 조회 실패`: `상태 확인 필요`로 표시. 실제 학습 여부를 추측하거나 자동 중단하지 않음
 - 로그가 제공되면 실제 Epoch와 Validation PESQ 표시. 확보하지 못하면 추정 진행률 대신 애니메이션
 
-**기존 Ralph GPU 작업을 중단하지 마세요.** 이미 열린 대시보드 서버만 `Ctrl+C`로 종료한 뒤 최신 코드로 다시 시작하면 됩니다.
+**기존 Ralph GPU 작업을 중단하지 마세요.** 기존 대시보드를 종료하지 않고 새 버전만 열려면 `git pull --ff-only` 후 **다른 PowerShell 창**에서 `& .\tools\start_dashboard.ps1 -Port 8766`을 실행합니다. 새 화면 주소는 `http://127.0.0.1:8766`입니다. 기존 8765 서버는 예전 Python 코드로 동작하므로 브라우저 새로고침만으로 업데이트되지 않습니다.
 
 ~~~powershell
 cd C:\Users\LG\Speech-Enhancement-DL-2026
