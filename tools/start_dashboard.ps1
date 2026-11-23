@@ -16,7 +16,6 @@ Write-Host "  Live dashboard: $Url" -ForegroundColor White
 Write-Host "  Read-only. Close this window or press Ctrl+C to stop dashboard." -ForegroundColor DarkGray
 Write-Host ""
 
-Start-Process $Url
 & py tools/ralph_dashboard.py --port $Port
 if ($LASTEXITCODE -ne 0) {
     throw "Dashboard couldn't start (port $Port may already be occupied)."
