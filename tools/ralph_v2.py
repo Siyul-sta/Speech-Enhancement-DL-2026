@@ -25,6 +25,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -32,6 +33,7 @@ import ralph_loop as legacy
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "runs" / "ralph_v2"
+UI_LOCK = threading.RLock()
 FAMILIES = ("residual_phase", "magnitude", "complex")
 TEMPLATES = {
     "magnitude": ("src/kaggle_train.py", "SpectrogramUNet", "E02_UNET"),
@@ -55,6 +57,30 @@ def json_write(path: Path, value) -> None:
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(json.dumps(value, indent=2, ensure_ascii=False), encoding="utf-8")
     tmp.replace(path)
+
+
+def dashboard_event(folder: Path, stage: str | None = None, **values):
+    """Best-effort read-only UI telemetry: never alter scoring or GPU behavior."""
+    try:
+        with UI_LOCK:
+            path = folder / "ui_state.json"
+            current = {}
+            if path.is_file():
+                old = json.loads(path.read_text(encoding="utf-8"))
+                if isinstance(old, dict):
+                    current = old
+            if stage is not None:
+                current["stage"] = stage
+            current.update(values)
+            current["updated_at"] = datetime.now(timezone.utc).isoformat()
+            json_write(path, current)
+    except (OSError, ValueError, TypeError) as exc:
+        print(f"Dashboard telemetry skipped: {exc}", flush=True)
+
+
+def dashboard_heartbeat(folder: Path, quit_signal: threading.Event):
+    while not quit_signal.wait(15):
+        dashboard_event(folder)
 
 
 def valid_full_result(folder: Path, *, min_epochs: int = 5) -> dict | None:
@@ -486,7 +512,8 @@ def package_candidate(*, source: str, variant: str, args, run_tag: str, job_id: 
 def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
                          result_folder: Path, max_wait_seconds: int,
                          *, sleep_seconds: float = 60,
-                         max_consecutive_status_errors: int = 5):
+                         max_consecutive_status_errors: int = 5,
+                         status_hook=None):
     """Submit ONCE, retry transient Kaggle status failures, never duplicate push.
 
     An unresolved status is NEVER treated as a cancelled job. After exhausting
@@ -517,6 +544,8 @@ def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
                     failed += 1
                     details = "Unrecognized successful Kaggle status: " + details
                 elif status.group(1) == "COMPLETE":
+                    if status_hook:
+                        status_hook("COMPLETE")
                     print(f"REMOTE COMPLETE: {ref}", flush=True)
                     legacy.command([kaggle, "kernels", "output", ref,
                                     "-p", result_folder, "-o"])
@@ -525,6 +554,8 @@ def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
                         raise RuntimeError("Kaggle COMPLETE but result.json missing")
                     return json.loads(result_file.read_text(encoding="utf-8"))
                 elif status.group(1) in ("ERROR", "CANCELLED", "CANCELED"):
+                    if status_hook:
+                        status_hook(status.group(1))
                     try:
                         print(legacy.command([kaggle, "kernels", "logs", ref],
                                              capture=True)[-12000:], flush=True)
@@ -535,6 +566,8 @@ def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
                     )
                 else:
                     failed = 0
+                    if status_hook:
+                        status_hook(status.group(1))
                     print(f"Kaggle remote status={status.group(1)}: {ref}", flush=True)
         if failed:
             print(
@@ -556,7 +589,8 @@ def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
 
 
 def remote_job(kaggle: str, *, source: str, variant: str, args, run_tag: str,
-               job_id: int, result_dir: Path, is_smoke: bool):
+               job_id: int, result_dir: Path, is_smoke: bool,
+               progress_cb=None):
     epochs = 2 if is_smoke else args.epochs
     job_dir, ref = package_candidate(
         source=source, variant=variant, args=args, run_tag=run_tag,
@@ -569,8 +603,14 @@ def remote_job(kaggle: str, *, source: str, variant: str, args, run_tag: str,
     })
     # If the local controller crashes after 'push', a new controller must
     # NOT resubmit before explicitly checking this remote notebook.
+    if progress_cb:
+        progress_cb(ref=ref, remote_status="SUBMIT_PENDING", epochs=epochs)
     result = poll_adaptive_kernel(
-        kaggle, job_dir, ref, result_dir, args.max_job_minutes * 60
+        kaggle, job_dir, ref, result_dir, args.max_job_minutes * 60,
+        status_hook=(
+            (lambda status: progress_cb(ref=ref, remote_status=status, epochs=epochs))
+            if progress_cb else None
+        ),
     )
     if valid_full_result(result_dir, min_epochs=1 if is_smoke else 5) is None:
         raise RuntimeError("Remote job output invalid (missing full PESQ/checkpoint)")
@@ -739,6 +779,17 @@ def main():
             raise RuntimeError("V1 backup integrity check failed; stopping")
         print(f"Preserved V1 trainer at {backup}", flush=True)
     save_state(run_dir, states, champion)
+    dashboard_event(
+        run_dir, "starting",
+        message="Ralph V2 자동 실험 시작",
+        family=FAMILIES[family_index], round=None, ref="", remote_status="",
+        epochs=args.epochs,
+    )
+    stop_heartbeat = threading.Event()
+    heartbeat = threading.Thread(
+        target=dashboard_heartbeat, args=(run_dir, stop_heartbeat), daemon=True
+    )
+    heartbeat.start()
     print(f"RUN DIRECTORY: {run_dir}", flush=True)
     try:
         for i in rounds:
@@ -750,6 +801,11 @@ def main():
                 break
 
             family = FAMILIES[family_index]
+            dashboard_event(
+                run_dir, "codex", round=i, family=family, remote_status="",
+                ref="", epochs=args.epochs,
+                message=f"Round {i}: {family} 모델 개선 가설 생성",
+            )
             current = states[family]
             variant = current["variant"]
             round_dir = run_dir / f"round_{i:04d}"
@@ -803,22 +859,38 @@ def main():
                     print(f"ROUND {i} new architecture: 2-epoch smoke first", flush=True)
                     smoke_dir = round_dir / "smoke"
                     smoke_dir.mkdir()
+                    dashboard_event(
+                        run_dir, "smoke",
+                        message=f"Round {i}: 2 Epoch 모델 동작 검증 중",
+                        ref="", remote_status="SUBMIT_PENDING", epochs=2,
+                    )
                     submitted = True
                     remote_job(
                         kaggle, source=candidate, variant=variant, args=args,
                         run_tag=tag, job_id=2 * i - 1,
                         result_dir=smoke_dir, is_smoke=True,
+                        progress_cb=lambda **v: dashboard_event(run_dir, "smoke", **v),
                     )
                     entry["smoke"] = "passed"
                 tried.add(family)
                 legacy.require_quota(kaggle, args.min_gpu_quota_hours)
                 full_dir = round_dir / "full"
                 full_dir.mkdir()
+                dashboard_event(
+                    run_dir, "training",
+                    message=f"Round {i}: Kaggle GPU 모델 학습 및 검증 진행 중",
+                    ref="", remote_status="SUBMIT_PENDING", epochs=args.epochs,
+                )
                 submitted = True
                 result, ref = remote_job(
                     kaggle, source=candidate, variant=variant, args=args,
                     run_tag=tag, job_id=2 * i,
                     result_dir=full_dir, is_smoke=False,
+                    progress_cb=lambda **v: dashboard_event(run_dir, "training", **v),
+                )
+                dashboard_event(
+                    run_dir, "scoring", message=f"Round {i}: PESQ 결과 분석 및 우승 판정",
+                    ref=ref, remote_status="COMPLETE",
                 )
                 score = float(result["best_validation_pesq_wb"])
                 entry.update({
@@ -899,8 +971,20 @@ def main():
                     f"MODEL SWITCH: {FAMILIES[family_index]} -> {FAMILIES[next_index]}",
                     flush=True,
                 )
+                dashboard_event(
+                    run_dir, "switch",
+                    message=f"정체 감지: {FAMILIES[family_index]} → {FAMILIES[next_index]}",
+                    family=FAMILIES[next_index],
+                )
             family_index, stagnant = next_index, next_stagnant
     finally:
+        stop_heartbeat.set()
+        heartbeat.join(timeout=2)
+        dashboard_event(
+            run_dir, "stopped",
+            message=f"Ralph 실행 종료 · 최고 PESQ {champion['score']:.4f}",
+            remote_status="FINISHED",
+        )
         save_state(run_dir, states, champion)
         if lock.exists():
             lock.unlink()
