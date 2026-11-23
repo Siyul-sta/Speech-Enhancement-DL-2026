@@ -130,6 +130,89 @@ class DashboardTests(unittest.TestCase):
             self.assertEqual(result["points"][0]["status"], "RECOVERED_COMPLETE")
             self.assertEqual(result["points"][0]["round"], 5)
 
+    def test_legacy_controller_pending_job_shows_verified_kaggle_live(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "runs" / "ralph_v2"
+            trial = output / "run_v220261123064255" / "round_0001"
+            (trial / "full").mkdir(parents=True)
+            (trial / "candidate.py").write_text(
+                "class ComplexMaskUNet(object):\n    pass\n", encoding="utf-8"
+            )
+            (trial / "full" / "remote_state.json").write_text(
+                json.dumps({
+                    "ref": "siyul1122/adaptive-speech-v2-v220261123064255-job-2",
+                    "status": "SUBMIT_PENDING", "epochs": 25,
+                }), encoding="utf-8"
+            )
+            with patch.object(dashboard, "ROOT", root), \
+                 patch.object(dashboard, "OUTPUT", output), \
+                 patch.object(dashboard, "kaggle_worker_status", return_value="RUNNING"), \
+                 patch.object(dashboard, "kaggle_live_epoch", return_value={
+                     "epoch": 7, "pesq": 2.204
+                 }):
+                result = dashboard.collect()
+            self.assertFalse(result["alive"])
+            self.assertTrue(result["remoteLive"])
+            self.assertEqual(result["stage"], "training")
+            self.assertEqual(result["round"], 1)
+            self.assertEqual(result["family"], "complex")
+            self.assertEqual(result["remote"], "RUNNING")
+            self.assertEqual(result["epoch"], 7)
+            self.assertEqual(result["total"], 25)
+            self.assertEqual(result["livePESQ"], 2.204)
+
+    def test_legacy_pending_remote_complete_does_not_fake_training(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "runs" / "ralph_v2"
+            full = output / "run_v220261123064255" / "round_0001" / "full"
+            full.mkdir(parents=True)
+            (full / "remote_state.json").write_text(
+                json.dumps({"ref": "siyul1122/kernel", "status": "SUBMIT_PENDING"}),
+                encoding="utf-8"
+            )
+            with patch.object(dashboard, "ROOT", root), \
+                 patch.object(dashboard, "OUTPUT", output), \
+                 patch.object(dashboard, "kaggle_worker_status", return_value="COMPLETE"):
+                result = dashboard.collect()
+            self.assertFalse(result["alive"])
+            self.assertFalse(result["remoteLive"])
+            self.assertEqual(result["stage"], "recover")
+            self.assertEqual(result["remote"], "COMPLETE")
+
+    def test_legacy_pending_unknown_does_not_claim_idle_or_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            output = root / "runs" / "ralph_v2"
+            full = output / "run_v220261123064255" / "round_0001" / "full"
+            full.mkdir(parents=True)
+            (full / "remote_state.json").write_text(
+                json.dumps({"ref": "siyul1122/kernel", "status": "SUBMIT_PENDING"}),
+                encoding="utf-8"
+            )
+            with patch.object(dashboard, "ROOT", root), \
+                 patch.object(dashboard, "OUTPUT", output), \
+                 patch.object(dashboard, "kaggle_worker_status", return_value=None):
+                result = dashboard.collect()
+            self.assertFalse(result["alive"])
+            self.assertFalse(result["remoteLive"])
+            self.assertEqual(result["stage"], "checking")
+
+    def test_cached_kaggle_status_is_read_only_and_throttled(self):
+        from types import SimpleNamespace
+        status = "owner/kernel"
+        response = SimpleNamespace(returncode=0, stdout="KernelWorkerStatus.RUNNING", stderr="")
+        with patch.object(dashboard.shutil, "which", return_value="kaggle"), \
+             patch.object(dashboard.subprocess, "run", return_value=response) as invoked:
+            dashboard._STATUS_CACHE.clear()
+            self.assertEqual(dashboard.kaggle_worker_status(status), "RUNNING")
+            self.assertEqual(dashboard.kaggle_worker_status(status), "RUNNING")
+            self.assertEqual(invoked.call_count, 1)
+            command = invoked.call_args.args[0]
+            self.assertEqual(command, ["kaggle", "kernels", "status", status])
+            self.assertNotIn("push", command)
+
     def test_unknown_and_sensitive_logs_are_not_exposed(self):
         with tempfile.TemporaryDirectory() as tmp:
             output = Path(tmp)
