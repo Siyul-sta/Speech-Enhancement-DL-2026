@@ -265,7 +265,8 @@ def write_csv(path: Path, fields, records):
 
 
 
-# Public training corpora: LibriSpeech and MUSAN.
+# Public training corpora: LibriSpeech, MUSAN and optional SLR73/SLR28.
+TRAIN_RIRS=[]
 def public_assets():
     import urllib.request, tarfile, hashlib
     base = Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external"
@@ -277,6 +278,8 @@ def public_assets():
     records = {}
     if EXPERIMENT_CONFIG.get("data_profile")=="spanish":
         sources["extra_speech"]="https://www.openslr.org/resources/73/es_pe_female.zip"
+    if EXPERIMENT_CONFIG.get("data_profile")=="rir":
+        sources["rir"]="https://www.openslr.org/resources/28/rirs_noises.zip"
     for key,url in sources.items():
         archive = base / (key+(".zip" if url.endswith(".zip") else ".tar.gz"))
         target = base / key
@@ -300,7 +303,10 @@ def public_assets():
         with archive.open("rb") as f:
             for chunk in iter(lambda:f.read(1048576),b""):
                 h.update(chunk)
-        records[key]={"url":url,"sha256":h.hexdigest(),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "CC-BY-4.0 (MUSAN individual terms apply)"}
+        records[key]={"url":url,"sha256":h.hexdigest(),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "Apache-2.0" if key=="rir" else "CC-BY-4.0 (MUSAN individual terms apply)"}
+    if "rir" in sources:
+        TRAIN_RIRS[:] = sorted(p for p in (base/"rir").rglob("*.wav") if "simulated_rirs" in p.parts)
+        if not TRAIN_RIRS: raise RuntimeError("No simulated room impulse responses")
     train=sorted((base/"train").rglob("*.flac"))
     if "extra_speech" in sources:
         extra=sorted((base/"extra_speech").rglob("*.wav"))
@@ -321,7 +327,7 @@ def public_assets():
     train,dev,tr,dv,test,te=map(quality_paths,(train,dev,tr,dv,test,te))
     if not all((train,dev,tr,dv,test,te)):
         raise RuntimeError("Empty external corpus split")
-    records["counts"]={"train":len(train),"dev":len(dev),"train_noise":len(tr),"dev_noise":len(dv)}
+    records["counts"]={"train":len(train),"dev":len(dev),"test":len(test),"train_noise":len(tr),"dev_noise":len(dv),"test_noise":len(te),"rir":len(TRAIN_RIRS)}
     (WORK/"external_manifest.json").write_text(json.dumps(records,indent=2))
     return train,dev,tr,dv,test,te
 
@@ -348,6 +354,14 @@ class SyntheticPairs(Dataset):
         snr=rng.uniform(-5,20)
         n=n*(np.sqrt(np.mean(c*c)+1e-8)/np.sqrt(np.mean(n*n)+1e-8))*10**(-snr/20)
         x=c+n
+        if self.dynamic and TRAIN_RIRS and rng.random()<0.5:
+            h,sr=sf.read(rng.choice(TRAIN_RIRS),dtype="float32",always_2d=True)
+            h=h[:,0]
+            if sr!=16000: h=scipy.signal.resample_poly(h,16000//math.gcd(sr,16000),sr//math.gcd(sr,16000))
+            if len(h) and np.isfinite(h).all() and np.max(np.abs(h))>1e-8:
+                h=h[np.argmax(np.abs(h)):][:16000]
+                h=h/max(1e-8,float(np.linalg.norm(h)))
+                x=scipy.signal.fftconvolve(x,h)[:len(x)]
         if self.dynamic and EXPERIMENT_CONFIG.get("augmentation")=="room_codec":
             # Train-only synthetic room tails and bandwidth degradation.
             if rng.random()<0.6:
@@ -723,6 +737,7 @@ def run():
         metrics={"error":repr(exc)}
     result = {
         "metrics":metrics,
+        "evaluation_protocol":"v4.1-fixed-dev-v1",
         "distill":bool(cfg.get("distill")),
         "experiment": variant,
         "best_epoch": best_epoch,
