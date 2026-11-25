@@ -135,6 +135,39 @@ class ControllerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             dashboard_v4.Handler.do_GET(handler)
 
+
+    def test_dashboard_observed_telemetry(self):
+        logs='\n'.join([
+            'epoch=1 loss=0.12 val_pesq=2.1 best=2.1',
+            'V4_TELEMETRY '+json.dumps({"event":"data","dataset":"train","stage":"download","bytes":100,"total_bytes":200,"elapsed_s":10}),
+            'V4_TELEMETRY '+json.dumps({"event":"batch","epoch":2,"epochs":3,"batch":10,"batches":20,"loss":0.04,"gpu_alloc_mib":512,"gpu_total_mib":15360}),
+            'epoch=2 loss=0.05 val_pesq=2.2 best=2.2',
+            'V4_TELEMETRY '+json.dumps({"event":"epoch","epoch":2,"loss":0.05,"challenge":2.2,"external":1.9,"robust":1.8}),
+            'V4_TELEMETRY malformed',
+        ])
+        t=dashboard_v4.parse_logs(logs)
+        self.assertEqual(t["download"]["bytes"],100)
+        self.assertEqual(t["batch"]["batch"],10)
+        self.assertEqual(t["epochs"][0]["challenge"],2.1)
+        self.assertEqual(t["epochs"][1]["external"],1.9)
+        self.assertEqual(t["activity"],"epoch")
+        self.assertIsNone(dashboard_v4.parse_logs("unrelated log")["download"])
+
+    def test_dashboard_log_read_only_cache_and_failure(self):
+        from types import SimpleNamespace
+        with patch.dict(dashboard_v4.LOG_CACHE,{},clear=True),patch.object(dashboard_v4.shutil,"which",return_value="mock"),patch.object(dashboard_v4.subprocess,"run",return_value=SimpleNamespace(returncode=0,stdout="epoch=1 loss=0.1 val_pesq=2.2 best=2.2",stderr="")) as call:
+            first=dashboard_v4.remote_logs("owner/test")
+            self.assertEqual(first["telemetry"]["epochs"][0]["challenge"],2.2)
+            self.assertEqual(dashboard_v4.remote_logs("owner/test"),first)
+            call.assert_called_once()
+            self.assertEqual(call.call_args.args[0],["mock","kernels","logs","owner/test"])
+            dashboard_v4.LOG_CACHE["owner/test"]=(float("-inf"),first)
+            call.return_value=SimpleNamespace(returncode=1,stdout="",stderr="network")
+            failed=dashboard_v4.remote_logs("owner/test")
+            self.assertIsNotNone(failed["error"])
+            self.assertEqual(failed["lines"],first["lines"])
+            self.assertEqual(dashboard_v4.remote_logs("bad ref")["lines"],[])
+
     def test_dashboard_remote_query_is_read_only(self):
         from types import SimpleNamespace
         with patch.dict(dashboard_v4.REMOTE_CACHE,{},clear=True),patch.object(dashboard_v4.shutil,"which",return_value="mock"),patch.object(dashboard_v4.subprocess,"run",return_value=SimpleNamespace(returncode=0,stdout="KernelWorkerStatus.RUNNING",stderr="")) as call:
