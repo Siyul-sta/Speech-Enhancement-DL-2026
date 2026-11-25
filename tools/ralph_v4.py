@@ -28,6 +28,10 @@ def verify_rows(path, count, expected):
         raise ValueError("Incomplete validation")
     if not all(math.isfinite(v) for v in scores) or not math.isfinite(float(expected)) or abs(sum(scores)/count-float(expected)) > 1e-6:
         raise ValueError("Invalid score")
+    return scores
+
+def rank_score(result):
+    return result.get("robust_score",result["joint_score"])
 
 def verify(folder, kind="v4_public"):
     r = json.loads((folder/"result.json").read_text(encoding="utf-8"))
@@ -42,10 +46,18 @@ def verify(folder, kind="v4_public"):
     if kind == "v4_external":
         if r["external_validation_files"] != 64 or not (folder/"best_model.pt").is_file() or (folder/"best_model.pt").stat().st_size==0:
             raise ValueError("Missing external evaluation or checkpoint")
-        verify_rows(folder/"external_validation.csv",64,r["external_validation_pesq_wb"])
+        external_rows=verify_rows(folder/"external_validation.csv",64,r["external_validation_pesq_wb"])
         joint=(r["best_validation_pesq_wb"]+r["external_validation_pesq_wb"])/2
         if not math.isfinite(float(r["joint_score"])) or abs(joint-r["joint_score"])>1e-6:
             raise ValueError("Invalid joint score")
+        if r.get("evaluation_protocol")=="v4.2-fixed-dev-v2":
+            domains=[float(r["best_validation_pesq_wb"]),sum(external_rows[:32])/32,sum(external_rows[32:])/32]
+            robust=0.5*sum(domains)/3+0.5*min(domains)
+            if not math.isfinite(float(r["robust_score"])) or abs(robust-r["robust_score"])>1e-6:
+                raise ValueError("Invalid robust score")
+            for name,value in zip(("challenge","external_normal","external_stress"),domains):
+                actual=float(r["domain_scores"][name])
+                if not math.isfinite(actual) or abs(actual-value)>1e-6: raise ValueError("Invalid domain score")
     return r
 
 def history():
@@ -55,7 +67,7 @@ def history():
         if state.get("status")=="COMPLETE" and state.get("kind")!="v4_audit":
             try:
                 r=verify(path.parent,state["kind"])
-                if state["kind"]=="v4_external" and r.get("evaluation_protocol")!="v4.1-fixed-dev-v1": continue
+                if state["kind"]=="v4_external" and r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": continue
                 state["source_path"]=str(path.parent/"source.py")
                 records.append((state,r))
             except (OSError,ValueError,KeyError):
@@ -136,7 +148,7 @@ def submit(kaggle, source, tag, i, kind, config=None):
     if kind=="v4_audit":
         print("FINAL AUDIT",json.dumps(r),flush=True)
         return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
-    core.append_history(folder.parents[1]/"experiments.jsonl",{"round":i,"family":kind,"status":"COMPLETE","score":r["best_validation_pesq_wb"],"kernel":ref,"external_score":r.get("external_validation_pesq_wb"),"hypothesis":json.dumps(config or {})})
+    core.append_history(folder.parents[1]/"experiments.jsonl",{"round":i,"family":kind,"status":"COMPLETE","score":r["best_validation_pesq_wb"],"kernel":ref,"external_score":r.get("external_validation_pesq_wb"),"robust_score":r.get("robust_score"),"domain_scores":r.get("domain_scores"),"hypothesis":json.dumps(config or {})})
     core.dashboard_event(folder.parents[1],"scoring",message="V4 verified results",ref=ref,remote_status="COMPLETE")
     print(json.dumps(r,indent=2),flush=True)
     return {"ref":ref,"kind":kind,"status":"COMPLETE","source_path":str(folder/"source.py")},r
@@ -177,7 +189,7 @@ def main():
             eligible=[(st,r) for st,r in records if st["kind"]=="v4_external" and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file() and r.get("model_family")!="generated"]
             if not eligible: raise RuntimeError("No eligible frozen checkpoint")
             if any(core.OUTPUT.glob("run_v4*/round_*/v4_audit/remote_state.json")): raise RuntimeError("Audit already submitted; do not reuse for tuning")
-            st,r=max(eligible,key=lambda z:z[1]["joint_score"])
+            st,r=max(eligible,key=lambda z:rank_score(z[1]))
             legacy.require_quota(kaggle,2)
             submit(kaggle,Path(st["source_path"]).read_text(encoding="utf-8"),tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":st["ref"],"architecture":r.get("model_family","residual"),"data_profile":"base","final_audit":True,"audit_aux":args.audit_aux})
             return
@@ -211,7 +223,7 @@ def main():
                       and bool(r.get("self_supervised"))==plan["self_supervised"]
                       and bool(r.get("transductive_noisy"))==plan["transductive"]
                       and r.get("generated_hash")==plan.get("generated_hash")]
-            best=max(external,key=lambda pair:pair[1]["joint_score"],default=None)
+            best=max(external,key=lambda pair:rank_score(pair[1]),default=None)
             warm=best[0]["ref"] if best and n%4!=0 else None
             cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":4,"patience":7,"seed":42,"warm_ref":warm,**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
@@ -225,9 +237,9 @@ def main():
                 print("Terminal experiment error",str(exc),flush=True)
                 if errors>=3: break
                 continue
-            ranked=max((r for st,r in records if st["kind"]=="v4_external"),key=lambda r:r["joint_score"])
+            ranked=max((r for st,r in records if st["kind"]=="v4_external"),key=rank_score)
             core.json_write(core.OUTPUT/("run_"+tag)/"v4_best.json",ranked)
-            print("BEST JOINT",ranked["joint_score"],"challenge",ranked["best_validation_pesq_wb"],"external",ranked["external_validation_pesq_wb"],flush=True)
+            print("BEST ROBUST",rank_score(ranked),"joint",ranked["joint_score"],"challenge",ranked["best_validation_pesq_wb"],"external",ranked["external_validation_pesq_wb"],flush=True)
     finally:
         lock.unlink(missing_ok=True)
 
