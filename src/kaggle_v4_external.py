@@ -291,7 +291,7 @@ def public_assets():
         records[key]={"url":url,"sha256":h.hexdigest()}
     train=sorted((base/"train").rglob("*.flac"))
     dev=sorted((base/"dev").rglob("*.flac"))
-    noises=sorted(p for p in (base/"noise").rglob("*.wav") if "noise" in p.parts or "music" in p.parts)
+    noises=sorted(p for p in (base/"noise").rglob("*.wav") if "noise" in p.relative_to(base/"noise").parts or "music" in p.relative_to(base/"noise").parts)
     groups=sorted({str(p.parent.relative_to(base/"noise")) for p in noises})
     random.Random(42).shuffle(groups)
     held=set(groups[:max(1,len(groups)//5)])
@@ -351,10 +351,14 @@ def run():
 
     root = locate_data_root()
     train_set = SpeechPairs(root, "train")
+    if len(train_set) != 1296:
+        raise RuntimeError("Unexpected train split size")
     tr, dv, tn, dn = public_assets()
-    train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,1024,42,True)])
+    train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
     external_val = DataLoader(SyntheticPairs(dv,dn,64,2026,False),batch_size=4,shuffle=False)
     val_set = SpeechPairs(root, "validation")
+    if len(val_set) != 164:
+        raise RuntimeError("Unexpected validation split size")
     train_loader = DataLoader(
         train_set, batch_size=cfg["batch_size"], shuffle=True, num_workers=0
     )
@@ -363,7 +367,16 @@ def run():
     )
     pesq_function = ensure_pesq()
     model = ResidualPhaseUNet().to(device)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=0.00035, weight_decay=0.0001)
+    warm_ref = cfg.get("warm_ref")
+    if warm_ref:
+        slug = warm_ref.rsplit("/", 1)[-1]
+        matches = list(Path("/kaggle/input").rglob("best_model.pt"))
+        matches = [p for p in matches if slug in p.parts]
+        if len(matches) != 1:
+            raise RuntimeError("Expected one checkpoint from configured private kernel")
+        model.load_state_dict(torch.load(matches[0], map_location=device, weights_only=True), strict=True)
+        print("Warm start loaded", flush=True)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
     )
@@ -418,6 +431,9 @@ def run():
         "external_validation_pesq_wb": external_score,
         "external_validation_files":64,
         "joint_score": (best_score+external_score)/2,
+        "warm_ref": warm_ref,
+        "external_size":cfg.get("external_size",1024),
+        "lr":cfg.get("lr",0.00035),
         "baseline_validation_pesq_wb": 1.6961209534144983,
         "delta_over_baseline": best_score - 1.6961209534144983,
         "seed": cfg["seed"],
