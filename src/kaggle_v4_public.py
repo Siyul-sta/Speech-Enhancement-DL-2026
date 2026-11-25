@@ -161,7 +161,7 @@ def write_csv(path: Path, fields, records):
 # Only noisy tensors are passed to enhancement models.
 def load_model(name, device):
     if name == "metricgan":
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "speechbrain==1.0.3"])
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "speechbrain==1.0.3","huggingface_hub<1"])
         from speechbrain.inference.enhancement import SpectralMaskEnhancement
         engine = SpectralMaskEnhancement.from_hparams(
             source="speechbrain/metricgan-plus-voicebank",
@@ -169,7 +169,7 @@ def load_model(name, device):
             run_opts={"device": str(device)})
         return lambda x: engine.enhance_batch(x, lengths=torch.ones(x.shape[0], device=x.device))
     if name in ("sepformer_dns","sepformer_wham"):
-        subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3"])
+        subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3","huggingface_hub<1"])
         from speechbrain.inference.separation import SepformerSeparation
         model_id={"sepformer_dns":"speechbrain/sepformer-dns4-16k-enhancement","sepformer_wham":"speechbrain/sepformer-wham16k-enhancement"}[name]
         engine=SepformerSeparation.from_hparams(source=model_id,savedir="/tmp/v4_"+name,run_opts={"device":str(device)})
