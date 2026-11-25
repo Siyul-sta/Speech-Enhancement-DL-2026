@@ -10,6 +10,8 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/"src"),str(ROOT/"tools")]
 import kaggle_v4_external as trainer
 import infer_v4
+import v4_research_catalog as catalog
+from unittest.mock import patch
 
 class CpuModelTests(unittest.TestCase):
     @classmethod
@@ -28,6 +30,15 @@ class CpuModelTests(unittest.TestCase):
                 grads=[p.grad for p in model.parameters() if p.grad is not None]
                 self.assertTrue(grads)
                 self.assertTrue(all(torch.isfinite(g).all() for g in grads))
+    def test_composed_model(self):
+        for n in (0,1,2):
+            with patch.dict(trainer.EXPERIMENT_CONFIG,{"network_spec":catalog.default_network(n)}):
+                model=trainer.ComposedEnhancer()
+                x=torch.randn(1,1024)*.05
+                y=model(x)
+                self.assertEqual(y.shape,x.shape)
+                y.square().mean().backward()
+                self.assertTrue(all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None))
     def test_synthetic_validation_repeatable(self):
         with tempfile.TemporaryDirectory() as d:
             path=Path(d)
@@ -41,6 +52,10 @@ class CpuModelTests(unittest.TestCase):
             self.assertTrue(torch.isfinite(x).all())
             self.assertLessEqual(float(x.abs().max()),1)
             self.assertEqual(trainer.quality_paths([c,c,n]),[c,n])
+            stress=trainer.SyntheticPairs([c],[n],2,42,False,stress=True)
+            sx,sy=stress[0]
+            self.assertTrue(torch.equal(sx,stress[0][0]))
+            self.assertFalse(torch.equal(sx,x))
     def test_inference_lengths(self):
         for length in (1,24001,48000,48001,100003):
             x=np.random.default_rng(42).normal(0,.1,length).astype(np.float32)
