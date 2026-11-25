@@ -35,6 +35,23 @@ class PublicAuditTests(unittest.TestCase):
                 y,sr=sf.read(p)
                 self.assertEqual(sr,16000)
                 self.assertGreater(len(y),15999)
+
+    def test_real_pesq_parallel_equals_serial(self):
+        from contextlib import closing
+        with closing(trainer.urgent_rows()) as rows:
+            row=next(rows)
+        c=trainer.decode_audit_audio(row["clean_audio"])
+        x=trainer.decode_audit_audio(row["noisy_audio"])
+        n=min(len(c),len(x),48000)
+        c=np.stack([c[:n]]*4); x=np.stack([x[:n],x[:n]*.9,x[:n]*.8,x[:n]*.7])
+        try:
+            serial=trainer.score_waveforms(c,x,pesq,workers=0)
+            parallel=trainer.score_waveforms(c,x,pesq,workers=2)
+            self.assertIsNotNone(trainer._PESQ_POOL)
+            np.testing.assert_array_equal(serial,parallel)
+        finally:
+            trainer.close_pesq_pool()
+
     def test_actual_whisper_wer_pipeline(self):
         with tempfile.TemporaryDirectory() as d,patch.object(trainer,"WORK",Path(d)):
             root=Path(d); clean=root/"1-1-1.wav"; noise=root/"noise.wav"
