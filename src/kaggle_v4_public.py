@@ -10,6 +10,7 @@ No private WAVs are copied into outputs.
 from __future__ import annotations
 
 import csv
+import math
 import importlib
 import json
 import random
@@ -268,12 +269,7 @@ def run():
     best = -float("inf")
     winner = None
     for name, pred in candidates.items():
-        rows = []
-        for i in range(len(noisy)):
-            score = float(pesq_fn(16000, np.clip(clean[i].numpy(), -1, 1), pred[i].clamp(-1,1).numpy(), "wb"))
-            if not np.isfinite(score):
-                raise RuntimeError("Nonfinite PESQ")
-            rows.append([i, score])
+        rows=[[i,score] for i,score in enumerate(score_waveforms(clean.numpy(),pred.numpy(),pesq_fn))]
         ds=[float(np.mean([row[1] for row in chunk])) for chunk in (rows[:challenge_count],rows[challenge_count:challenge_count+32],rows[challenge_count+32:])]
         robust=0.5*float(np.mean(ds))+0.5*min(ds)
         scores[name] = {"challenge":ds[0],"external_normal":ds[1],"external_stress":ds[2],"robust":robust}
@@ -294,4 +290,6 @@ def run():
     print("FINAL_RESULT", json.dumps(result), flush=True)
 
 if __name__ == "__main__":
-    run()
+    try: run()
+    finally:
+        if "close_pesq_pool" in globals(): close_pesq_pool()
