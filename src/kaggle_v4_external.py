@@ -745,6 +745,68 @@ def fleurs_speech(split,limit=256):
     return paths
 
 
+
+@torch.no_grad()
+def update_ema(teacher,model):
+    if teacher is None: return
+    for t,p in zip(teacher.parameters(),model.parameters()):
+        t.lerp_(p,0.01)
+    for t,p in zip(teacher.buffers(),model.buffers()):
+        if t.is_floating_point(): t.lerp_(p,0.01)
+        else: t.copy_(p)
+
+def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None):
+    variant=cfg["id"]
+    optimizer.zero_grad(set_to_none=True)
+    pred = model(noisy)
+    loss = enhancement_loss(pred, clean, variant)
+    if distill is not None:
+        with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
+        loss=loss+0.1*F.l1_loss(pred,pseudo)
+    if cfg.get("loss_mode") == "composed":
+        weights=cfg["loss_weights"]
+        a=pred-pred.mean(-1,keepdim=True)
+        b=clean-clean.mean(-1,keepdim=True)
+        proj=(a*b).sum(-1,keepdim=True)*b/(b.square().sum(-1,keepdim=True)+1e-8)
+        si=(10*torch.log10((proj.square().sum(-1)+1e-8)/((a-proj).square().sum(-1)+1e-8))).clamp(-30,30).mean()
+        win=torch.hann_window(512,device=pred.device,dtype=pred.dtype)
+        p_mag=torch.stft(pred,512,128,window=win,return_complex=True).abs()
+        c_mag=torch.stft(clean,512,128,window=win,return_complex=True).abs()
+        loss=loss+weights["wave"]*F.l1_loss(pred,clean)+weights["spectral"]*F.l1_loss(p_mag.log1p(),c_mag.log1p())-0.01*weights["sisdr"]*si
+    elif cfg.get("loss_mode") == "sisdr":
+        a=pred-pred.mean(-1,keepdim=True)
+        b=clean-clean.mean(-1,keepdim=True)
+        proj=(a*b).sum(-1,keepdim=True)*b/(b.square().sum(-1,keepdim=True)+1e-8)
+        loss=loss-0.01*(10*torch.log10((proj.square().sum(-1)+1e-8)/((a-proj).square().sum(-1)+1e-8))).clamp(-30,30).mean()
+    elif cfg.get("loss_mode") == "waveform":
+        loss=loss+0.2*F.l1_loss(pred,clean)
+    if not torch.isfinite(loss):
+        raise RuntimeError("Non-finite train loss")
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
+    optimizer.step()
+    update_ema(teacher,model)
+    return float(loss.detach())
+
+def consistency_step(model,optimizer,teacher,x,mode="consistency"):
+    with torch.no_grad():
+        target=teacher(x).clamp(-1,1)
+        if mode=="remix" and x.shape[0]>1:
+            # Recombine estimated speech and permuted estimated noise.
+            residue=x-target
+            perturbed=target+residue.roll(1,dims=0)
+        else:
+            perturbed=x+torch.randn_like(x)*0.01
+    optimizer.zero_grad(set_to_none=True)
+    loss=0.1*F.l1_loss(model(perturbed.clamp(-1,1)),target)
+    if not torch.isfinite(loss): raise RuntimeError("Nonfinite consistency loss")
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(model.parameters(),5.0)
+    optimizer.step()
+    update_ema(teacher,model)
+    return float(loss.detach())
+
+
 def run():
     cfg = EXPERIMENT_CONFIG
     variant = cfg["id"]
@@ -879,51 +941,11 @@ def run():
         losses = []
         for noisy, clean in train_loader:
             noisy, clean = noisy.to(device), clean.to(device)
-            optimizer.zero_grad(set_to_none=True)
-            pred = model(noisy)
-            loss = enhancement_loss(pred, clean, variant)
-            if distill is not None:
-                with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
-                loss=loss+0.1*F.l1_loss(pred,pseudo)
-            if cfg.get("loss_mode") == "composed":
-                weights=cfg["loss_weights"]
-                a=pred-pred.mean(-1,keepdim=True)
-                b=clean-clean.mean(-1,keepdim=True)
-                proj=(a*b).sum(-1,keepdim=True)*b/(b.square().sum(-1,keepdim=True)+1e-8)
-                si=(10*torch.log10((proj.square().sum(-1)+1e-8)/((a-proj).square().sum(-1)+1e-8))).clamp(-30,30).mean()
-                win=torch.hann_window(512,device=pred.device,dtype=pred.dtype)
-                p_mag=torch.stft(pred,512,128,window=win,return_complex=True).abs()
-                c_mag=torch.stft(clean,512,128,window=win,return_complex=True).abs()
-                loss=loss+weights["wave"]*F.l1_loss(pred,clean)+weights["spectral"]*F.l1_loss(p_mag.log1p(),c_mag.log1p())-0.01*weights["sisdr"]*si
-            elif cfg.get("loss_mode") == "sisdr":
-                a=pred-pred.mean(-1,keepdim=True)
-                b=clean-clean.mean(-1,keepdim=True)
-                proj=(a*b).sum(-1,keepdim=True)*b/(b.square().sum(-1,keepdim=True)+1e-8)
-                loss=loss-0.01*(10*torch.log10((proj.square().sum(-1)+1e-8)/((a-proj).square().sum(-1)+1e-8))).clamp(-30,30).mean()
-            elif cfg.get("loss_mode") == "waveform":
-                loss=loss+0.2*F.l1_loss(pred,clean)
-            if not torch.isfinite(loss):
-                raise RuntimeError(f"Non-finite train loss at epoch={epoch}")
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-            optimizer.step()
-            losses.append(float(loss.detach()))
+            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None))
         if unlabeled_loader is not None and epoch >= 2:
             for k,x in enumerate(unlabeled_loader):
                 if k>=64: break
-                x=x.to(device)
-                with torch.no_grad():
-                    target=teacher(x).clamp(-1,1)
-                perturb=torch.randn_like(x)*0.01
-                optimizer.zero_grad(set_to_none=True)
-                loss=0.1*F.l1_loss(model((x+perturb).clamp(-1,1)),target)
-                if not torch.isfinite(loss): raise RuntimeError("Nonfinite consistency loss")
-                loss.backward()
-                torch.nn.utils.clip_grad_norm_(model.parameters(),5.0)
-                optimizer.step()
-                with torch.no_grad():
-                    for t,p in zip(teacher.parameters(),model.parameters()):
-                        t.lerp_(p,0.01)
+                consistency_step(model,optimizer,teacher,x.to(device),cfg.get("self_mode","consistency"))
         scheduler.step()
         val_pesq, _ = evaluate(model, val_loader, device, pesq_function)
         external_pesq, domain_rows = evaluate(model, external_val, device, pesq_function, save_rows=True)
@@ -986,6 +1008,7 @@ def run():
         "network_spec":cfg.get("network_spec"),
         "transductive_noisy":bool(cfg.get("transductive")) and bool(cfg.get("self_supervised")),
         "self_supervised":bool(cfg.get("self_supervised")),
+        "self_mode":cfg.get("self_mode","consistency"),
         "unlabeled_files":len(unlabeled) if unlabeled is not None else 0,
         "architecture": cfg.get("architecture","residual"),
         "optimizer": "AdamW+CosineAnnealingLR",
