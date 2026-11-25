@@ -27,3 +27,18 @@ When reviewing results:
 3. Identify specific next hypothesis with evidence and expected risk.
 4. Design a bounded experiment with reproducible settings.
 5. Never leak speech or identifiers from private data.
+
+
+## Ralph V4 scope (only tools/ralph_v4.py and src/kaggle_v4_*.py)
+
+V4 permits public pretrained weights, licensed external training speech/noise,
+train-only augmentation, transfer, distillation and noisy-only consistency.
+The earlier train-only challenge restriction applies to V1–V3, not V4.
+Validation/test clean is NEVER used as a training target. Optional transductive
+noisy adaptation is separately recorded and excluded from inductive final audit.
+Do not expose private recordings, credentials, or raw local files to public APIs.
+Unknown external assets are research proposals until license, schema and adapter
+are reviewed. Prefer validated declarative model/loss descriptions; experimental
+generated Python is opt-in, not sandboxed by AST checks. Fixed evaluator, data
+splits and metric protocol may not be modified by an experiment proposal.
+Stop for quota/uncertain GPU state or failure budget, never a target PESQ.

@@ -200,7 +200,9 @@ def collect():
                 })
         # Recovered Kaggle jobs may have finished before local controller
         # recorded its history; show the validated result exactly once.
-        for result_file in run.glob("round_*/full/result.json"):
+        for result_file in run.glob("round_*/*/result.json"):
+            if result_file.parent.name not in ("full", "v4_public", "v4_external", "public"):
+                continue
             folder = result_file.parent
             meta = read_json(folder / "remote_state.json")
             result = read_json(result_file)
@@ -220,6 +222,8 @@ def collect():
                 "E03_MRSTFT": "magnitude"
             }.get(result.get("experiment"), "unknown")
             score = number(result.get("best_validation_pesq_wb"))
+            if score is not None and (global_score is None or score > global_score):
+                global_score, global_origin = score, str(meta.get("ref", ""))[:100]
             if score is not None:
                 points.append({
                     "run": run.name, "round": round_n, "score": score,

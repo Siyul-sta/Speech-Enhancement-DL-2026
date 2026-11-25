@@ -1,0 +1,52 @@
+name: Ralph V4 offline checks
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  offline:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m compileall -q tools src tests
+      - run: python -m unittest discover -s tests -p test_ralph_v4.py -v
+      - run: python tools/ralph_v4.py --loop --codex-research --discover
+  cpu-models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install numpy pandas scipy soundfile
+      - run: python -m unittest discover -s tests -p test_v4_cpu_models.py -v
+  public-models:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install 'numpy<2' pandas scipy soundfile speechbrain==1.0.3 'huggingface_hub<1'
+      - run: python -m unittest discover -s tests -p test_v4_public_models.py -v
+  public-audits:
+    runs-on: ubuntu-latest
+    timeout-minutes: 18
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch==2.5.1 torchaudio==2.5.1 --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install 'numpy<2' pandas scipy soundfile pesq==0.0.4 datasets==3.6.0 pyarrow==20.0.0 torchmetrics==1.6.3 onnxruntime librosa transformers==4.51.3 'huggingface_hub<1'
+      - run: python -m unittest discover -s tests -p test_v4_public_audits.py -v

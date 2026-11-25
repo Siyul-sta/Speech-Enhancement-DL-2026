@@ -106,6 +106,12 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
         if not resolve:
             print("Remote job COMPLETE. Re-run --resolve to fetch/check artifacts.")
             return
+        if info.get("kind")=="v4_cache":
+            info["status"]="COMPLETE"
+            info["reconciled"]=True
+            adaptive.json_write(path,info)
+            print("RESOLVED PUBLIC CACHE; manifest verified on mount by V4.")
+            return
         result_dir = path.parent
         cmd = [str(kaggle), "kernels", "output", ref, "-p", str(result_dir), "-o"]
         proc = subprocess.run(cmd, cwd=ROOT, check=False)
@@ -113,7 +119,16 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
             print("Download failed; leave unresolved.")
             return
         min_epochs = 1 if result_dir.name == "smoke" else 5
-        if adaptive.valid_full_result(result_dir, min_epochs=min_epochs) is None:
+        if info.get("kind") in ("v4_public", "v4_external", "v4_audit", "v4_smoke", "v4_perf"):
+            try:
+                import ralph_v4
+                ralph_v4.verify(result_dir, info["kind"])
+                valid = True
+            except (OSError, ValueError, KeyError, TypeError):
+                valid = False
+        else:
+            valid = adaptive.valid_full_result(result_dir, min_epochs=min_epochs) is not None
+        if not valid:
             print("Missing/invalid 164-score result, checkpoint or training metadata. "
                   "Keep unresolved for inspection.")
             return
