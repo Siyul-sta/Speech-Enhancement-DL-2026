@@ -111,6 +111,29 @@ class CpuModelTests(unittest.TestCase):
                 manifest=__import__("json").loads((root/"external_manifest.json").read_text())
                 self.assertNotIn("test",manifest)
 
+
+    def test_training_steps_actual_weights(self):
+        import copy
+        model=trainer.TemporalEnhancer().train()
+        teacher=copy.deepcopy(model).eval().requires_grad_(False)
+        distill=copy.deepcopy(model).eval().requires_grad_(False)
+        optimizer=torch.optim.AdamW(model.parameters(),lr=1e-3)
+        x=torch.randn(2,4096)*.05
+        y=x*.6
+        cfg={"id":"V3_RESIDUAL_PHASE","loss_mode":"composed","loss_weights":{"wave":.2,"spectral":.3,"sisdr":.5}}
+        before=model.out.weight.detach().clone()
+        old_teacher=teacher.out.weight.detach().clone()
+        loss=trainer.supervised_step(model,optimizer,x,y,cfg,distill,teacher)
+        self.assertTrue(np.isfinite(loss))
+        self.assertFalse(torch.equal(before,model.out.weight))
+        self.assertFalse(torch.equal(old_teacher,teacher.out.weight))
+        for mode in ("consistency","remix"):
+            before=model.out.weight.detach().clone()
+            self.assertTrue(np.isfinite(trainer.consistency_step(model,optimizer,teacher,x,mode)))
+            self.assertFalse(torch.equal(before,model.out.weight))
+        self.assertTrue(all(p.grad is None for p in distill.parameters()))
+        self.assertTrue(all(p.grad is None for p in teacher.parameters()))
+
     def test_wer(self):
         self.assertEqual(trainer.word_error_count("one two three","one four three"),(1,3))
         self.assertEqual(trainer.word_error_count("one two","one"),(1,2))
