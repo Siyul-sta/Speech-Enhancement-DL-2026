@@ -27,9 +27,9 @@ CPU model tests need torch, numpy, pandas, scipy and soundfile.
 GitHub Actions uses no Kaggle credentials or private audio.
 
 ## Isolated smoke (only after user authorizes GPU)
-    py -u tools/ralph_v4.py --smoke --build-public-cache --execute
+    py -u tools/ralph_v4.py --smoke --execute
 
-This runs one two-epoch Temporal CNN trial using 16 challenge and 16 external training examples and all 228 development evaluation clips. Its checkpoint/result is never used for model selection. The optional CPU public cache is created first if absent. Omit `--build-public-cache` to download directly inside the job.
+This runs one two-epoch Temporal CNN trial using 16 challenge pairs and 16 train-derived synthetic pairs, then scores all 164 challenge validation clips and 64 train-derived synthetic engineering fixtures. No public archives or public cache are needed, even if the legacy build flag is passed. The fixture protocol is NOT external generalization and is never ranked. Existing submitted jobs retain their previous code.
 
 ## Execution (only after user authorizes GPU)
     py -u tools/ralph_v4.py --loop --codex-research --discover --build-public-cache --epochs 15 --max-rounds 1 --execute
@@ -40,6 +40,12 @@ For final frozen audit:
 
 Final audit is deliberately separate from the loop; do not use its results to tune.
 If a Kaggle job is interrupted, use tools/reconcile_ralph_v2.py, which understands V4 state.
+
+## Performance configuration
+- Public CPU cache prepares at most two archives concurrently; full source archives and fixed evaluation protocol remain unchanged.
+- Fixed synthetic development pairs are materialized once, 16 kHz long clips use exact random seek, CUDA training loaders use up to two spawned workers with pinned buffers.
+- PESQ scoring uses up to two isolated spawned CPU processes, preserving file order and FP32 scoring inputs. No speedup claimed until Kaggle benchmark.
+- `--amp` is opt-in and only enables FP16 convolution forward for temporal/composed models, with FP32 loss, gradient scaling and FP32 evaluation. Default is FP32. AMP and loader performance require actual GPU verification.
 
 ## Remaining runtime risks
 Public model dependencies, remote model downloads, real external archives (large),
