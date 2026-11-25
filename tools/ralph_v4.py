@@ -29,6 +29,7 @@ def verify_rows(path, count, expected):
 
 def verify(folder, kind="v4_public"):
     r = json.loads((folder/"result.json").read_text(encoding="utf-8"))
+    if kind not in ("v4_public","v4_external","v4_audit"): raise ValueError("Unknown result kind")
     if kind=="v4_audit":
         if r.get("audit_files")!=128: raise ValueError("Wrong audit size")
         verify_rows(folder/"audit_per_file.csv",128,r["audit_pesq"])
@@ -37,7 +38,7 @@ def verify(folder, kind="v4_public"):
         raise ValueError("Expected 164 validation clips")
     verify_rows(folder/"validation_per_file.csv",164,r["best_validation_pesq_wb"])
     if kind == "v4_external":
-        if r["external_validation_files"] != 64 or not (folder/"best_model.pt").is_file():
+        if r["external_validation_files"] != 64 or not (folder/"best_model.pt").is_file() or (folder/"best_model.pt").stat().st_size==0:
             raise ValueError("Missing external evaluation or checkpoint")
         verify_rows(folder/"external_validation.csv",64,r["external_validation_pesq_wb"])
         joint=(r["best_validation_pesq_wb"]+r["external_validation_pesq_wb"])/2
@@ -59,15 +60,15 @@ def history():
 
 def propose_config(records, n, epochs, codex):
     """Codex chooses a typed research plan; no arbitrary evaluation code edits."""
-    architectures=("residual","temporal","metricgan","generated")
-    fallback={"architecture":architectures[n%4] if codex else architectures[n%3],"self_supervised":bool(n%2),
-              "lr":0.0001,"external_size":[512,1024,2048][n%3],"loss_mode":["base","sisdr","waveform"][n%3]}
+    architectures=("residual","temporal","metricgan","moe","generated")
+    fallback={"architecture":architectures[n%5] if codex else architectures[n%4],"self_supervised":bool(n%2),
+              "lr":0.0001,"external_size":[512,1024,2048][n%3],"loss_mode":["base","sisdr","waveform"][n%3],"distill":bool(n%3==2),"transductive":False}
     if not codex: return fallback
     evidence=[{"kind":st["kind"],"result":r} for st,r in records[-12:]]
     prompt=("Return ONLY one JSON object, no code or markdown. Design next speech enhancement trial "
-            "to improve challenge and external domain PESQ. Allowed keys: architecture (residual, temporal, metricgan, generated), "
-            "self_supervised (boolean, uses noisy-only transductive consistency), lr (0.00001 to 0.001), "
-            "external_size (512,1024,2048), loss_mode (base, sisdr, waveform). Avoid repeated failed or stagnant settings. "
+            "to improve challenge and external domain PESQ. Allowed keys: architecture (residual, temporal, metricgan, moe, generated), "
+            "self_supervised (boolean, uses train noisy-only consistency), lr (0.00001 to 0.001), "
+            "external_size (512,1024,2048), loss_mode (base, sisdr, waveform), distill (boolean), transductive (boolean; only if self_supervised). Avoid repeated failed or stagnant settings. "
             "No filesystem edits, no training or external commands. History: "+json.dumps(evidence)[-14000:])
     try:
         p=subprocess.run([codex,"exec","--sandbox","read-only",prompt],cwd=ROOT,
@@ -75,7 +76,7 @@ def propose_config(records, n, epochs, codex):
         match=re.search(r'\{[^{}]*"architecture"[^{}]*\}',p.stdout,re.S)
         obj=json.loads(match.group(0))
         if (obj["architecture"] not in architectures or type(obj["self_supervised"]) is not bool
-            or not 0.00001<=float(obj["lr"])<=0.001 or obj["external_size"] not in (512,1024,2048) or obj["loss_mode"] not in ("base","sisdr","waveform")):
+            or not 0.00001<=float(obj["lr"])<=0.001 or obj["external_size"] not in (512,1024,2048) or obj["loss_mode"] not in ("base","sisdr","waveform") or type(obj["distill"]) is not bool or type(obj["transductive"]) is not bool or (obj["transductive"] and not obj["self_supervised"])):
             raise ValueError("Invalid proposal")
         return {k:obj[k] for k in fallback}
     except Exception as exc:
@@ -185,6 +186,7 @@ def main():
             external=[(st,r) for st,r in records if st["kind"]=="v4_external"
                       and r.get("model_family","residual")==plan["architecture"]
                       and bool(r.get("self_supervised"))==plan["self_supervised"]
+                      and bool(r.get("transductive_noisy"))==plan["transductive"]
                       and r.get("generated_hash")==plan.get("generated_hash")]
             best=max(external,key=lambda pair:pair[1]["joint_score"],default=None)
             warm=best[0]["ref"] if best and n%4!=0 else None
