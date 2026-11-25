@@ -13,12 +13,64 @@ import ralph_v4 as v4
 import v4_research_catalog as catalog
 import v4_model_policy as policy
 import dashboard_v4
+import v4_perf_policy as perf
 
 class ControllerTests(unittest.TestCase):
     def rows(self,path,count,value):
         with path.open("w",newline="",encoding="utf-8") as f:
             w=csv.writer(f); w.writerow(["index","pesq_wb"])
             w.writerows((i,value) for i in range(count))
+
+    def test_perf_gate_accepts_only_quality_preserving_speedup(self):
+        import copy
+        def trial(seed,workers,seconds):
+            return {"seed":seed,"epochs_completed":2,"perf_reproducible":True,"model_family":"temporal",
+                    "data_fingerprint":"validation","training_fingerprint":str(seed),"hardware":{"device":"T4","torch":"2.5","cpu_count":4},
+                    "loader_workers":workers,"precision":"fp32","evaluation_protocol":perf.PROTOCOL,
+                    "domain_scores":{"challenge":2.5,"external_normal":2.2,"external_stress":1.9},"robust_score":2.05,
+                    "metrics":{"challenge":{"si_sdr":7.0,"stoi":.8},"external":{"si_sdr":6.0,"stoi":.75}},
+                    "epoch_seconds":[seconds,seconds]}
+        pairs=[(trial(seed,0,100),trial(seed,2,80)) for seed in perf.SEEDS]
+        report=perf.compare(pairs,2)
+        self.assertTrue(report["accepted"])
+        self.assertAlmostEqual(report["median_ratio"],.8)
+        for key in ("data_fingerprint","training_fingerprint","hardware","precision"):
+            broken=copy.deepcopy(pairs)
+            broken[0][1][key]="different"
+            self.assertFalse(perf.compare(broken,2)["accepted"])
+        broken=copy.deepcopy(pairs)
+        broken[1][1]["metrics"]["challenge"]["stoi"]-=.00001
+        self.assertFalse(perf.compare(broken,2)["accepted"])
+        broken=copy.deepcopy(pairs)
+        for base,cand in broken: cand["epoch_seconds"]=[99,99]
+        self.assertFalse(perf.compare(broken,2)["accepted"])
+        self.assertFalse(perf.compare(pairs[:2],2)["accepted"])
+        report.update(source_sha256=perf.signature("source"),cache="owner/cache",profile=perf.profile(2),amp=False,seeds=list(perf.SEEDS))
+        self.assertTrue(perf.authorized(report,"source","owner/cache",2,False))
+        self.assertFalse(perf.authorized(report,"changed","owner/cache",2,False))
+        self.assertFalse(perf.authorized(report,"source","owner/cache2",2,False))
+        self.assertFalse(perf.authorized(report,"source","owner/cache",3,False))
+        self.assertFalse(perf.authorized(report,"source","owner/cache",2,True))
+
+    def test_performance_benchmark_pairs_and_no_promotion(self):
+        with tempfile.TemporaryDirectory() as d:
+            calls=[]
+            def fake(kaggle,source,tag,slot,kind,cfg):
+                calls.append((slot,kind,cfg))
+                return {},{"seed":cfg["seed"]}
+            with patch.object(v4.core,"OUTPUT",Path(d)),patch.object(v4.legacy,"require_quota"),patch.object(v4,"submit",fake):
+                with patch.object(perf,"compare",return_value={"accepted":False,"reasons":["regression"],"pairs":[]}):
+                    report=v4.performance_benchmark("mock","source","tag","owner/cache",2,True)
+                self.assertFalse(report["accepted"])
+                self.assertEqual(len(calls),6)
+                self.assertEqual(len({x[0] for x in calls}),6)
+                self.assertTrue(all(x[1]=="v4_perf" for x in calls))
+                for seed in perf.SEEDS:
+                    pair=[x[2] for x in calls if x[2]["seed"]==seed]
+                    self.assertEqual({x["loader_workers"] for x in pair},{0,2})
+                    self.assertEqual({x["amp"] for x in pair},{False,True})
+                self.assertFalse(json.loads(v4.performance_report_path(True).read_text())["accepted"])
+
     def test_plan_rotation(self):
         plans=[v4.propose_config([],n,2,None) for n in range(24)]
         self.assertEqual({p["architecture"] for p in plans},{"residual","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer"})
