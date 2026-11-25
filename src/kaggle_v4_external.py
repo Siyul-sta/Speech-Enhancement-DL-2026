@@ -267,10 +267,21 @@ def write_csv(path: Path, fields, records):
 
 # Public training corpora: LibriSpeech, MUSAN and optional SLR73/SLR28.
 TRAIN_RIRS=[]
-def public_assets(evaluation_only=False,include_test=False):
+def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
     import urllib.request, tarfile, hashlib
     base = Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external"
     base.mkdir(parents=True, exist_ok=True)
+    cache=EXPERIMENT_CONFIG.get("public_cache")
+    if cache:
+        candidates=list(Path("/kaggle/input").rglob("v4_cache_manifest.json"))
+        slug=cache.rsplit("/",1)[-1]
+        matches=[p for p in candidates if slug in p.parts]
+        if len(matches)!=1: raise RuntimeError("Configured public cache not mounted uniquely")
+        cache_root=matches[0].parent
+        cache_meta=json.loads(matches[0].read_text(encoding="utf-8"))
+        if cache_meta.get("format")!="ralph-v4-public-cache-1": raise RuntimeError("Invalid public cache format")
+    else:
+        cache_root=None; cache_meta={}
     sources = {"train":"https://www.openslr.org/resources/12/train-clean-100.tar.gz",
                "dev":"https://www.openslr.org/resources/12/dev-clean.tar.gz",
                "test":"https://www.openslr.org/resources/12/test-clean.tar.gz",
@@ -279,13 +290,20 @@ def public_assets(evaluation_only=False,include_test=False):
     if evaluation_only:
         sources.pop("train",None)
     records = {}
-    if not evaluation_only and EXPERIMENT_CONFIG.get("data_profile")=="spanish":
+    if not evaluation_only and (EXPERIMENT_CONFIG.get("data_profile")=="spanish" or prepare_only):
         sources["extra_speech"]="https://www.openslr.org/resources/73/es_pe_female.zip"
-    if not evaluation_only and EXPERIMENT_CONFIG.get("data_profile")=="rir":
+    if not evaluation_only and (EXPERIMENT_CONFIG.get("data_profile")=="rir" or prepare_only):
         sources["rir"]="https://www.openslr.org/resources/28/rirs_noises.zip"
     for key,url in sources.items():
         archive = base / (key+(".zip" if url.endswith(".zip") else ".tar.gz"))
         target = base / key
+        if cache_root is not None and key!="test":
+            cached=cache_root/key
+            if cache_meta.get("sources",{}).get(key)!=url or not (cached/".complete").is_file() or not (cached/".sha256").is_file(): raise RuntimeError("Missing or incompatible public cache entry: "+key)
+            if target.exists() and not target.is_symlink():
+                import shutil
+                shutil.rmtree(target)
+            if not target.exists(): target.symlink_to(cached,target_is_directory=True)
         marker=target/".complete"
         digest_path=target/".sha256"
         if not marker.exists() or not digest_path.exists():
@@ -326,6 +344,10 @@ def public_assets(evaluation_only=False,include_test=False):
             marker.touch()
             archive.unlink(missing_ok=True)
         records[key]={"url":url,"sha256":digest_path.read_text(encoding="ascii"),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "Apache-2.0" if key=="rir" else "CC-BY-4.0 (MUSAN individual terms apply)"}
+    if prepare_only:
+        (base/"v4_cache_manifest.json").write_text(json.dumps({"format":"ralph-v4-public-cache-1","sources":sources,"records":records},indent=2),encoding="utf-8")
+        return base
+    TRAIN_RIRS.clear()
     if "rir" in sources:
         TRAIN_RIRS[:] = sorted(p for p in (base/"rir").rglob("*.wav") if "simulated_rirs" in p.parts)
         if not TRAIN_RIRS: raise RuntimeError("No simulated room impulse responses")
@@ -854,7 +876,9 @@ def self_test():
 
 
 if __name__ == "__main__":
-    if "--self-test" in sys.argv:
+    if "--prepare-public-cache" in sys.argv:
+        public_assets(prepare_only=True)
+    elif "--self-test" in sys.argv:
         self_test()
     else:
         run()
