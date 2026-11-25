@@ -140,6 +140,29 @@ class ControllerTests(unittest.TestCase):
         self.assertIn("def public_recipe",result)
         compile(result,"audit.py","exec")
 
+
+    def test_smoke_isolated_from_research(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            (root/"src").mkdir()
+            for p in (ROOT/"src").glob("kaggle_v4*.py"): shutil.copy(p,root/"src"/p.name)
+            calls=[]
+            def fake(kaggle,source,tag,i,kind,config=None):
+                calls.append((kind,config))
+                folder=v4.core.OUTPUT/("run_"+tag)/"round_0001"/kind
+                folder.mkdir(parents=True)
+                (folder/"remote_state.json").write_text(json.dumps({"kind":kind,"status":"COMPLETE","ref":"owner/test"}))
+                return {},{}
+            with patch.object(v4,"ROOT",root),patch.object(v4.core,"OUTPUT",root/"runs"),patch.object(v4.shutil,"which",return_value="mock"),patch.object(v4.legacy,"require_quota"),patch.object(v4,"submit",fake),patch.object(sys,"argv",["ralph_v4","--smoke","--execute"]):
+                v4.main()
+                self.assertEqual(v4.history(),[])
+            self.assertEqual(len(calls),1)
+            self.assertEqual(calls[0][0],"v4_smoke")
+            self.assertEqual(calls[0][1]["epochs"],2)
+            self.assertEqual(calls[0][1]["external_size"],16)
+            self.assertFalse((root/"runs"/"active.lock").exists())
+
     def test_source_compiles(self):
         for p in (ROOT/"src").glob("kaggle_v4*.py"):
             compile(p.read_text(encoding="utf-8"),str(p),"exec")
