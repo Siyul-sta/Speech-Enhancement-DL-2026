@@ -736,6 +736,11 @@ def preflight(args):
     return codex, kaggle, lock, initial_tracked
 
 
+def target_reached(score: float, target: float) -> bool:
+    """Stop only for an actual finite complete-validation champion."""
+    return math.isfinite(score) and score >= target
+
+
 def main():
     p = argparse.ArgumentParser(description="Stagnation-triggered architecture-switching Ralph V2")
     p.add_argument("--username", required=True)
@@ -746,6 +751,8 @@ def main():
     p.add_argument("--max-rounds", type=int, default=0, help="0 = until GPU quota/safety stop")
     p.add_argument("--stagnation-rounds", type=int, default=2)
     p.add_argument("--min-improvement", type=float, default=0.005)
+    p.add_argument("--target-pesq", type=float, default=4.5,
+                   help="Stop only if a verified 164-file full-run champion reaches this target")
     p.add_argument("--min-gpu-quota-hours", type=float, default=2.0)
     p.add_argument("--max-job-minutes", type=int, default=80)
     p.add_argument("--max-errors", type=int, default=3)
@@ -759,6 +766,7 @@ def main():
             and 0 <= args.max_rounds <= 1000
             and 1 <= args.stagnation_rounds <= 20
             and 0 < args.min_improvement <= 0.25
+            and 1.0 <= args.target_pesq <= 4.5
             and 1 <= args.min_gpu_quota_hours <= 20
             and 15 <= args.max_job_minutes <= 180
             and 1 <= args.max_errors <= 10):
@@ -773,6 +781,11 @@ def main():
         key=lambda v: v["score"],
     )
     print(f"GLOBAL CHAMPION: {champion['score']:.4f} / {champion['origin']}", flush=True)
+    print(f"TARGET: verified Validation PESQ-WB {args.target_pesq:.4f}; "
+          "no metric modifications or private-test tuning", flush=True)
+    if target_reached(champion["score"], args.target_pesq):
+        print("TARGET ALREADY REACHED: no GPU job submitted", flush=True)
+        return
     for name, state in states.items():
         print(f"  family={name}, best={state['score']:.4f}", flush=True)
     print(
@@ -996,6 +1009,17 @@ def main():
 
             append_history(run_dir / "experiments.jsonl", entry)
             history.append(entry)
+            if target_reached(champion["score"], args.target_pesq):
+                print(
+                    f"TARGET REACHED: verified 164-file Validation PESQ-WB="
+                    f"{champion['score']:.4f} >= {args.target_pesq:.4f}; no more GPU jobs",
+                    flush=True,
+                )
+                dashboard_event(
+                    run_dir, "complete",
+                    message=f"목표 달성: Validation PESQ-WB {champion['score']:.4f}",
+                )
+                break
             if errors >= args.max_errors:
                 print("STOP: too many consecutive local/model errors", flush=True)
                 break
@@ -1017,10 +1041,13 @@ def main():
         stop_heartbeat.set()
         heartbeat.join(timeout=2)
         dashboard_event(
-            run_dir, "error" if sys.exc_info()[0] else "stopped",
+            run_dir, "error" if sys.exc_info()[0] else
+            "complete" if target_reached(champion["score"], args.target_pesq) else "stopped",
             message=(
                 f"오류 또는 중단 · 마지막 최고 PESQ {champion['score']:.4f}"
                 if sys.exc_info()[0] else
+                f"목표 달성 · Validation PESQ {champion['score']:.4f}"
+                if target_reached(champion["score"], args.target_pesq) else
                 f"실험 종료 · 마지막 최고 PESQ {champion['score']:.4f}"
             ),
             remote_status="FINISHED",
