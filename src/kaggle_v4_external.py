@@ -439,8 +439,15 @@ class SyntheticPairs(Dataset):
         import math
         rng=random if self.dynamic else random.Random(self.seed+i)
         def clip(paths):
-            y,sr=sf.read(str(rng.choice(paths)),dtype="float32",always_2d=True)
-            y=y.mean(axis=1)
+            path=rng.choice(paths)
+            with sf.SoundFile(str(path)) as audio:
+                sr=audio.samplerate
+                if sr==16000 and len(audio)>=48000:
+                    # Identical random crop to full-file decode, without reading unused audio.
+                    k=rng.randint(0,len(audio)-48000)
+                    audio.seek(k)
+                    return audio.read(48000,dtype="float32",always_2d=True).mean(axis=1).astype(np.float32)
+                y=audio.read(dtype="float32",always_2d=True).mean(axis=1)
             if sr!=16000:
                 g=math.gcd(sr,16000)
                 y=scipy.signal.resample_poly(y,16000//g,sr//g)
@@ -827,10 +834,16 @@ def update_ema(teacher,model):
         if t.is_floating_point(): t.lerp_(p,0.01)
         else: t.copy_(p)
 
-def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None):
+def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,scaler=None):
     variant=cfg["id"]
     optimizer.zero_grad(set_to_none=True)
-    pred = model(noisy)
+    # Only convolutional forward uses AMP; STFT, objectives and teachers stay FP32.
+    if scaler is not None:
+        with torch.autocast(device_type="cuda",dtype=torch.float16):
+            pred=model(noisy)
+        pred=pred.float()
+    else:
+        pred=model(noisy)
     loss = enhancement_loss(pred, clean, variant)
     if distill is not None:
         with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
@@ -854,10 +867,19 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None):
         loss=loss+0.2*F.l1_loss(pred,clean)
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite train loss")
-    loss.backward()
-    torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
-    optimizer.step()
-    update_ema(teacher,model)
+    if scaler is not None:
+        scaler.scale(loss).backward()
+        scaler.unscale_(optimizer)
+        torch.nn.utils.clip_grad_norm_(model.parameters(),5.0)
+        scale_before=scaler.get_scale()
+        scaler.step(optimizer)
+        scaler.update()
+        if scaler.get_scale()>=scale_before: update_ema(teacher,model)
+    else:
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(),5.0)
+        optimizer.step()
+        update_ema(teacher,model)
     return float(loss.detach())
 
 def consistency_step(model,optimizer,teacher,x,mode="consistency"):
@@ -1029,6 +1051,9 @@ def run():
     if cfg.get("distill"):
         distill=MetricGANTransfer().to(device).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
+    use_amp=bool(cfg.get("amp")) and device.type=="cuda" and cfg.get("architecture") in ("temporal","composed")
+    scaler=torch.amp.GradScaler("cuda") if use_amp else None
+    print(f"TRAIN_PRECISION={'amp_fp16_forward_fp32_loss' if use_amp else 'fp32'}",flush=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
     )
@@ -1052,7 +1077,7 @@ def run():
         epoch_started=time.monotonic()
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
             noisy, clean = noisy.to(device,non_blocking=True), clean.to(device,non_blocking=True)
-            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None))
+            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None,scaler=scaler))
             if batch_idx==1 or batch_idx%10==0 or batch_idx==len(train_loader):
                 telemetry={"event":"batch","epoch":epoch,"epochs":int(cfg["epochs"]),"batch":batch_idx,"batches":len(train_loader),"loss":float(losses[-1]),"elapsed_s":time.monotonic()-epoch_started}
                 if device.type=="cuda":
@@ -1101,6 +1126,7 @@ def run():
         metrics={"error":repr(exc)}
     result = {
         "smoke":bool(cfg.get("smoke")),
+        "precision":"amp_fp16_forward_fp32_loss" if use_amp else "fp32",
         "metrics":metrics,
         "evaluation_protocol":"v4-smoke-fixture-v1" if smoke else "v4.2-fixed-dev-v2",
         "domain_scores":{"challenge":best_score,"external_normal":float(np.mean([r[1] for r in external_rows[:32]])),"external_stress":float(np.mean([r[1] for r in external_rows[32:]]))},
