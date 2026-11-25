@@ -113,6 +113,26 @@ class CpuModelTests(unittest.TestCase):
 
 
 
+
+    def test_perf_seed_schedule_same_with_spawn_workers(self):
+        with tempfile.TemporaryDirectory() as d:
+            c=Path(d)/"c.wav"; n=Path(d)/"n.wav"
+            rng=np.random.default_rng(42)
+            sf.write(c,rng.normal(0,.05,72000),16000)
+            sf.write(n,rng.normal(0,.03,72000),16000)
+            with patch.dict(trainer.EXPERIMENT_CONFIG,{"perf_reproducible":True,"seed":43}):
+                ds=trainer.SyntheticPairs([c],[n],4,42,True)
+                trainer.set_data_epoch(ds,1)
+                expected=trainer.fingerprint_pairs(ds)
+                loader=torch.utils.data.DataLoader(ds,batch_size=2,num_workers=2,multiprocessing_context="spawn")
+                actual=[]
+                for x,y in loader: actual.extend(zip(x,y))
+                for i,(x,y) in enumerate(actual):
+                    a,b=ds[i]
+                    self.assertTrue(torch.equal(a,x) and torch.equal(b,y))
+                trainer.set_data_epoch(ds,2)
+                self.assertNotEqual(expected,trainer.fingerprint_pairs(ds))
+
     def test_fixed_validation_materialization_and_seek(self):
         import random
         with tempfile.TemporaryDirectory() as d:
