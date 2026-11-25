@@ -61,3 +61,27 @@ def discover(fetcher=fetch):
             result["papers"].append({"id":node.findtext("a:id",default="",namespaces=ns),"title":" ".join(node.findtext("a:title",default="",namespaces=ns).split()),"abstract":" ".join(node.findtext("a:summary",default="",namespaces=ns).split())[:1000]})
     except Exception as exc: result["errors"]["papers"]=str(exc)
     return result
+
+def validate_network(spec):
+    if not isinstance(spec,dict) or set(spec)!={"width","blocks","activation","norm"}:
+        raise ValueError("Invalid network spec keys")
+    if type(spec["width"]) is not int or spec["width"] not in (16,24,32,48,64):
+        raise ValueError("Unsupported network width")
+    if spec["activation"] not in ("gelu","silu") or type(spec["norm"]) is not bool:
+        raise ValueError("Invalid network activation or norm")
+    if not isinstance(spec["blocks"],list) or not 2<=len(spec["blocks"])<=12:
+        raise ValueError("Invalid number of blocks")
+    for block in spec["blocks"]:
+        if not isinstance(block,dict) or set(block)!={"kernel","dilation","type"}:
+            raise ValueError("Invalid block keys")
+        if type(block["kernel"]) is not int or block["kernel"] not in (3,5,7,9,15):
+            raise ValueError("Invalid kernel")
+        if type(block["dilation"]) is not int or block["dilation"] not in (1,2,4,8,16,32,64,128):
+            raise ValueError("Invalid dilation")
+        if block["type"] not in ("dense","depthwise","gated"):
+            raise ValueError("Unknown block")
+    return spec
+
+def default_network(n):
+    return {"width":[16,32,48][n%3],"activation":["gelu","silu"][n%2],"norm":bool(n%2),
+            "blocks":[{"kernel":[3,5,7,9][(n+i)%4],"dilation":2**(i%7),"type":["dense","depthwise","gated"][(n+i)%3]} for i in range(4+n%5)]}
