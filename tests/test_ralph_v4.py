@@ -21,7 +21,7 @@ class ControllerTests(unittest.TestCase):
             w.writerows((i,value) for i in range(count))
     def test_plan_rotation(self):
         plans=[v4.propose_config([],n,2,None) for n in range(24)]
-        self.assertEqual({p["architecture"] for p in plans},{"residual","temporal","metricgan","moe","composed"})
+        self.assertEqual({p["architecture"] for p in plans},{"residual","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer"})
         self.assertEqual({p["data_profile"] for p in plans},set(catalog.DATASETS))
         self.assertTrue(any(p["distill"] for p in plans))
         self.assertTrue(any(p["loss_mode"]=="composed" for p in plans))
@@ -97,6 +97,49 @@ class ControllerTests(unittest.TestCase):
             state=dashboard_v4.snapshot(Path(d))
             self.assertIsNone(state["best"])
             self.assertEqual(state["experiments"],[])
+
+    def test_public_cache_cpu_submission(self):
+        from types import SimpleNamespace
+        source=(ROOT/"src/kaggle_v4_external.py").read_text(encoding="utf-8")
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            def fake(argv,**kwargs):
+                if "push" in argv:
+                    job=Path(argv[-1])
+                    m=json.loads((job/"kernel-metadata.json").read_text())
+                    self.assertEqual(m["enable_gpu"],"false")
+                    self.assertEqual(m["dataset_sources"],[])
+                    self.assertEqual(m["kernel_sources"],[])
+                    code=(job/"run.py").read_text()
+                    self.assertNotIn(v4.DATASET,code)
+                    compile(code,"cache.py","exec")
+                    return SimpleNamespace(stdout="",stderr="")
+                return SimpleNamespace(stdout="KernelWorkerStatus.COMPLETE",stderr="")
+            with patch.object(v4,"ROOT",root),patch.object(v4.core,"OUTPUT",root/"runs"),patch.object(v4.subprocess,"run",fake):
+                ref=v4.build_public_cache("mock",source,"v4test")
+                self.assertEqual(v4.find_public_cache(),ref)
+                self.assertEqual(v4.history(),[])
+    def test_loop_with_mocked_remote(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            (root/"src").mkdir()
+            for p in (ROOT/"src").glob("kaggle_v4*.py"): shutil.copy(p,root/"src"/p.name)
+            calls=[]
+            def fake(kaggle,source,tag,i,kind,config=None):
+                calls.append((kind,config))
+                return {"kind":kind,"ref":"owner/job-"+str(i)},{"joint_score":2.4,"robust_score":2.3,"best_validation_pesq_wb":2.4,"external_validation_pesq_wb":2.4,"model_family":(config or {}).get("architecture","residual")}
+            with patch.object(v4,"ROOT",root),patch.object(v4.core,"OUTPUT",root/"runs"),patch.object(v4.shutil,"which",return_value="mock"),patch.object(v4.legacy,"require_quota"),patch.object(v4,"submit",fake),patch.object(sys,"argv",["ralph_v4","--loop","--execute","--max-rounds","3","--epochs","2"]):
+                v4.main()
+            self.assertEqual([k for k,c in calls],["v4_public","v4_external","v4_external","v4_external"])
+            self.assertFalse((root/"runs"/"active.lock").exists())
+    def test_public_audit_packaging(self):
+        public=(ROOT/"src/kaggle_v4_public.py").read_text(encoding="utf-8")
+        external=(ROOT/"src/kaggle_v4_external.py").read_text(encoding="utf-8")
+        result=v4.audit_with_public(external,public)
+        self.assertIn("def public_recipe",result)
+        compile(result,"audit.py","exec")
+
     def test_source_compiles(self):
         for p in (ROOT/"src").glob("kaggle_v4*.py"):
             compile(p.read_text(encoding="utf-8"),str(p),"exec")
