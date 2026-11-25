@@ -45,7 +45,7 @@ def main():
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     family=module.EXPERIMENT_CONFIG.get("architecture","residual")
-    names={"residual":"ResidualPhaseUNet","temporal":"TemporalEnhancer","metricgan":"MetricGANTransfer","moe":"AdaptiveMixture","generated":"GeneratedEnhancer"}
+    names={"residual":"ResidualPhaseUNet","temporal":"TemporalEnhancer","metricgan":"MetricGANTransfer","moe":"AdaptiveMixture","composed":"ComposedEnhancer","generated":"GeneratedEnhancer"}
     model=getattr(module,names[family])().to(args.device).eval()
     model.load_state_dict(torch.load(args.checkpoint,map_location=args.device,weights_only=True),strict=True)
     audio,sr=sf.read(args.input,dtype="float32",always_2d=True)
