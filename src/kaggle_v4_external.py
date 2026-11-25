@@ -330,6 +330,60 @@ class SyntheticPairs(Dataset):
         return torch.from_numpy((x/scale).astype(np.float32)),torch.from_numpy((c/scale).astype(np.float32))
 
 
+
+class MetricGANTransfer(nn.Module):
+    """Fine-tune public generator weights through differentiable STFT masking."""
+    def __init__(self):
+        super().__init__()
+        subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3"])
+        from speechbrain.inference.enhancement import SpectralMaskEnhancement
+        engine=SpectralMaskEnhancement.from_hparams(source="speechbrain/metricgan-plus-voicebank",
+            savedir=str(WORK/"metricgan_weights"),run_opts={"device":"cpu"},freeze_params=False)
+        self.generator=engine.mods.enhance_model
+        self.features=engine.hparams.compute_STFT
+        self.resynthesize=engine.hparams.resynth
+        self.generator.requires_grad_(True)
+    def forward(self,x):
+        from speechbrain.processing.features import spectral_magnitude
+        mag=spectral_magnitude(self.features(x),power=0.5)
+        features=torch.log1p(mag)
+        mask=self.generator(features,lengths=torch.ones(x.size(0),device=x.device))
+        if isinstance(mask,tuple): mask=mask[0]
+        return self.resynthesize(torch.expm1(mask*features),x)
+
+class TemporalEnhancer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.inp=nn.Conv1d(1,32,15,padding=7)
+        self.blocks=nn.ModuleList(nn.Sequential(nn.Conv1d(32,32,9,padding=4*d,dilation=d,groups=32),
+            nn.Conv1d(32,32,1),nn.GELU()) for d in (1,2,4,8,16,32,64,128))
+        self.out=nn.Conv1d(32,1,15,padding=7)
+        nn.init.zeros_(self.out.weight)
+        nn.init.zeros_(self.out.bias)
+    def forward(self,x):
+        z=self.inp(x.unsqueeze(1))
+        for block in self.blocks: z=z+block(z)
+        return x+self.out(z).squeeze(1)
+
+class NoisyOnly(Dataset):
+    """Read only noisy manifests; never read validation/test clean files."""
+    def __init__(self,root):
+        self.paths=[]
+        for split in ("train","validation","test"):
+            p=root/split/"samples.csv"
+            if p.is_file():
+                for name in pd.read_csv(p,usecols=["noisy_path"])["noisy_path"]:
+                    q=(root/name).resolve()
+                    if not q.is_relative_to(root.resolve()): raise ValueError("Unsafe path")
+                    self.paths.append(q)
+        self.paths=list(dict.fromkeys(self.paths))
+    def __len__(self): return len(self.paths)
+    def __getitem__(self,i):
+        x,sr=sf.read(self.paths[i],dtype="float32",always_2d=True)
+        if sr!=16000 or x.shape!=(48000,1): raise ValueError("Unexpected noisy shape")
+        return torch.from_numpy(x[:,0])
+
+
 def run():
     cfg = EXPERIMENT_CONFIG
     variant = cfg["id"]
@@ -366,7 +420,12 @@ def run():
         val_set, batch_size=cfg["batch_size"], shuffle=False, num_workers=0
     )
     pesq_function = ensure_pesq()
-    model = ResidualPhaseUNet().to(device)
+    if cfg.get("architecture") == "metricgan":
+        model = MetricGANTransfer().to(device)
+    elif cfg.get("architecture") == "temporal":
+        model = TemporalEnhancer().to(device)
+    else:
+        model = ResidualPhaseUNet().to(device)
     warm_ref = cfg.get("warm_ref")
     if warm_ref:
         slug = warm_ref.rsplit("/", 1)[-1]
@@ -376,6 +435,11 @@ def run():
             raise RuntimeError("Expected one checkpoint from configured private kernel")
         model.load_state_dict(torch.load(matches[0], map_location=device, weights_only=True), strict=True)
         print("Warm start loaded", flush=True)
+    unlabeled = NoisyOnly(root) if cfg.get("self_supervised") else None
+    unlabeled_loader = DataLoader(unlabeled,batch_size=cfg["batch_size"],shuffle=True) if unlabeled is not None else None
+    if unlabeled_loader is not None:
+        import copy
+        teacher=copy.deepcopy(model).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
@@ -398,6 +462,22 @@ def run():
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             optimizer.step()
             losses.append(float(loss.detach()))
+        if unlabeled_loader is not None and epoch >= 2:
+            for k,x in enumerate(unlabeled_loader):
+                if k>=64: break
+                x=x.to(device)
+                with torch.no_grad():
+                    target=teacher(x).clamp(-1,1)
+                perturb=torch.randn_like(x)*0.01
+                optimizer.zero_grad(set_to_none=True)
+                loss=0.1*F.l1_loss(model((x+perturb).clamp(-1,1)),target)
+                if not torch.isfinite(loss): raise RuntimeError("Nonfinite consistency loss")
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(),5.0)
+                optimizer.step()
+                with torch.no_grad():
+                    for t,p in zip(teacher.parameters(),model.parameters()):
+                        t.lerp_(p,0.01)
         scheduler.step()
         val_pesq, _ = evaluate(model, val_loader, device, pesq_function)
         external_pesq, _ = evaluate(model, external_val, device, pesq_function)
@@ -438,8 +518,11 @@ def run():
         "delta_over_baseline": best_score - 1.6961209534144983,
         "seed": cfg["seed"],
         "elapsed_seconds": round(time.monotonic() - started, 2),
-        "model": "ResidualPhaseUNet",
-        "architecture": "sigmoid magnitude head and bounded zero-initialized phase residual head",
+        "model": type(model).__name__,
+        "model_family":cfg.get("architecture","residual"),
+        "transductive_noisy":bool(cfg.get("self_supervised")),
+        "unlabeled_files":len(unlabeled) if unlabeled is not None else 0,
+        "architecture": cfg.get("architecture","residual"),
         "optimizer": "AdamW+CosineAnnealingLR",
         "loss_variant": variant,
         "checkpoint": "best_model.pt",
