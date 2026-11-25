@@ -834,26 +834,28 @@ def run():
         raise RuntimeError("Kaggle GPU unavailable; refusing CPU full training")
     print(f"EXPERIMENT={variant} device={device} seed={cfg['seed']}", flush=True)
 
-    root = locate_data_root()
-    train_set = SpeechPairs(root, "train")
-    if len(train_set) != 1296:
-        raise RuntimeError("Unexpected train split size")
-    tr, dv, tn, dn, ts, tnoise = public_assets(include_test=bool(cfg.get("final_audit")))
-    if cfg.get("data_profile")=="korean" and not cfg.get("final_audit"):
-        subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
-        tr+=fleurs_speech("train")
-        print("Added 256 FLEURS Korean read-speech training clips (approximate clean)",flush=True)
-    train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
-    external_val = DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)]),batch_size=4,shuffle=False)
-    val_set = SpeechPairs(root, "validation")
-    if len(val_set) != 164:
-        raise RuntimeError("Unexpected validation split size")
-    train_loader = DataLoader(
-        train_set, batch_size=cfg["batch_size"], shuffle=True, num_workers=0
-    )
-    val_loader = DataLoader(
-        val_set, batch_size=cfg["batch_size"], shuffle=False, num_workers=0
-    )
+    is_audit=bool(cfg.get("final_audit"))
+    root=None
+    tr, dv, tn, dn, ts, tnoise = public_assets(evaluation_only=is_audit,include_test=is_audit)
+    if not is_audit:
+        root = locate_data_root()
+        train_set = SpeechPairs(root, "train")
+        if len(train_set) != 1296:
+            raise RuntimeError("Unexpected train split size")
+        if cfg.get("data_profile")=="korean":
+            subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
+            # Separate sampling prevents the small Korean corpus from being diluted.
+            korean=fleurs_speech("train")
+            n=int(cfg.get("external_size",1024))
+            train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,n//2,42,True),SyntheticPairs(korean,tn,n-n//2,43,True)])
+        else:
+            train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
+        external_val = DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)]),batch_size=4,shuffle=False)
+        val_set = SpeechPairs(root, "validation")
+        if len(val_set) != 164:
+            raise RuntimeError("Unexpected validation split size")
+        train_loader = DataLoader(train_set,batch_size=cfg["batch_size"],shuffle=True,num_workers=0)
+        val_loader = DataLoader(val_set,batch_size=cfg["batch_size"],shuffle=False,num_workers=0)
     pesq_function = ensure_pesq()
     if cfg.get("public_recipe"):
         class RecipeModel(nn.Module):
@@ -884,12 +886,13 @@ def run():
             raise RuntimeError("Expected one checkpoint from configured private kernel")
         model.load_state_dict(torch.load(matches[0], map_location=device, weights_only=True), strict=True)
         print("Warm start loaded", flush=True)
-    unlabeled = NoisyOnly(root, bool(cfg.get("transductive"))) if cfg.get("self_supervised") else None
+    unlabeled = NoisyOnly(root, bool(cfg.get("transductive"))) if cfg.get("self_supervised") and not is_audit else None
     unlabeled_loader = DataLoader(unlabeled,batch_size=cfg["batch_size"],shuffle=True) if unlabeled is not None else None
     if unlabeled_loader is not None:
         import copy
         teacher=copy.deepcopy(model).eval().requires_grad_(False)
     if cfg.get("final_audit"):
+        model.eval()
         if not warm_ref and not cfg.get("public_recipe"):
             raise RuntimeError("Final audit requires frozen checkpoint or recipe")
         test_loader=DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(ts,tnoise,64,82491,False),SyntheticPairs(ts,tnoise,64,92491,False,stress=True)]),batch_size=4,shuffle=False)
