@@ -409,7 +409,7 @@ def append_history(file: Path, entry: dict) -> None:
 
 def codex_propose(codex: str, *, workfile: Path, family: str,
                   champion: dict, family_state: dict, history: list[dict],
-                  round_dir: Path, model: str) -> str:
+                  round_dir: Path, model: str, target: float) -> str:
     short_history = [
         {k: entry.get(k) for k in ("round", "family", "score", "status", "hypothesis", "win_rate", "worst10_mean_delta", "mean_paired_delta")}
         for entry in history[-15:]
@@ -420,6 +420,8 @@ def codex_propose(codex: str, *, workfile: Path, family: str,
         "Read AGENTS.md. You MUST edit exactly ONE file: " + relative + ". "
         "This is an isolated scratch copy of a full trainer. "
         f"Current model family is {family}; its editable network class is {TEMPLATES[family][1]}. "
+        f"Target honest complete 164-file mean PESQ-WB={target:.4f}, which is near the metric ceiling; "
+        "never falsify scores or leak validation targets. "
         f"Global best complete 164-file PESQ-WB={champion['score']:.5f} "
         f"({champion['origin']}). "
         f"Best for this family={family_state['score']:.5f}. "
@@ -889,6 +891,7 @@ def main():
                         codex, workfile=candidate_file, family=family,
                         champion=champion, family_state=current, history=history,
                         round_dir=round_dir, model=args.codex_model,
+                        target=args.target_pesq,
                     )
                     candidate = candidate_file.read_text(encoding="utf-8")
                 entry["edits"] = validate_source(candidate, current["source"], family)
