@@ -11,6 +11,8 @@ param(
     [switch]$NoDashboard,
     [ValidateRange(2,100)]
     [int]$Epochs = 25,
+    [ValidateRange(1.0,4.5)]
+    [double]$TargetPesq = 4.5,
     [ValidateRange(1,20)]
     [int]$StagnationRounds = 2
 )
@@ -66,6 +68,7 @@ $log = Join-Path $RunRoot ("adaptive_" + (Get-Date -Format "yyyyMMdd_HHmmss") + 
 Start-Transcript -Path $log -Append | Out-Null
 try {
     Write-Host "ADAPTIVE RALPH V2 START"
+    Write-Host "Verified 164-file PESQ-WB target: $TargetPesq"
     Write-Host "First model: residual_phase. Switch after $StagnationRounds full-score plateaus."
     Write-Host "No wall-time cutoff; GPU quota and safety guards remain."
     Write-Host "LOG: $log"
@@ -85,6 +88,7 @@ try {
         "--codex-model", "gpt-6.1-sol",
         "--epochs", "$Epochs",
         "--stagnation-rounds", "$StagnationRounds",
+        "--target-pesq", "$TargetPesq",
         "--max-rounds", "0",
         "--min-gpu-quota-hours", "2",
         "--execute"
