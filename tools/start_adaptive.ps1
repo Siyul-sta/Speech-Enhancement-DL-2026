@@ -9,6 +9,7 @@ Before running:
 param(
     [switch]$ConfirmedNoRemoteJob,
     [switch]$NoDashboard,
+    [switch]$ResearchV3,
     [ValidateRange(2,100)]
     [int]$Epochs = 25,
     [ValidateRange(1.0,4.5)]
@@ -93,6 +94,11 @@ try {
         "--min-gpu-quota-hours", "2",
         "--execute"
     )
+    if ($ResearchV3) {
+        & py -m unittest discover -s tests -p "test_research_v3.py" -v
+        if ($LASTEXITCODE -ne 0) { throw "V3 research tests failed; no GPU job submitted." }
+        $RalphArgs += "--research-v3"
+    }
     & py @RalphArgs
     if ($LASTEXITCODE -ne 0) {
         throw "Adaptive controller ended with error ($LASTEXITCODE); check log."
