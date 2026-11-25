@@ -832,7 +832,7 @@ def run():
         raise RuntimeError("Unexpected train split size")
     tr, dv, tn, dn, ts, tnoise = public_assets(include_test=bool(cfg.get("final_audit")))
     if cfg.get("data_profile")=="korean" and not cfg.get("final_audit"):
-        subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0"])
+        subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
         tr+=fleurs_speech("train")
         print("Added 256 FLEURS Korean read-speech training clips (approximate clean)",flush=True)
     train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
@@ -890,7 +890,7 @@ def run():
         audit={"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref,"public_recipe":cfg.get("public_recipe")}
         if cfg.get("audit_korean"):
             try:
-                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0"])
+                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
                 korean=fleurs_speech("test",64)
                 korean_loader=DataLoader(SyntheticPairs(korean,tnoise,64,99801,False,stress=True),batch_size=4,shuffle=False)
                 kscore,krows=evaluate(model,korean_loader,device,pesq_function,save_rows=True)
@@ -899,7 +899,7 @@ def run():
             except Exception as exc: audit["korean_error"]=repr(exc)
         if cfg.get("audit_urgent"):
             try:
-                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","torchmetrics","onnxruntime","librosa"])
+                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1","torchmetrics==1.6.3","onnxruntime","librosa"])
                 audit["urgent_paired"]=urgent_audit(model,device,pesq_function)
                 audit["urgent_blind"]=urgent_audit(model,device,pesq_function,blind=True)
             except Exception as exc: audit["urgent_error"]=repr(exc)
@@ -907,10 +907,10 @@ def run():
             for name in ("dnsmos","wer"):
                 try:
                     if name=="dnsmos":
-                        subprocess.check_call([sys.executable,"-m","pip","install","-q","torchmetrics","onnxruntime","librosa"])
+                        subprocess.check_call([sys.executable,"-m","pip","install","-q","torchmetrics==1.6.3","onnxruntime","librosa"])
                         audit[name]=dnsmos_metrics(model,test_loader,device)
                     else:
-                        subprocess.check_call([sys.executable,"-m","pip","install","-q","transformers"])
+                        subprocess.check_call([sys.executable,"-m","pip","install","-q","transformers==4.51.3","huggingface_hub<1"])
                         audit[name]=transcription_audit(model,ts,tnoise,device)
                 except Exception as exc: audit[name+"_error"]=repr(exc)
         (WORK/"result.json").write_text(json.dumps(audit,indent=2))
