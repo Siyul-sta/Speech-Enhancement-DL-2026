@@ -14,6 +14,7 @@ from pathlib import Path
 import v4_model_policy as policy
 import v4_research_catalog as catalog
 import tempfile
+import time
 import ralph_v2 as core
 import ralph_loop as legacy
 
@@ -66,7 +67,7 @@ def history():
     records=[]
     for path in sorted(core.OUTPUT.glob("run_v4*/round_*/*/remote_state.json")):
         state=json.loads(path.read_text(encoding="utf-8"))
-        if state.get("status")=="COMPLETE" and state.get("kind")!="v4_audit":
+        if state.get("status")=="COMPLETE" and state.get("kind") not in ("v4_audit","v4_cache"):
             try:
                 r=verify(path.parent,state["kind"])
                 if r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": continue
@@ -122,6 +123,45 @@ def generate_model(codex,records):
         code=code.split("\n",1)[1].rsplit("```",1)[0]
     return code,policy.validate_model(code)
 
+
+def build_public_cache(kaggle,source,tag):
+    """Separate CPU kernel; never attaches the challenge data or weights."""
+    folder=core.OUTPUT/("run_"+tag)/"round_0000"/"v4_cache"
+    folder.mkdir(parents=True)
+    job=ROOT/"kaggle_run"/"ralph_v4"/tag/"public_cache"
+    job.mkdir(parents=True)
+    ref=f"siyul1122/ralph-public-cache-{tag}"
+    title=f"Ralph Public Cache {tag}"
+    tree=ast.parse(source)
+    nodes=[ast.get_source_segment(source,n) for n in tree.body if isinstance(n,ast.FunctionDef) and n.name=="public_assets"]
+    if len(nodes)!=1: raise ValueError("Missing public cache builder")
+    code="import json, zipfile\nfrom pathlib import Path\nWORK=Path('/kaggle/working')\nEXPERIMENT_CONFIG={}\n"+nodes[0]+"\npublic_assets(prepare_only=True)\n"
+    compile(code,"public_cache.py","exec")
+    (job/"run.py").write_text(code,encoding="utf-8")
+    core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"false","enable_internet":"true","dataset_sources":[],"competition_sources":[],"kernel_sources":[]})
+    state=folder/"remote_state.json"
+    core.json_write(state,{"ref":ref,"status":"SUBMIT_PENDING","kind":"v4_cache"})
+    core.dashboard_event(folder.parents[1],"preparing",message="Public-only CPU cache",ref=ref,remote_status="SUBMIT_PENDING")
+    subprocess.run([kaggle,"kernels","push","-p",str(job)],check=True,timeout=180)
+    deadline=time.monotonic()+4*3600
+    while time.monotonic()<deadline:
+        p=subprocess.run([kaggle,"kernels","status",ref],capture_output=True,encoding="utf-8",errors="replace",timeout=60,check=True)
+        status=(p.stdout+" "+p.stderr).upper()
+        if "COMPLETE" in status:
+            core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":"v4_cache"})
+            return ref
+        if any(x in status for x in ("ERROR","CANCEL_ACKNOWLEDGED","CANCELLED","CANCELED")):
+            core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":"v4_cache"})
+            raise legacy.KaggleTerminalFailure("Public cache build failed: "+ref)
+        time.sleep(60)
+    raise TimeoutError("Public cache remains unresolved: "+ref)
+
+def find_public_cache():
+    for p in sorted(core.OUTPUT.glob("run_v4*/round_0000/v4_cache/remote_state.json"),reverse=True):
+        r=json.loads(p.read_text(encoding="utf-8"))
+        if r.get("status")=="COMPLETE": return r["ref"]
+    return None
+
 def submit(kaggle, source, tag, i, kind, config=None):
     folder=core.OUTPUT/("run_"+tag)/f"round_{i:04d}"/kind
     folder.mkdir(parents=True)
@@ -137,7 +177,7 @@ def submit(kaggle, source, tag, i, kind, config=None):
     compile(source,"run.py","exec")
     (job/"run.py").write_text(source,encoding="utf-8")
     (folder/"source.py").write_text(source,encoding="utf-8")
-    core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"true","enable_internet":"true","dataset_sources":[DATASET],"competition_sources":[],"kernel_sources":[config["warm_ref"]] if config and config.get("warm_ref") else []})
+    core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"true","enable_internet":"true","dataset_sources":[DATASET],"competition_sources":[],"kernel_sources":list(dict.fromkeys(config[k] for k in ("warm_ref","public_cache") if config and config.get(k)))})
     state=folder/"remote_state.json"
     core.json_write(state,{"ref":ref,"status":"SUBMIT_PENDING","kind":kind})
     core.dashboard_event(folder.parents[1],"training",message="V4 "+kind,ref=ref,round=i,remote_status="SUBMIT_PENDING")
@@ -171,6 +211,8 @@ def main():
     p.add_argument("--allow-generated-code",action="store_true",help="Opt in to experimental generated Python; AST validation is not a security sandbox")
     p.add_argument("--discover",action="store_true",help="Fetch public dataset/model/paper metadata for strategy selection")
     p.add_argument("--audit-aux",action="store_true",help="Add DNSMOS and transcript WER to final audit")
+    p.add_argument("--build-public-cache",action="store_true",help="Prepare/reuse separate public-only CPU kernel outputs")
+    p.add_argument("--public-cache-ref",help="Existing compatible public corpus kernel output")
     p.add_argument("--execute",action="store_true")
     p.add_argument("--loop",action="store_true",help="Continue mixed-corpus training and warm-start search until quota/safety guard")
     p.add_argument("--codex-research",action="store_true",help="Use Codex for structured strategy proposals")
@@ -196,6 +238,9 @@ def main():
         core.no_uncertain_prior_jobs()
         tag="v4"+datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         records=history()
+        cache=args.public_cache_ref or find_public_cache()
+        if args.build_public_cache and not cache:
+            cache=build_public_cache(kaggle,sources["v4_external"],tag)
         codex=(shutil.which("codex") or shutil.which("codex.cmd")) if args.codex_research else None
         i=0
         if args.final_audit:
@@ -204,12 +249,12 @@ def main():
             if any(json.loads(p.read_text(encoding="utf-8")).get("status")!="ERROR_TERMINAL" for p in core.OUTPUT.glob("run_v4*/round_*/v4_audit/remote_state.json")): raise RuntimeError("Audit already submitted; do not reuse for tuning")
             st,r=max(eligible,key=lambda z:rank_score(z[1]))
             legacy.require_quota(kaggle,2)
-            submit(kaggle,Path(st["source_path"]).read_text(encoding="utf-8"),tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":st["ref"],"architecture":r.get("model_family","residual"),"data_profile":"base","network_spec":r.get("network_spec"),"final_audit":True,"audit_aux":args.audit_aux})
+            submit(kaggle,Path(st["source_path"]).read_text(encoding="utf-8"),tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":st["ref"],"architecture":r.get("model_family","residual"),"data_profile":"base","network_spec":r.get("network_spec"),"final_audit":True,"audit_aux":args.audit_aux,"public_cache":cache})
             return
         if not any(st["kind"]=="v4_public" for st,r in records) or not args.loop:
             legacy.require_quota(kaggle,2)
             i+=1
-            records.append(submit(kaggle,sources["v4_public"],tag,i,"v4_public"))
+            records.append(submit(kaggle,sources["v4_public"],tag,i,"v4_public",{"id":"V4_PUBLIC_ZERO_SHOT","seed":42,"public_cache":cache}))
         if not args.loop: return
         errors=0
         discovery={}
@@ -240,7 +285,7 @@ def main():
                       and (plan["architecture"]!="composed" or r.get("network_spec")==plan["network_spec"])]
             best=max(external,key=lambda pair:rank_score(pair[1]),default=None)
             warm=best[0]["ref"] if best and n%4!=0 else None
-            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":4,"patience":7,"seed":42,"warm_ref":warm,**plan}
+            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
             try:
