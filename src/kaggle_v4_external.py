@@ -303,6 +303,7 @@ def public_assets():
     dv=[p for p in noises if str(p.parent.relative_to(base/"noise")) in held]
     te=[p for p in noises if str(p.parent.relative_to(base/"noise")) in test_held]
     test=sorted((base/"test").rglob("*.flac"))
+    train,dev,tr,dv,test,te=map(quality_paths,(train,dev,tr,dv,test,te))
     if not all((train,dev,tr,dv,test,te)):
         raise RuntimeError("Empty external corpus split")
     records["counts"]={"train":len(train),"dev":len(dev),"train_noise":len(tr),"dev_noise":len(dv)}
@@ -324,7 +325,7 @@ class SyntheticPairs(Dataset):
             if sr!=16000:
                 g=math.gcd(sr,16000)
                 y=scipy.signal.resample_poly(y,16000//g,sr//g)
-            if len(y)==0: raise ValueError("Empty audio")
+            if len(y)==0 or not np.isfinite(y).all(): raise ValueError("Invalid audio")
             if len(y)<48000: y=np.tile(y,(48000+len(y)-1)//len(y))
             k=rng.randint(0,len(y)-48000)
             return y[k:k+48000].astype(np.float32)
@@ -395,6 +396,61 @@ class NoisyOnly(Dataset):
         return torch.from_numpy(x[:,0])
 
 
+
+def quality_paths(paths):
+    valid=[]
+    seen=set()
+    for p in paths:
+        try:
+            info=sf.info(p)
+            if info.frames<info.samplerate//4 or info.samplerate<8000: continue
+            with sf.SoundFile(p) as file:
+                y=file.read(min(info.frames,info.samplerate*3),dtype="float32",always_2d=True)
+            if not np.isfinite(y).all() or np.sqrt(np.mean(y*y))<1e-5: continue
+            import hashlib
+            digest=hashlib.sha256(y.tobytes()).hexdigest()
+            if digest in seen: continue
+            seen.add(digest); valid.append(p)
+        except (OSError,ValueError,RuntimeError): continue
+    return valid
+
+class AdaptiveMixture(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.a=ResidualPhaseUNet()
+        self.b=TemporalEnhancer()
+        self.gate=nn.Sequential(nn.Linear(3,16),nn.GELU(),nn.Linear(16,3))
+    def forward(self,x):
+        rms=x.square().mean(-1).clamp_min(1e-8).sqrt()
+        delta=(x[:,1:]-x[:,:-1]).square().mean(-1).clamp_min(1e-8).sqrt()
+        feat=torch.stack([rms.log(),delta.log(),x.abs().amax(-1)],-1)
+        w=self.gate(feat).softmax(-1)
+        return w[:,0,None]*self.a(x)+w[:,1,None]*self.b(x)+w[:,2,None]*spectral_gate(x)
+
+def spectral_gate(x):
+    win=torch.hann_window(512,device=x.device,dtype=x.dtype)
+    z=torch.stft(x,512,128,window=win,return_complex=True)
+    mag=z.abs()
+    noise=mag.quantile(.2,dim=-1,keepdim=True)
+    gain=(1-noise.square()/(mag.square()+1e-8)).clamp(.08,1).sqrt()
+    return torch.istft(z*gain,512,128,window=win,length=x.shape[-1])
+
+def additional_metrics(model,loader,device):
+    from pystoi import stoi
+    scores=[]
+    model.eval()
+    with torch.no_grad():
+        for x,y in loader:
+            pred=model(x.to(device)).cpu().clamp(-1,1).numpy()
+            for a,b in zip(pred,y.numpy()):
+                a=a-a.mean(); b=b-b.mean()
+                p=np.dot(a,b)*b/(np.dot(b,b)+1e-8)
+                si=10*np.log10((np.dot(p,p)+1e-8)/(np.dot(a-p,a-p)+1e-8))
+                scores.append((float(si),float(stoi(b,a,16000,extended=False))))
+    if not np.isfinite(scores).all(): raise RuntimeError("Nonfinite auxiliary metric")
+    return {"si_sdr":float(np.mean(scores,axis=0)[0]),"stoi":float(np.mean(scores,axis=0)[1])}
+
+
 def run():
     cfg = EXPERIMENT_CONFIG
     variant = cfg["id"]
@@ -433,6 +489,8 @@ def run():
     pesq_function = ensure_pesq()
     if cfg.get("architecture") == "metricgan":
         model = MetricGANTransfer().to(device)
+    elif cfg.get("architecture") == "moe":
+        model = AdaptiveMixture().to(device)
     elif cfg.get("architecture") == "generated":
         model = GeneratedEnhancer().to(device)
     elif cfg.get("architecture") == "temporal":
@@ -461,6 +519,9 @@ def run():
         write_csv(WORK/"audit_per_file.csv",["index","pesq_wb"],rows)
         (WORK/"result.json").write_text(json.dumps({"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref},indent=2))
         return
+    distill = None
+    if cfg.get("distill"):
+        distill=MetricGANTransfer().to(device).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
@@ -485,6 +546,9 @@ def run():
             optimizer.zero_grad(set_to_none=True)
             pred = model(noisy)
             loss = enhancement_loss(pred, clean, variant)
+            if distill is not None:
+                with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
+                loss=loss+0.1*F.l1_loss(pred,pseudo)
             if cfg.get("loss_mode") == "sisdr":
                 a=pred-pred.mean(-1,keepdim=True)
                 b=clean-clean.mean(-1,keepdim=True)
@@ -538,7 +602,15 @@ def run():
     write_csv(WORK / "validation_per_file.csv", ["index", "pesq_wb"], rows)
     external_score, external_rows = evaluate(model, external_val, device, pesq_function, save_rows=True)
     write_csv(WORK / "external_validation.csv", ["index","pesq_wb"], external_rows)
+    metrics={}
+    try:
+        subprocess.check_call([sys.executable,"-m","pip","install","-q","pystoi==0.4.1"])
+        metrics={"challenge":additional_metrics(model,val_loader,device),"external":additional_metrics(model,external_val,device)}
+    except Exception as exc:
+        metrics={"error":repr(exc)}
     result = {
+        "metrics":metrics,
+        "distill":bool(cfg.get("distill")),
         "experiment": variant,
         "best_epoch": best_epoch,
         "epochs_completed": len(history),
