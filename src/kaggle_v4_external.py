@@ -239,7 +239,7 @@ def evaluate(model, loader, device, pesq_function, save_rows=False):
     model.eval()
     values, rows, index = [], [], 0
     for noisy, clean in loader:
-        pred = model(noisy.to(device)).cpu().numpy()
+        pred = model(noisy.to(device,non_blocking=True)).cpu().numpy()
         noisy_np, clean_np = noisy.numpy(), clean.numpy()
         for j in range(len(pred)):
             # Match the output WAV's PCM16 domain when scoring.
@@ -846,6 +846,36 @@ def consistency_step(model,optimizer,teacher,x,mode="consistency"):
     return float(loss.detach())
 
 
+def smoke_pairs(train):
+    """Offline engineering fixture only; real train speech + synthetic noise.
+    No public download or validation-clean input to training. Never ranked.
+    """
+    clean=torch.from_numpy(train.clean[:80]).clone()
+    rng=torch.Generator().manual_seed(20261125)
+    noise=torch.randn(clean.shape,generator=rng)
+    rms=clean.square().mean(-1,keepdim=True).sqrt().clamp_min(1e-5)
+    noise=noise/noise.square().mean(-1,keepdim=True).sqrt().clamp_min(1e-5)
+    snr=torch.linspace(0,15,len(clean)).reshape(-1,1)
+    noisy=clean+noise*rms*10**(-snr/20)
+    scale=torch.maximum(noisy.abs().amax(-1,keepdim=True),clean.abs().amax(-1,keepdim=True)).clamp_min(1)
+    pairs=torch.utils.data.TensorDataset(noisy/scale,clean/scale)
+    return torch.utils.data.Subset(pairs,list(range(16))),torch.utils.data.Subset(pairs,list(range(16,80)))
+
+def fixed_pairs(dataset):
+    """Materialize deterministic validation once; identical order and values."""
+    pairs=[dataset[i] for i in range(len(dataset))]
+    return torch.utils.data.TensorDataset(torch.stack([x for x,y in pairs]),torch.stack([y for x,y in pairs]))
+
+def make_loader(dataset,batch_size,shuffle,device,dynamic=False):
+    import os
+    workers=min(2,max(0,(os.cpu_count() or 1)-1)) if device.type=="cuda" and dynamic else 0
+    opts={"num_workers":workers,"pin_memory":device.type=="cuda"}
+    if workers: opts.update(persistent_workers=True,prefetch_factor=2,multiprocessing_context="spawn")
+    # Spawn cannot see runtime-only dataset globals (RIR profile). Keep those in-process.
+    if TRAIN_RIRS and workers:
+        opts={"num_workers":0,"pin_memory":device.type=="cuda"}
+    return DataLoader(dataset,batch_size=batch_size,shuffle=shuffle,**opts)
+
 def run():
     cfg = EXPERIMENT_CONFIG
     variant = cfg["id"]
@@ -866,30 +896,35 @@ def run():
     print(f"EXPERIMENT={variant} device={device} seed={cfg['seed']}", flush=True)
 
     is_audit=bool(cfg.get("final_audit"))
+    smoke=bool(cfg.get("smoke"))
     root=None
-    tr, dv, tn, dn, ts, tnoise = public_assets(evaluation_only=is_audit,include_test=is_audit)
+    if not smoke:
+        tr, dv, tn, dn, ts, tnoise = public_assets(evaluation_only=is_audit,include_test=is_audit)
     if not is_audit:
         root = locate_data_root()
         train_set = SpeechPairs(root, "train")
         if len(train_set) != 1296:
             raise RuntimeError("Unexpected train split size")
-        if cfg.get("data_profile")=="korean":
-            subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
-            # Separate sampling prevents the small Korean corpus from being diluted.
-            korean=fleurs_speech("train")
-            n=int(cfg.get("external_size",1024))
-            train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,n//2,42,True),SyntheticPairs(korean,tn,n-n//2,43,True)])
+        if smoke:
+            fixture_train,fixture_val=smoke_pairs(train_set)
+            train_set=torch.utils.data.ConcatDataset([torch.utils.data.Subset(train_set,list(range(16))),fixture_train])
+            external_val=make_loader(fixture_val,4,False,device)
+            print("SMOKE FIXTURE: no public download; 64 train-derived synthetic checks, not external generalization",flush=True)
         else:
-            train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
-        if cfg.get("smoke"):
-            # Use 16 challenge and 16 external samples, but the complete fixed validation.
-            train_set=torch.utils.data.Subset(train_set,list(range(16))+list(range(1296,1312)))
-        external_val = DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)]),batch_size=4,shuffle=False)
+            if cfg.get("data_profile")=="korean":
+                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
+                korean=fleurs_speech("train")
+                n=int(cfg.get("external_size",1024))
+                train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,n//2,42,True),SyntheticPairs(korean,tn,n-n//2,43,True)])
+            else:
+                train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
+            external_data=torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)])
+            external_val=make_loader(fixed_pairs(external_data),4,False,device)
         val_set = SpeechPairs(root, "validation")
         if len(val_set) != 164:
             raise RuntimeError("Unexpected validation split size")
-        train_loader = DataLoader(train_set,batch_size=cfg["batch_size"],shuffle=True,num_workers=0)
-        val_loader = DataLoader(val_set,batch_size=cfg["batch_size"],shuffle=False,num_workers=0)
+        train_loader = make_loader(train_set,cfg["batch_size"],True,device,dynamic=not smoke)
+        val_loader = make_loader(val_set,cfg["batch_size"],False,device)
     pesq_function = ensure_pesq()
     if cfg.get("public_recipe"):
         class RecipeModel(nn.Module):
@@ -986,7 +1021,7 @@ def run():
         losses = []
         epoch_started=time.monotonic()
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
-            noisy, clean = noisy.to(device), clean.to(device)
+            noisy, clean = noisy.to(device,non_blocking=True), clean.to(device,non_blocking=True)
             losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None))
             if batch_idx==1 or batch_idx%10==0 or batch_idx==len(train_loader):
                 telemetry={"event":"batch","epoch":epoch,"epochs":int(cfg["epochs"]),"batch":batch_idx,"batches":len(train_loader),"loss":float(losses[-1]),"elapsed_s":time.monotonic()-epoch_started}
@@ -1037,7 +1072,7 @@ def run():
     result = {
         "smoke":bool(cfg.get("smoke")),
         "metrics":metrics,
-        "evaluation_protocol":"v4.2-fixed-dev-v2",
+        "evaluation_protocol":"v4-smoke-fixture-v1" if smoke else "v4.2-fixed-dev-v2",
         "domain_scores":{"challenge":best_score,"external_normal":float(np.mean([r[1] for r in external_rows[:32]])),"external_stress":float(np.mean([r[1] for r in external_rows[32:]]))},
         "robust_score":0.5*float(np.mean([best_score,float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))]))+0.5*min(best_score,float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))),
         "distill":bool(cfg.get("distill")),
