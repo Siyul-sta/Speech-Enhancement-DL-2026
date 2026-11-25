@@ -36,7 +36,7 @@ def rank_score(result):
 
 def verify(folder, kind="v4_public"):
     r = json.loads((folder/"result.json").read_text(encoding="utf-8"))
-    if kind not in ("v4_public","v4_external","v4_audit"): raise ValueError("Unknown result kind")
+    if kind not in ("v4_public","v4_external","v4_audit","v4_smoke"): raise ValueError("Unknown result kind")
     if kind=="v4_audit":
         if r.get("audit_files")!=128: raise ValueError("Wrong audit size")
         verify_rows(folder/"audit_per_file.csv",128,r["audit_pesq"])
@@ -44,10 +44,10 @@ def verify(folder, kind="v4_public"):
     if r["validation_files"] != 164:
         raise ValueError("Expected 164 validation clips")
     verify_rows(folder/"validation_per_file.csv",164,r["best_validation_pesq_wb"])
-    if kind=="v4_external" or r.get("evaluation_protocol")=="v4.2-fixed-dev-v2":
+    if kind in ("v4_external","v4_smoke") or r.get("evaluation_protocol")=="v4.2-fixed-dev-v2":
         if r["external_validation_files"] != 64:
             raise ValueError("Missing external evaluation")
-        if kind=="v4_external" and (not (folder/"best_model.pt").is_file() or (folder/"best_model.pt").stat().st_size==0):
+        if kind in ("v4_external","v4_smoke") and (not (folder/"best_model.pt").is_file() or (folder/"best_model.pt").stat().st_size==0):
             raise ValueError("Missing checkpoint")
         external_rows=verify_rows(folder/"external_validation.csv",64,r["external_validation_pesq_wb"])
         joint=(r["best_validation_pesq_wb"]+r["external_validation_pesq_wb"])/2
@@ -61,13 +61,14 @@ def verify(folder, kind="v4_public"):
             for name,value in zip(("challenge","external_normal","external_stress"),domains):
                 actual=float(r["domain_scores"][name])
                 if not math.isfinite(actual) or abs(actual-value)>1e-6: raise ValueError("Invalid domain score")
+    if kind=="v4_smoke" and (not r.get("smoke") or r.get("epochs_completed")!=2): raise ValueError("Incomplete isolated smoke run")
     return r
 
 def history():
     records=[]
     for path in sorted(core.OUTPUT.glob("run_v4*/round_*/*/remote_state.json")):
         state=json.loads(path.read_text(encoding="utf-8"))
-        if state.get("status")=="COMPLETE" and state.get("kind") not in ("v4_audit","v4_cache"):
+        if state.get("status")=="COMPLETE" and state.get("kind") not in ("v4_audit","v4_cache","v4_smoke"):
             try:
                 r=verify(path.parent,state["kind"])
                 if r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": continue
@@ -190,6 +191,9 @@ def submit(kaggle, source, tag, i, kind, config=None):
         raise
     r=verify(folder,kind)
     core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind})
+    if kind=="v4_smoke":
+        print("SMOKE PASS (not ranked)",json.dumps(r),flush=True)
+        return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
     if kind=="v4_audit":
         print("FINAL AUDIT",json.dumps(r),flush=True)
         return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
@@ -215,6 +219,7 @@ def audit_with_public(external,public):
 
 def main():
     p=argparse.ArgumentParser()
+    p.add_argument("--smoke",action="store_true",help="One isolated two-epoch training smoke; no leaderboard promotion")
     p.add_argument("--final-audit",action="store_true",help="Evaluate frozen best non-transductive built-in checkpoint once")
     p.add_argument("--allow-generated-code",action="store_true",help="Opt in to experimental generated Python; AST validation is not a security sandbox")
     p.add_argument("--discover",action="store_true",help="Fetch public dataset/model/paper metadata for strategy selection")
@@ -229,6 +234,7 @@ def main():
     p.add_argument("--max-rounds",type=int,default=0,help="0 means until quota/safety stop")
     p.add_argument("--epochs",type=int,default=15,choices=range(2,101))
     args=p.parse_args()
+    if args.smoke and (args.loop or args.final_audit): p.error("--smoke cannot be combined with --loop or --final-audit")
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
     sources["v4_public"]=public_with_external(sources["v4_public"],sources["v4_external"])
@@ -254,6 +260,10 @@ def main():
             cache=build_public_cache(kaggle,sources["v4_external"],tag)
         codex=(shutil.which("codex") or shutil.which("codex.cmd")) if args.codex_research else None
         i=0
+        if args.smoke:
+            legacy.require_quota(kaggle,2)
+            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":"temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":cache})
+            return
         if args.final_audit:
             eligible=[(st,r) for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file()]
             if not eligible: raise RuntimeError("No eligible frozen model or recipe")
