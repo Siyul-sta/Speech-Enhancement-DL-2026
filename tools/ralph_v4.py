@@ -8,6 +8,7 @@ import math
 import os
 import re
 import shutil
+import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 import ralph_v2 as core
@@ -50,6 +51,32 @@ def history():
                 continue
     return records
 
+
+def propose_config(records, n, epochs, codex):
+    """Codex chooses a typed research plan; no arbitrary evaluation code edits."""
+    architectures=("residual","temporal","metricgan")
+    fallback={"architecture":architectures[n%3],"self_supervised":bool(n%2),
+              "lr":0.0001,"external_size":[512,1024,2048][n%3]}
+    if not codex: return fallback
+    evidence=[{"kind":st["kind"],"result":r} for st,r in records[-12:]]
+    prompt=("Return ONLY one JSON object, no code or markdown. Design next speech enhancement trial "
+            "to improve challenge and external domain PESQ. Allowed keys: architecture (residual, temporal, metricgan), "
+            "self_supervised (boolean, uses noisy-only transductive consistency), lr (0.00001 to 0.001), "
+            "external_size (512,1024,2048). Avoid repeated failed or stagnant settings. "
+            "No filesystem edits, no training or external commands. History: "+json.dumps(evidence)[-14000:])
+    try:
+        p=subprocess.run([codex,"exec","--sandbox","read-only",prompt],cwd=ROOT,
+                         capture_output=True,encoding="utf-8",errors="replace",timeout=180,check=True)
+        match=re.search(r'\{[^{}]*"architecture"[^{}]*\}',p.stdout,re.S)
+        obj=json.loads(match.group(0))
+        if (obj["architecture"] not in architectures or type(obj["self_supervised"]) is not bool
+            or not 0.00001<=float(obj["lr"])<=0.001 or obj["external_size"] not in (512,1024,2048)):
+            raise ValueError("Invalid proposal")
+        return {k:obj[k] for k in fallback}
+    except Exception as exc:
+        print("Codex proposal unavailable; using deterministic fallback:",str(exc),flush=True)
+        return fallback
+
 def submit(kaggle, source, tag, i, kind, config=None):
     folder=core.OUTPUT/("run_"+tag)/f"round_{i:04d}"/kind
     folder.mkdir(parents=True)
@@ -67,13 +94,16 @@ def submit(kaggle, source, tag, i, kind, config=None):
     core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"true","enable_internet":"true","dataset_sources":[DATASET],"competition_sources":[],"kernel_sources":[config["warm_ref"]] if config and config.get("warm_ref") else []})
     state=folder/"remote_state.json"
     core.json_write(state,{"ref":ref,"status":"SUBMIT_PENDING","kind":kind})
+    core.dashboard_event(folder.parents[1],"training",message="V4 "+kind,ref=ref,round=i,remote_status="SUBMIT_PENDING")
     try:
-        core.poll_adaptive_kernel(kaggle,job,ref,folder,180*60)
+        core.poll_adaptive_kernel(kaggle,job,ref,folder,180*60,status_hook=lambda status,**updates: core.dashboard_event(folder.parents[1], "training",remote_status=status,ref=ref,**updates))
     except legacy.KaggleTerminalFailure:
         core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":kind})
         raise
     r=verify(folder,kind)
     core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind})
+    core.append_history(folder.parents[1]/"experiments.jsonl",{"round":i,"family":kind,"status":"COMPLETE","score":r["best_validation_pesq_wb"],"kernel":ref,"external_score":r.get("external_validation_pesq_wb"),"hypothesis":json.dumps(config or {})})
+    core.dashboard_event(folder.parents[1],"scoring",message="V4 verified results",ref=ref,remote_status="COMPLETE")
     print(json.dumps(r,indent=2),flush=True)
     return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
 
@@ -81,6 +111,7 @@ def main():
     p=argparse.ArgumentParser()
     p.add_argument("--execute",action="store_true")
     p.add_argument("--loop",action="store_true",help="Continue mixed-corpus training and warm-start search until quota/safety guard")
+    p.add_argument("--codex-research",action="store_true",help="Use Codex for structured strategy proposals")
     p.add_argument("--epochs",type=int,default=15,choices=range(2,101))
     args=p.parse_args()
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
@@ -99,24 +130,35 @@ def main():
         core.no_uncertain_prior_jobs()
         tag="v4"+datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         records=history()
+        codex=(shutil.which("codex") or shutil.which("codex.cmd")) if args.codex_research else None
         i=0
         if not any(st["kind"]=="v4_public" for st,r in records) or not args.loop:
             legacy.require_quota(kaggle,2)
             i+=1
             records.append(submit(kaggle,sources["v4_public"],tag,i,"v4_public"))
         if not args.loop: return
+        errors=0
         for n in itertools.count(sum(st["kind"]=="v4_external" for st,r in records)):
             try: legacy.require_quota(kaggle,2)
             except legacy.QuotaGuardReached as exc:
                 print("STOP",exc,flush=True); break
-            external=[(st,r) for st,r in records if st["kind"]=="v4_external"]
+            plan=propose_config(records,n,args.epochs,codex)
+            external=[(st,r) for st,r in records if st["kind"]=="v4_external"
+                      and r.get("model_family","residual")==plan["architecture"]
+                      and bool(r.get("transductive_noisy"))==plan["self_supervised"]]
             best=max(external,key=lambda pair:pair[1]["joint_score"],default=None)
-            # Alternate scratch baselines and warm-start learning rates/data ratios.
             warm=best[0]["ref"] if best and n%4!=0 else None
-            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":4,"patience":7,"seed":42,"warm_ref":warm,
-                 "lr":([0.0001,0.0002,0.00005][n%3] if warm else 0.00035),"external_size":[512,1024,2048][n%3]}
+            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":4,"patience":7,"seed":42,"warm_ref":warm,**plan}
+            print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
-            records.append(submit(kaggle,sources["v4_external"],tag,i,"v4_external",cfg))
+            try:
+                records.append(submit(kaggle,sources["v4_external"],tag,i,"v4_external",cfg))
+                errors=0
+            except legacy.KaggleTerminalFailure as exc:
+                errors+=1
+                print("Terminal experiment error",str(exc),flush=True)
+                if errors>=3: break
+                continue
             ranked=max((r for st,r in records if st["kind"]=="v4_external"),key=lambda r:r["joint_score"])
             print("BEST JOINT",ranked["joint_score"],"challenge",ranked["best_validation_pesq_wb"],"external",ranked["external_validation_pesq_wb"],flush=True)
     finally:
