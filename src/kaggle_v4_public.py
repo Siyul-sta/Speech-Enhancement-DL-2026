@@ -168,6 +168,16 @@ def load_model(name, device):
             savedir=str(Path("/tmp/ralph_v4_public_metricgan") if Path("/kaggle").exists() else WORK / "public_weights" / "metricgan"),
             run_opts={"device": str(device)})
         return lambda x: engine.enhance_batch(x, lengths=torch.ones(x.shape[0], device=x.device))
+    if name in ("sepformer_dns","sepformer_wham"):
+        subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3"])
+        from speechbrain.inference.separation import SepformerSeparation
+        model_id={"sepformer_dns":"speechbrain/sepformer-dns4-16k-enhancement","sepformer_wham":"speechbrain/sepformer-wham16k-enhancement"}[name]
+        engine=SepformerSeparation.from_hparams(source=model_id,savedir="/tmp/v4_"+name,run_opts={"device":str(device)})
+        def infer(x):
+            y=engine.separate_batch(x)
+            if y.ndim!=3 or y.shape[-1]!=1: raise RuntimeError("Expected one enhanced source")
+            return y.squeeze(-1)
+        return infer
     if name == "deepfilter":
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "deepfilternet==0.5.6"])
         from df.enhance import init_df, enhance
@@ -194,7 +204,7 @@ def run():
         raise RuntimeError("Expected 164 validation clips")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pesq_fn = ensure_pesq()
-    names = ("metricgan", "deepfilter")
+    names = ("metricgan", "deepfilter", "sepformer_dns", "sepformer_wham")
     predictions, errors = {}, {}
     noisy = torch.from_numpy(data.noisy)
     for name in names:
@@ -215,9 +225,10 @@ def run():
     for name, pred in predictions.items():
         for alpha in (0.7, 0.85, 1.0):
             candidates[f"{name}:{alpha}"] = alpha * pred + (1-alpha) * noisy
-    if len(predictions) == 2:
-        for alpha in (0.25, 0.5, 0.75):
-            candidates[f"blend:{alpha}"] = alpha * predictions["metricgan"] + (1-alpha) * predictions["deepfilter"]
+    import itertools
+    for a,b in itertools.combinations(predictions,2):
+        for alpha in (0.25,0.5,0.75):
+            candidates[f"blend:{a}:{b}:{alpha}"]=alpha*predictions[a]+(1-alpha)*predictions[b]
     scores = {}
     best_rows = None
     best = -float("inf")
