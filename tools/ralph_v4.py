@@ -53,7 +53,7 @@ def verify(folder, kind="v4_public"):
         joint=(r["best_validation_pesq_wb"]+r["external_validation_pesq_wb"])/2
         if not math.isfinite(float(r["joint_score"])) or abs(joint-r["joint_score"])>1e-6:
             raise ValueError("Invalid joint score")
-        if r.get("evaluation_protocol")=="v4.2-fixed-dev-v2":
+        if r.get("evaluation_protocol") in ("v4.2-fixed-dev-v2","v4-smoke-fixture-v1"):
             domains=[float(r["best_validation_pesq_wb"]),sum(external_rows[:32])/32,sum(external_rows[32:])/32]
             robust=0.5*sum(domains)/3+0.5*min(domains)
             if not math.isfinite(float(r["robust_score"])) or abs(robust-r["robust_score"])>1e-6:
@@ -256,13 +256,14 @@ def main():
         tag="v4"+datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
         records=history()
         cache=args.public_cache_ref or find_public_cache()
-        if args.build_public_cache and not cache:
+        if args.build_public_cache and not cache and not args.smoke:
             cache=build_public_cache(kaggle,sources["v4_external"],tag)
         codex=(shutil.which("codex") or shutil.which("codex.cmd")) if args.codex_research else None
         i=0
         if args.smoke:
+            print("SMOKE: no public cache or corpus download required",flush=True)
             legacy.require_quota(kaggle,2)
-            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":"temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":cache})
+            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":"temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":None})
             return
         if args.final_audit:
             eligible=[(st,r) for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file()]
