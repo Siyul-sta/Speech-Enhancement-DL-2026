@@ -476,6 +476,71 @@ def additional_metrics(model,loader,device):
     return {"si_sdr":float(np.mean(scores,axis=0)[0]),"stoi":float(np.mean(scores,axis=0)[1])}
 
 
+
+@torch.no_grad()
+def dnsmos_metrics(model,loader,device):
+    from torchmetrics.functional.audio.dnsmos import deep_noise_suppression_mean_opinion_score
+    rows=[]
+    model.eval()
+    for x,_ in loader:
+        pred=model(x.to(device)).cpu().clamp(-1,1)
+        rows.extend(deep_noise_suppression_mean_opinion_score(pred,16000,False).cpu().reshape(-1,4).tolist())
+    if not rows or not np.isfinite(rows).all(): raise RuntimeError("Invalid DNSMOS")
+    return dict(zip(("p808","sig","bak","ovrl"),map(float,np.mean(rows,axis=0))))
+
+def word_error_count(reference,hypothesis):
+    a,b=reference.lower().split(),hypothesis.lower().split()
+    prev=list(range(len(b)+1))
+    for i,w in enumerate(a,1):
+        cur=[i]
+        for j,v in enumerate(b,1): cur.append(min(cur[-1]+1,prev[j]+1,prev[j-1]+(w!=v)))
+        prev=cur
+    return prev[-1],len(a)
+
+@torch.no_grad()
+def transcription_audit(model,speech,noise,device):
+    """WER uses full held-out utterances with original LibriSpeech transcripts.
+    This is an audit-only metric, never fed to the research planner.
+    """
+    from transformers import pipeline
+    import scipy.signal
+    rng=random.Random(82491)
+    asr=pipeline("automatic-speech-recognition",model="openai/whisper-tiny.en",device=-1)
+    transcripts={}
+    for file in sorted({p.parent for p in speech}):
+        for path in file.glob("*.trans.txt"):
+            for row in path.read_text(encoding="utf-8").splitlines():
+                if " " in row:
+                    key,value=row.split(" ",1); transcripts[key]=value
+    chosen=[p for p in speech if p.stem in transcripts]
+    rng.shuffle(chosen)
+    errors=words=0
+    for p in chosen[:24]:
+        c,sr=sf.read(p,dtype="float32",always_2d=True)
+        c=c.mean(1)
+        if sr!=16000: c=scipy.signal.resample_poly(c,16000//math.gcd(sr,16000),sr//math.gcd(sr,16000))
+        n,nsr=sf.read(rng.choice(noise),dtype="float32",always_2d=True)
+        n=n.mean(1)
+        if nsr!=16000: n=scipy.signal.resample_poly(n,16000//math.gcd(nsr,16000),nsr//math.gcd(nsr,16000))
+        if not len(c) or not len(n): continue
+        n=np.tile(n,(len(c)+len(n)-1)//len(n))[:len(c)]
+        x=c+n*np.sqrt((np.mean(c*c)+1e-8)/(np.mean(n*n)+1e-8))*.56234
+        x=x/max(1,float(np.max(np.abs(x))))
+        out=[]
+        for k in range(0,len(x),48000):
+            clip=x[k:k+48000]
+            y=model(torch.from_numpy(np.pad(clip,(0,48000-len(clip))).astype(np.float32))[None].to(device))
+            out.append(y.cpu().numpy()[0,:len(clip)])
+        wave=np.concatenate(out).clip(-1,1)
+        text=asr({"array":wave,"sampling_rate":16000})["text"]
+        import re
+        normalize=lambda t:re.sub(r"[^a-z0-9' ]"," ",t.lower())
+        e,w=word_error_count(normalize(transcripts[p.stem]),normalize(text))
+        errors+=e; words+=w
+    if not words: raise RuntimeError("No transcript words available")
+    return {"wer":errors/words,"words":words}
+
+
 def run():
     cfg = EXPERIMENT_CONFIG
     variant = cfg["id"]
@@ -542,7 +607,18 @@ def run():
         test_loader=DataLoader(SyntheticPairs(ts,tnoise,128,82491,False),batch_size=4,shuffle=False)
         score,rows=evaluate(model,test_loader,device,pesq_function,save_rows=True)
         write_csv(WORK/"audit_per_file.csv",["index","pesq_wb"],rows)
-        (WORK/"result.json").write_text(json.dumps({"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref},indent=2))
+        audit={"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref}
+        if cfg.get("audit_aux"):
+            for name in ("dnsmos","wer"):
+                try:
+                    if name=="dnsmos":
+                        subprocess.check_call([sys.executable,"-m","pip","install","-q","torchmetrics","onnxruntime","librosa"])
+                        audit[name]=dnsmos_metrics(model,test_loader,device)
+                    else:
+                        subprocess.check_call([sys.executable,"-m","pip","install","-q","transformers"])
+                        audit[name]=transcription_audit(model,ts,tnoise,device)
+                except Exception as exc: audit[name+"_error"]=repr(exc)
+        (WORK/"result.json").write_text(json.dumps(audit,indent=2))
         return
     distill = None
     if cfg.get("distill"):
@@ -576,7 +652,17 @@ def run():
             if distill is not None:
                 with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
                 loss=loss+0.1*F.l1_loss(pred,pseudo)
-            if cfg.get("loss_mode") == "sisdr":
+            if cfg.get("loss_mode") == "composed":
+                weights=cfg["loss_weights"]
+                a=pred-pred.mean(-1,keepdim=True)
+                b=clean-clean.mean(-1,keepdim=True)
+                proj=(a*b).sum(-1,keepdim=True)*b/(b.square().sum(-1,keepdim=True)+1e-8)
+                si=(10*torch.log10((proj.square().sum(-1)+1e-8)/((a-proj).square().sum(-1)+1e-8))).clamp(-30,30).mean()
+                win=torch.hann_window(512,device=pred.device,dtype=pred.dtype)
+                p_mag=torch.stft(pred,512,128,window=win,return_complex=True).abs()
+                c_mag=torch.stft(clean,512,128,window=win,return_complex=True).abs()
+                loss=loss+weights["wave"]*F.l1_loss(pred,clean)+weights["spectral"]*F.l1_loss(p_mag.log1p(),c_mag.log1p())-0.01*weights["sisdr"]*si
+            elif cfg.get("loss_mode") == "sisdr":
                 a=pred-pred.mean(-1,keepdim=True)
                 b=clean-clean.mean(-1,keepdim=True)
                 proj=(a*b).sum(-1,keepdim=True)*b/(b.square().sum(-1,keepdim=True)+1e-8)
@@ -656,6 +742,7 @@ def run():
         "model": type(model).__name__,
         "model_family":cfg.get("architecture","residual"),
         "loss_mode":cfg.get("loss_mode","base"),
+        "loss_weights":cfg.get("loss_weights"),
         "data_profile":cfg.get("data_profile","base"),
         "augmentation":cfg.get("augmentation","base"),
         "generated_hash":cfg.get("generated_hash"),
