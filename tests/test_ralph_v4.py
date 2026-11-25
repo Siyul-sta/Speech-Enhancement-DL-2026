@@ -12,6 +12,7 @@ sys.path.insert(0,str(ROOT/"tools"))
 import ralph_v4 as v4
 import v4_research_catalog as catalog
 import v4_model_policy as policy
+import dashboard_v4
 
 class ControllerTests(unittest.TestCase):
     def rows(self,path,count,value):
@@ -84,6 +85,18 @@ class ControllerTests(unittest.TestCase):
                 st,r=v4.submit("mock",'DATASET_SLUG = "PRIVATE_DATASET_SLUG"\n',"v4test",1,"v4_public")
                 self.assertEqual(st["status"],"COMPLETE")
                 self.assertEqual(r["best_validation_pesq_wb"],2.5)
+    def test_public_shared_evaluator(self):
+        public=(ROOT/"src/kaggle_v4_public.py").read_text(encoding="utf-8")
+        external=(ROOT/"src/kaggle_v4_external.py").read_text(encoding="utf-8")
+        combined=v4.public_with_external(public,external)
+        self.assertIn("class SyntheticPairs",combined)
+        self.assertIn("def public_assets",combined)
+        compile(combined,"combined.py","exec")
+    def test_empty_dashboard(self):
+        with tempfile.TemporaryDirectory() as d:
+            state=dashboard_v4.snapshot(Path(d))
+            self.assertIsNone(state["best"])
+            self.assertEqual(state["experiments"],[])
     def test_source_compiles(self):
         for p in (ROOT/"src").glob("kaggle_v4*.py"):
             compile(p.read_text(encoding="utf-8"),str(p),"exec")
