@@ -10,6 +10,7 @@ No private WAVs are copied into outputs.
 from __future__ import annotations
 
 import csv
+import math
 import importlib
 import json
 import random
@@ -274,23 +275,37 @@ def public_assets():
                "test":"https://www.openslr.org/resources/12/test-clean.tar.gz",
                "noise":"https://www.openslr.org/resources/17/musan.tar.gz"}
     records = {}
+    if EXPERIMENT_CONFIG.get("data_profile")=="spanish":
+        sources["extra_speech"]="https://www.openslr.org/resources/73/es_pe_female.zip"
     for key,url in sources.items():
-        archive = base / (key+".tar.gz")
+        archive = base / (key+(".zip" if url.endswith(".zip") else ".tar.gz"))
         target = base / key
         if not (target / ".complete").exists():
             if not archive.exists():
-                urllib.request.urlretrieve(url, str(archive)+".partial")
+                with urllib.request.urlopen(url,timeout=60) as response, open(str(archive)+".partial","wb") as out:
+                    import shutil
+                    shutil.copyfileobj(response,out,1024*1024)
                 Path(str(archive)+".partial").replace(archive)
             target.mkdir(exist_ok=True)
-            with tarfile.open(archive,"r:gz") as tf:
-                tf.extractall(target, filter="data")
+            if archive.suffix==".zip":
+                with zipfile.ZipFile(archive) as zf:
+                    for member in zf.infolist():
+                        if not (target/member.filename).resolve().is_relative_to(target.resolve()): raise ValueError("Unsafe archive path")
+                    zf.extractall(target)
+            else:
+                with tarfile.open(archive,"r:gz") as tf:
+                    tf.extractall(target, filter="data")
             (target / ".complete").touch()
         h=hashlib.sha256()
         with archive.open("rb") as f:
             for chunk in iter(lambda:f.read(1048576),b""):
                 h.update(chunk)
-        records[key]={"url":url,"sha256":h.hexdigest()}
+        records[key]={"url":url,"sha256":h.hexdigest(),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "CC-BY-4.0 (MUSAN individual terms apply)"}
     train=sorted((base/"train").rglob("*.flac"))
+    if "extra_speech" in sources:
+        extra=sorted((base/"extra_speech").rglob("*.wav"))
+        if not extra: raise RuntimeError("Additional speech corpus empty")
+        train+=extra
     dev=sorted((base/"dev").rglob("*.flac"))
     noises=sorted(p for p in (base/"noise").rglob("*.wav") if "noise" in p.relative_to(base/"noise").parts or "music" in p.relative_to(base/"noise").parts)
     groups=sorted({str(p.parent.relative_to(base/"noise")) for p in noises})
@@ -333,6 +348,16 @@ class SyntheticPairs(Dataset):
         snr=rng.uniform(-5,20)
         n=n*(np.sqrt(np.mean(c*c)+1e-8)/np.sqrt(np.mean(n*n)+1e-8))*10**(-snr/20)
         x=c+n
+        if self.dynamic and EXPERIMENT_CONFIG.get("augmentation")=="room_codec":
+            # Train-only synthetic room tails and bandwidth degradation.
+            if rng.random()<0.6:
+                impulse=np.zeros(2048,dtype=np.float32); impulse[0]=1
+                for k in range(1,7):
+                    delay=rng.randint(20,2047)
+                    impulse[delay]+=rng.uniform(-.3,.3)*np.exp(-delay/1000)
+                x=scipy.signal.fftconvolve(x,impulse)[:len(x)]
+            if rng.random()<0.4:
+                x=scipy.signal.resample_poly(scipy.signal.resample_poly(x,1,2),2,1)[:len(x)]
         scale=max(1.0,float(np.max(np.abs(x))),float(np.max(np.abs(c))))
         return torch.from_numpy((x/scale).astype(np.float32)),torch.from_numpy((c/scale).astype(np.float32))
 
@@ -347,7 +372,7 @@ class MetricGANTransfer(nn.Module):
         engine=SpectralMaskEnhancement.from_hparams(source="speechbrain/metricgan-plus-voicebank",
             savedir=str(Path("/tmp/ralph_v4_metricgan") if Path("/kaggle").exists() else WORK/"metricgan_weights"),run_opts={"device":"cpu"},freeze_params=False)
         self.generator=engine.mods.enhance_model
-        self.features=engine.hparams.compute_STFT
+        self.features=engine.hparams.compute_stft
         self.resynthesize=engine.hparams.resynth
         self.generator.requires_grad_(True)
     def forward(self,x):
@@ -526,6 +551,8 @@ def run():
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
     )
+    if cfg.get("architecture")=="generated" and sum(p.numel() for p in model.parameters())>5000000:
+        raise RuntimeError("Generated model exceeds parameter budget")
     probe=torch.randn(1,48000,device=device)*0.05
     out=model(probe)
     if out.shape!=probe.shape or not torch.isfinite(out).all():
@@ -629,6 +656,8 @@ def run():
         "model": type(model).__name__,
         "model_family":cfg.get("architecture","residual"),
         "loss_mode":cfg.get("loss_mode","base"),
+        "data_profile":cfg.get("data_profile","base"),
+        "augmentation":cfg.get("augmentation","base"),
         "generated_hash":cfg.get("generated_hash"),
         "transductive_noisy":bool(cfg.get("transductive")) and bool(cfg.get("self_supervised")),
         "self_supervised":bool(cfg.get("self_supervised")),
