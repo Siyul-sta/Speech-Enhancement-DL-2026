@@ -267,7 +267,7 @@ def write_csv(path: Path, fields, records):
 
 # Public training corpora: LibriSpeech, MUSAN and optional SLR73/SLR28.
 TRAIN_RIRS=[]
-def public_assets(evaluation_only=False):
+def public_assets(evaluation_only=False,include_test=False):
     import urllib.request, tarfile, hashlib
     base = Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external"
     base.mkdir(parents=True, exist_ok=True)
@@ -275,8 +275,9 @@ def public_assets(evaluation_only=False):
                "dev":"https://www.openslr.org/resources/12/dev-clean.tar.gz",
                "test":"https://www.openslr.org/resources/12/test-clean.tar.gz",
                "noise":"https://www.openslr.org/resources/17/musan.tar.gz"}
+    if not include_test: sources.pop("test")
     if evaluation_only:
-        sources.pop("train"); sources.pop("test")
+        sources.pop("train",None)
     records = {}
     if not evaluation_only and EXPERIMENT_CONFIG.get("data_profile")=="spanish":
         sources["extra_speech"]="https://www.openslr.org/resources/73/es_pe_female.zip"
@@ -346,7 +347,7 @@ def public_assets(evaluation_only=False):
     te=[p for p in noises if str(p.parent.relative_to(base/"noise")) in test_held]
     test=sorted((base/"test").rglob("*.flac"))
     train,dev,tr,dv,test,te=map(quality_paths,(train,dev,tr,dv,test,te))
-    if not all((dev,tr,dv,te)) or (not evaluation_only and not all((train,test))):
+    if not all((dev,tr,dv,te)) or (not evaluation_only and not train) or (include_test and not test):
         raise RuntimeError("Empty external corpus split")
     records["counts"]={"train":len(train),"dev":len(dev),"test":len(test),"train_noise":len(tr),"dev_noise":len(dv),"test_noise":len(te),"rir":len(TRAIN_RIRS)}
     (WORK/"external_manifest.json").write_text(json.dumps(records,indent=2))
@@ -403,7 +404,10 @@ class MetricGANTransfer(nn.Module):
     """Fine-tune public generator weights through differentiable STFT masking."""
     def __init__(self):
         super().__init__()
-        subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3"])
+        try:
+            import speechbrain
+        except ImportError:
+            subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3","huggingface_hub<1"])
         from speechbrain.inference.enhancement import SpectralMaskEnhancement
         engine=SpectralMaskEnhancement.from_hparams(source="speechbrain/metricgan-plus-voicebank",
             savedir=str(Path("/tmp/ralph_v4_metricgan") if Path("/kaggle").exists() else WORK/"metricgan_weights"),run_opts={"device":"cpu"},freeze_params=False)
@@ -630,7 +634,7 @@ def run():
     train_set = SpeechPairs(root, "train")
     if len(train_set) != 1296:
         raise RuntimeError("Unexpected train split size")
-    tr, dv, tn, dn, ts, tnoise = public_assets()
+    tr, dv, tn, dn, ts, tnoise = public_assets(include_test=bool(cfg.get("final_audit")))
     train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
     external_val = DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)]),batch_size=4,shuffle=False)
     val_set = SpeechPairs(root, "validation")
