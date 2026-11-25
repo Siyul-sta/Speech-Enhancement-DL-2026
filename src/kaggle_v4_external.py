@@ -972,6 +972,9 @@ def run():
     if device.type != "cuda" and Path("/kaggle").exists():
         raise RuntimeError("Kaggle GPU unavailable; refusing CPU full training")
     print(f"EXPERIMENT={variant} device={device} seed={cfg['seed']}", flush=True)
+    hardware={"device":torch.cuda.get_device_name(device) if device.type=="cuda" else "cpu","torch":str(torch.__version__),"cuda":torch.version.cuda,"cpu_count":__import__("os").cpu_count()}
+    expected=cfg.get("expected_perf")
+    if expected and hardware!=expected["hardware"]: raise RuntimeError("Approved performance hardware changed; use serial FP32")
 
     is_audit=bool(cfg.get("final_audit"))
     smoke=bool(cfg.get("smoke"))
@@ -1009,6 +1012,8 @@ def run():
             # Exact train pairs at each seed/epoch are defined by this schedule; hash epoch one.
             set_data_epoch(train_set,1)
             training_fingerprint=fingerprint_pairs(train_set)
+            if expected and (data_fingerprint!=expected["data_fingerprint"] or training_fingerprint!=expected["training_fingerprint"]):
+                raise RuntimeError("Approved performance data changed; use serial FP32")
         train_loader = make_loader(train_set,cfg["batch_size"],True,device,dynamic=not smoke)
         val_loader = make_loader(val_set,cfg["batch_size"],False,device)
     pesq_function = ensure_pesq()
@@ -1169,7 +1174,7 @@ def run():
         "data_fingerprint":data_fingerprint,
         "training_fingerprint":training_fingerprint,
         "epoch_seconds":epoch_times,
-        "hardware":{"device":torch.cuda.get_device_name(device) if device.type=="cuda" else "cpu","torch":str(torch.__version__),"cuda":torch.version.cuda,"cpu_count":__import__("os").cpu_count()},
+        "hardware":hardware,
         "metrics":metrics,
         "evaluation_protocol":"v4-smoke-fixture-v1" if smoke else "v4.2-fixed-dev-v2",
         "domain_scores":{"challenge":best_score,"external_normal":float(np.mean([r[1] for r in external_rows[:32]])),"external_stress":float(np.mean([r[1] for r in external_rows[32:]]))},
