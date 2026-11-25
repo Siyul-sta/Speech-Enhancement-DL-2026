@@ -299,13 +299,13 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
         target = base / key
         if cache_root is not None and key!="test":
             cached=cache_root/key
-            if cache_meta.get("sources",{}).get(key)!=url or not (cached/".complete").is_file() or not (cached/".sha256").is_file(): raise RuntimeError("Missing or incompatible public cache entry: "+key)
+            if cache_meta.get("sources",{}).get(key)!=url or not (cached/"cache_complete.txt").is_file() or not (cached/"archive_sha256.txt").is_file(): raise RuntimeError("Missing or incompatible public cache entry: "+key)
             if target.exists() and not target.is_symlink():
                 import shutil
                 shutil.rmtree(target)
             if not target.exists(): target.symlink_to(cached,target_is_directory=True)
-        marker=target/".complete"
-        digest_path=target/".sha256"
+        marker=target/"cache_complete.txt"
+        digest_path=target/"archive_sha256.txt"
         if not marker.exists() or not digest_path.exists():
             import shutil
             if target.exists(): shutil.rmtree(target)
@@ -724,6 +724,27 @@ def urgent_audit(model,device,pesq_fn,limit=24,blind=False):
     return {"count":len(rows),"scores":dict(zip(keys,map(float,np.mean([r[1:] for r in rows],axis=0)))),"split":config,"sample_rule":"every seventh item; fixed 24 items; pretrained overlap not established"}
 
 
+
+def fleurs_speech(split,limit=256):
+    """Approximate clean read speech; fixed official Korean train/test split."""
+    from datasets import load_dataset, Audio
+    if split not in ("train","test"): raise ValueError("Unsupported FLEURS split")
+    revision="44ebc3e0222cda1571220d148f3e3163843747dd"
+    root=(Path("/tmp/ralph_v4_fleurs") if Path("/kaggle").exists() else WORK/"fleurs")/split
+    root.mkdir(parents=True,exist_ok=True)
+    data=load_dataset("google/fleurs","ko_kr",revision=revision,split=split,streaming=True).cast_column("audio",Audio(decode=False))
+    paths=[]
+    for i,row in enumerate(data):
+        if len(paths)>=limit: break
+        x=decode_audit_audio(row["audio"])
+        if len(x)<16000 or np.sqrt(np.mean(x*x))<1e-5: continue
+        dest=root/f"clip_{i:05d}.wav"
+        sf.write(dest,x.clip(-1,1),16000,subtype="PCM_16")
+        paths.append(dest)
+    if len(paths)!=limit: raise RuntimeError("Incomplete FLEURS "+split)
+    return paths
+
+
 def run():
     cfg = EXPERIMENT_CONFIG
     variant = cfg["id"]
@@ -748,6 +769,10 @@ def run():
     if len(train_set) != 1296:
         raise RuntimeError("Unexpected train split size")
     tr, dv, tn, dn, ts, tnoise = public_assets(include_test=bool(cfg.get("final_audit")))
+    if cfg.get("data_profile")=="korean" and not cfg.get("final_audit"):
+        subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0"])
+        tr+=fleurs_speech("train")
+        print("Added 256 FLEURS Korean read-speech training clips (approximate clean)",flush=True)
     train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
     external_val = DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)]),batch_size=4,shuffle=False)
     val_set = SpeechPairs(root, "validation")
@@ -801,6 +826,15 @@ def run():
         score,rows=evaluate(model,test_loader,device,pesq_function,save_rows=True)
         write_csv(WORK/"audit_per_file.csv",["index","pesq_wb"],rows)
         audit={"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref,"public_recipe":cfg.get("public_recipe")}
+        if cfg.get("audit_korean"):
+            try:
+                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0"])
+                korean=fleurs_speech("test",64)
+                korean_loader=DataLoader(SyntheticPairs(korean,tnoise,64,99801,False,stress=True),batch_size=4,shuffle=False)
+                kscore,krows=evaluate(model,korean_loader,device,pesq_function,save_rows=True)
+                write_csv(WORK/"korean_audit.csv",["index","pesq_wb"],krows)
+                audit["korean_synthetic"]={"pesq":kscore,"count":64,"reference":"FLEURS read-speech recordings; approximate clean"}
+            except Exception as exc: audit["korean_error"]=repr(exc)
         if cfg.get("audit_urgent"):
             try:
                 subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","torchmetrics","onnxruntime","librosa"])
