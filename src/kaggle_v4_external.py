@@ -357,6 +357,11 @@ class MetricGANTransfer(nn.Module):
         if isinstance(mask,tuple): mask=mask[0]
         return self.resynthesize(torch.expm1(mask*features),x)
 
+class GeneratedEnhancer(nn.Module):
+    def __init__(self):
+        super().__init__()
+        raise RuntimeError('Generated model not supplied')
+
 class TemporalEnhancer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -428,6 +433,8 @@ def run():
     pesq_function = ensure_pesq()
     if cfg.get("architecture") == "metricgan":
         model = MetricGANTransfer().to(device)
+    elif cfg.get("architecture") == "generated":
+        model = GeneratedEnhancer().to(device)
     elif cfg.get("architecture") == "temporal":
         model = TemporalEnhancer().to(device)
     else:
@@ -478,6 +485,13 @@ def run():
             optimizer.zero_grad(set_to_none=True)
             pred = model(noisy)
             loss = enhancement_loss(pred, clean, variant)
+            if cfg.get("loss_mode") == "sisdr":
+                a=pred-pred.mean(-1,keepdim=True)
+                b=clean-clean.mean(-1,keepdim=True)
+                proj=(a*b).sum(-1,keepdim=True)*b/(b.square().sum(-1,keepdim=True)+1e-8)
+                loss=loss-0.01*(10*torch.log10((proj.square().sum(-1)+1e-8)/((a-proj).square().sum(-1)+1e-8))).clamp(-30,30).mean()
+            elif cfg.get("loss_mode") == "waveform":
+                loss=loss+0.2*F.l1_loss(pred,clean)
             if not torch.isfinite(loss):
                 raise RuntimeError(f"Non-finite train loss at epoch={epoch}")
             loss.backward()
@@ -542,6 +556,8 @@ def run():
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "model": type(model).__name__,
         "model_family":cfg.get("architecture","residual"),
+        "loss_mode":cfg.get("loss_mode","base"),
+        "generated_hash":cfg.get("generated_hash"),
         "transductive_noisy":bool(cfg.get("transductive")) and bool(cfg.get("self_supervised")),
         "self_supervised":bool(cfg.get("self_supervised")),
         "unlabeled_files":len(unlabeled) if unlabeled is not None else 0,
