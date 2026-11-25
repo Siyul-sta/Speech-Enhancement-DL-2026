@@ -146,11 +146,12 @@ def build_public_cache(kaggle,source,tag):
     deadline=time.monotonic()+4*3600
     while time.monotonic()<deadline:
         p=subprocess.run([kaggle,"kernels","status",ref],capture_output=True,encoding="utf-8",errors="replace",timeout=60,check=True)
-        status=(p.stdout+" "+p.stderr).upper()
-        if "COMPLETE" in status:
+        match=re.search(r"KernelWorkerStatus\.([A-Z_]+)",p.stdout+" "+p.stderr)
+        status=match.group(1) if match else ""
+        if status=="COMPLETE":
             core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":"v4_cache"})
             return ref
-        if any(x in status for x in ("ERROR","CANCEL_ACKNOWLEDGED","CANCELLED","CANCELED")):
+        if status in ("ERROR","CANCEL_ACKNOWLEDGED","CANCELLED","CANCELED"):
             core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":"v4_cache"})
             raise legacy.KaggleTerminalFailure("Public cache build failed: "+ref)
         time.sleep(60)
@@ -205,11 +206,18 @@ def public_with_external(public,external):
     if public.count(marker)!=1: raise ValueError("Invalid public runner")
     return public.replace(marker,"TRAIN_RIRS=[]\n\n"+"\n\n".join(fragments)+"\n\n"+marker,1)
 
+def audit_with_public(external,public):
+    names={"load_model","checked_output","public_recipe"}
+    fragments=[ast.get_source_segment(public,n) for n in ast.parse(public).body if isinstance(n,ast.FunctionDef) and n.name in names]
+    if len(fragments)!=3: raise ValueError("Missing recipe helpers")
+    return external.replace("def run():","\n\n".join(fragments)+"\n\ndef run():",1)
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--final-audit",action="store_true",help="Evaluate frozen best non-transductive built-in checkpoint once")
     p.add_argument("--allow-generated-code",action="store_true",help="Opt in to experimental generated Python; AST validation is not a security sandbox")
     p.add_argument("--discover",action="store_true",help="Fetch public dataset/model/paper metadata for strategy selection")
+    p.add_argument("--audit-urgent",action="store_true",help="Add URGENT public paired and blind mixed real/simulated audit")
     p.add_argument("--audit-aux",action="store_true",help="Add DNSMOS and transcript WER to final audit")
     p.add_argument("--build-public-cache",action="store_true",help="Prepare/reuse separate public-only CPU kernel outputs")
     p.add_argument("--public-cache-ref",help="Existing compatible public corpus kernel output")
@@ -226,6 +234,7 @@ def main():
     core.no_uncertain_prior_jobs()
     print("V4: public benchmark; optional continuous external-data and warm-start research; no PESQ cutoff")
     if not args.execute:
+        compile(audit_with_public(sources["v4_external"],sources["v4_public"]),"audit.py","exec")
         print("DRY RUN; no submission")
         return
     if args.allow_generated_code and not args.codex_research: p.error("--allow-generated-code requires --codex-research")
@@ -244,12 +253,15 @@ def main():
         codex=(shutil.which("codex") or shutil.which("codex.cmd")) if args.codex_research else None
         i=0
         if args.final_audit:
-            eligible=[(st,r) for st,r in records if st["kind"]=="v4_external" and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file() and r.get("model_family")!="generated"]
-            if not eligible: raise RuntimeError("No eligible frozen checkpoint")
+            eligible=[(st,r) for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file()]
+            if not eligible: raise RuntimeError("No eligible frozen model or recipe")
             if any(json.loads(p.read_text(encoding="utf-8")).get("status")!="ERROR_TERMINAL" for p in core.OUTPUT.glob("run_v4*/round_*/v4_audit/remote_state.json")): raise RuntimeError("Audit already submitted; do not reuse for tuning")
             st,r=max(eligible,key=lambda z:rank_score(z[1]))
+            archived=Path(st["source_path"]).read_text(encoding="utf-8")
+            recipe=r.get("winner") if st["kind"]=="v4_public" else None
+            source=audit_with_public(sources["v4_external"],archived) if recipe else archived
             legacy.require_quota(kaggle,2)
-            submit(kaggle,Path(st["source_path"]).read_text(encoding="utf-8"),tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":st["ref"],"architecture":r.get("model_family","residual"),"data_profile":"base","network_spec":r.get("network_spec"),"final_audit":True,"audit_aux":args.audit_aux,"public_cache":cache})
+            submit(kaggle,source,tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":None if recipe else st["ref"],"public_recipe":recipe,"architecture":r.get("model_family","residual"),"data_profile":"base","network_spec":r.get("network_spec"),"final_audit":True,"audit_aux":args.audit_aux,"audit_urgent":args.audit_urgent,"public_cache":cache})
             return
         if not any(st["kind"]=="v4_public" for st,r in records) or not args.loop:
             legacy.require_quota(kaggle,2)
