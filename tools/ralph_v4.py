@@ -305,7 +305,9 @@ def main():
             if not perf_policy.authorized(report,sources["v4_external"],cache,args.epochs,args.amp):
                 raise RuntimeError("No matching approved performance profile; keep FP32 serial default")
             legacy.require_quota(kaggle,2)
-            cfg={**perf_policy.profile(args.epochs),"seed":42,"public_cache":cache,"loader_workers":2,"amp":args.amp}
+            proof=report["pairs"][0]
+            cfg={**perf_policy.profile(args.epochs),"seed":42,"public_cache":cache,"loader_workers":2,"amp":args.amp,
+                 "expected_perf":{k:proof[k] for k in ("hardware","data_fingerprint","training_fingerprint")}}
             submit(kaggle,sources["v4_external"],tag,1,"v4_external",cfg)
             return
         if args.smoke:
