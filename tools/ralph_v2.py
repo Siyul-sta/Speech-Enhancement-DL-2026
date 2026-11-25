@@ -476,9 +476,9 @@ def codex_propose(codex: str, *, workfile: Path, family: str,
         )
     if proc.returncode:
         raise RuntimeError(
-            f"Codex exit={proc.returncode}: {logfile.read_text(encoding='utf-8')[-2000:]}"
+            f"Codex exit={proc.returncode}: {logfile.read_text(encoding='utf-8', errors='replace')[-2000:]}"
         )
-    return summary.read_text(encoding="utf-8") if summary.exists() else ""
+    return summary.read_text(encoding="utf-8", errors="replace") if summary.exists() else ""
 
 
 def cpu_check(candidate_file: Path):
@@ -609,7 +609,7 @@ def poll_adaptive_kernel(kaggle: str, folder: Path, ref: str,
                     if not result_file.exists():
                         raise RuntimeError("Kaggle COMPLETE but result.json missing")
                     return json.loads(result_file.read_text(encoding="utf-8"))
-                elif status.group(1) in ("ERROR", "CANCELLED", "CANCELED"):
+                elif status.group(1) in ("ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED"):
                     if status_hook:
                         status_hook(status.group(1))
                     try:
