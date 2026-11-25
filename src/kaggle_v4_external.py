@@ -436,6 +436,36 @@ class TemporalEnhancer(nn.Module):
         for block in self.blocks: z=z+block(z)
         return x+self.out(z).squeeze(1)
 
+
+class ComposedEnhancer(nn.Module):
+    """A new topology assembled from validated JSON, no generated Python execution."""
+    def __init__(self):
+        super().__init__()
+        spec=EXPERIMENT_CONFIG["network_spec"]
+        width=spec["width"]
+        activation=nn.GELU if spec["activation"]=="gelu" else nn.SiLU
+        self.inp=nn.Conv1d(1,width,9,padding=4)
+        self.blocks=nn.ModuleList()
+        for b in spec["blocks"]:
+            k,d=b["kernel"],b["dilation"]
+            pad=d*(k-1)//2
+            if b["type"]=="dense":
+                layers=[nn.Conv1d(width,width,k,padding=pad,dilation=d)]
+            elif b["type"]=="gated":
+                layers=[nn.Conv1d(width,2*width,k,padding=pad,dilation=d,groups=width),nn.GLU(dim=1),nn.Conv1d(width,width,1)]
+            else:
+                layers=[nn.Conv1d(width,width,k,padding=pad,dilation=d,groups=width),nn.Conv1d(width,width,1)]
+            if spec["norm"]: layers.append(nn.GroupNorm(1,width))
+            layers.append(activation())
+            self.blocks.append(nn.Sequential(*layers))
+        self.out=nn.Conv1d(width,1,9,padding=4)
+        nn.init.zeros_(self.out.weight); nn.init.zeros_(self.out.bias)
+    def forward(self,x):
+        z=self.inp(x.unsqueeze(1))
+        for block in self.blocks: z=z+block(z)
+        return x+self.out(z).squeeze(1)
+
+
 class NoisyOnly(Dataset):
     """Read only noisy manifests; never read validation/test clean files."""
     def __init__(self,root,transductive=False):
@@ -613,6 +643,8 @@ def run():
     pesq_function = ensure_pesq()
     if cfg.get("architecture") == "metricgan":
         model = MetricGANTransfer().to(device)
+    elif cfg.get("architecture") == "composed":
+        model = ComposedEnhancer().to(device)
     elif cfg.get("architecture") == "moe":
         model = AdaptiveMixture().to(device)
     elif cfg.get("architecture") == "generated":
@@ -784,6 +816,7 @@ def run():
         "data_profile":cfg.get("data_profile","base"),
         "augmentation":cfg.get("augmentation","base"),
         "generated_hash":cfg.get("generated_hash"),
+        "network_spec":cfg.get("network_spec"),
         "transductive_noisy":bool(cfg.get("transductive")) and bool(cfg.get("self_supervised")),
         "self_supervised":bool(cfg.get("self_supervised")),
         "unlabeled_files":len(unlabeled) if unlabeled is not None else 0,
