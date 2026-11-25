@@ -40,10 +40,7 @@ class PublicAuditTests(unittest.TestCase):
             root=Path(d); clean=root/"1-1-1.wav"; noise=root/"noise.wav"
             # Public read speech as source; test checks real ASR output plumbing only,
             # not a meaningful WER estimate for this synthetic transcript.
-            from datasets import load_dataset,Audio
-            data=load_dataset("urgent-challenge/urgent2024_official","test_nonblind",streaming=True)
-            split=next(iter(data.values())).cast_column("clean_audio",Audio(decode=False))
-            row=next(iter(split))
+            row=next(iter(trainer.urgent_rows()))
             x=trainer.decode_audit_audio(row["clean_audio"])
             sf.write(clean,x,16000)
             sf.write(noise,np.random.default_rng(42).normal(0,.001,48000),16000)
