@@ -13,6 +13,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import v4_model_policy as policy
 import v4_research_catalog as catalog
+import v4_perf_policy as perf_policy
 import tempfile
 import time
 import ralph_v2 as core
@@ -36,7 +37,7 @@ def rank_score(result):
 
 def verify(folder, kind="v4_public"):
     r = json.loads((folder/"result.json").read_text(encoding="utf-8"))
-    if kind not in ("v4_public","v4_external","v4_audit","v4_smoke"): raise ValueError("Unknown result kind")
+    if kind not in ("v4_public","v4_external","v4_audit","v4_smoke","v4_perf"): raise ValueError("Unknown result kind")
     if kind=="v4_audit":
         if r.get("audit_files")!=128: raise ValueError("Wrong audit size")
         verify_rows(folder/"audit_per_file.csv",128,r["audit_pesq"])
@@ -44,7 +45,7 @@ def verify(folder, kind="v4_public"):
     if r["validation_files"] != 164:
         raise ValueError("Expected 164 validation clips")
     verify_rows(folder/"validation_per_file.csv",164,r["best_validation_pesq_wb"])
-    if kind in ("v4_external","v4_smoke") or r.get("evaluation_protocol")=="v4.2-fixed-dev-v2":
+    if kind in ("v4_external","v4_smoke","v4_perf") or r.get("evaluation_protocol")=="v4.2-fixed-dev-v2":
         if r["external_validation_files"] != 64:
             raise ValueError("Missing external evaluation")
         if kind in ("v4_external","v4_smoke") and (not (folder/"best_model.pt").is_file() or (folder/"best_model.pt").stat().st_size==0):
@@ -68,7 +69,7 @@ def history():
     records=[]
     for path in sorted(core.OUTPUT.glob("run_v4*/round_*/*/remote_state.json")):
         state=json.loads(path.read_text(encoding="utf-8"))
-        if state.get("status")=="COMPLETE" and state.get("kind") not in ("v4_audit","v4_cache","v4_smoke"):
+        if state.get("status")=="COMPLETE" and state.get("kind") not in ("v4_audit","v4_cache","v4_smoke","v4_perf"):
             try:
                 r=verify(path.parent,state["kind"])
                 if r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": continue
@@ -191,6 +192,9 @@ def submit(kaggle, source, tag, i, kind, config=None):
         raise
     r=verify(folder,kind)
     core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind})
+    if kind=="v4_perf":
+        print("PERFORMANCE TRIAL (not ranked)",json.dumps(r),flush=True)
+        return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
     if kind=="v4_smoke":
         print("SMOKE PASS (not ranked)",json.dumps(r),flush=True)
         return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
@@ -217,8 +221,39 @@ def audit_with_public(external,public):
     if len(fragments)!=3: raise ValueError("Missing recipe helpers")
     return external.replace("def run():","\n\n".join(fragments)+"\n\ndef run():",1)
 
+def performance_report_path(amp):
+    return core.OUTPUT/("perf_gate_amp.json" if amp else "perf_gate_fp32.json")
+
+def performance_benchmark(kaggle,source,tag,cache,epochs,amp):
+    if not cache: raise RuntimeError("Performance benchmark requires a shared public cache")
+    path=performance_report_path(amp)
+    common=perf_policy.profile(epochs)
+    report={"accepted":False,"source_sha256":perf_policy.signature(source),"cache":cache,"profile":common,
+            "amp":bool(amp),"seeds":list(perf_policy.SEEDS),"reasons":["Benchmark incomplete"],"pairs":[]}
+    core.json_write(path,report)
+    pairs=[]
+    for i,seed in enumerate(perf_policy.SEEDS):
+        results={}
+        # Alternate order to reduce systematic warm/cold scheduling bias.
+        for label in (("baseline","candidate") if i%2==0 else ("candidate","baseline")):
+            legacy.require_quota(kaggle,2)
+            cfg={**common,"seed":seed,"public_cache":cache,"loader_workers":2 if label=="candidate" else 0,
+                 "amp":bool(amp and label=="candidate")}
+            slot=2*i+(1 if label=="baseline" else 2)
+            _,result=submit(kaggle,source,tag,slot,"v4_perf",cfg)
+            results[label]=result
+        pairs.append((results["baseline"],results["candidate"]))
+        report["completed_seed_pairs"]=len(pairs)
+        core.json_write(path,report)
+    report.update(perf_policy.compare(pairs,epochs,amp))
+    core.json_write(path,report)
+    print("PERF_GATE",json.dumps(report),flush=True)
+    return report
+
 def main():
     p=argparse.ArgumentParser()
+    p.add_argument("--perf-benchmark",action="store_true",help="Three paired seeds on full fixed development data; no ranking")
+    p.add_argument("--validated-perf-run",action="store_true",help="Run only the exact temporal profile approved by the performance gate")
     p.add_argument("--amp",action="store_true",help="Experimental CUDA mixed precision for temporal/composed convolution models only")
     p.add_argument("--smoke",action="store_true",help="One isolated two-epoch training smoke; no leaderboard promotion")
     p.add_argument("--final-audit",action="store_true",help="Evaluate frozen best non-transductive built-in checkpoint once")
@@ -235,7 +270,8 @@ def main():
     p.add_argument("--max-rounds",type=int,default=0,help="0 means until quota/safety stop")
     p.add_argument("--epochs",type=int,default=15,choices=range(2,101))
     args=p.parse_args()
-    if args.smoke and (args.loop or args.final_audit): p.error("--smoke cannot be combined with --loop or --final-audit")
+    if sum(map(bool,(args.smoke,args.loop,args.final_audit,args.perf_benchmark,args.validated_perf_run)))>1: p.error("Choose exactly one execution mode")
+    if args.amp and not (args.smoke or args.perf_benchmark or args.validated_perf_run): p.error("--amp requires smoke or the quality-gated performance mode")
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
     sources["v4_public"]=public_with_external(sources["v4_public"],sources["v4_external"])
@@ -261,6 +297,17 @@ def main():
             cache=build_public_cache(kaggle,sources["v4_external"],tag)
         codex=(shutil.which("codex") or shutil.which("codex.cmd")) if args.codex_research else None
         i=0
+        if args.perf_benchmark:
+            performance_benchmark(kaggle,sources["v4_external"],tag,cache,args.epochs,args.amp)
+            return
+        if args.validated_perf_run:
+            report=json.loads(performance_report_path(args.amp).read_text(encoding="utf-8"))
+            if not perf_policy.authorized(report,sources["v4_external"],cache,args.epochs,args.amp):
+                raise RuntimeError("No matching approved performance profile; keep FP32 serial default")
+            legacy.require_quota(kaggle,2)
+            cfg={**perf_policy.profile(args.epochs),"seed":42,"public_cache":cache,"loader_workers":2,"amp":args.amp}
+            submit(kaggle,sources["v4_external"],tag,1,"v4_external",cfg)
+            return
         if args.smoke:
             print("SMOKE: no public cache or corpus download required",flush=True)
             legacy.require_quota(kaggle,2)
