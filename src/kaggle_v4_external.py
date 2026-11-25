@@ -234,28 +234,50 @@ def ensure_pesq():
         return importlib.import_module("pesq").pesq
 
 
+_PESQ_POOL=None
+
+def _pesq_one(pair):
+    from pesq import pesq
+    reference,wave=pair
+    return float(pesq(16000,reference,wave,"wb"))
+
+def close_pesq_pool():
+    global _PESQ_POOL
+    if _PESQ_POOL is not None:
+        _PESQ_POOL.shutdown(wait=True)
+        _PESQ_POOL=None
+
+def score_waveforms(clean,pred,pesq_function,workers=None):
+    """Exact same clips and score order; native PESQ isolated in spawned processes."""
+    import os
+    pairs=[(np.clip(c,-1.0,1.0),np.clip(y,-1.0,1.0)) for c,y in zip(clean,pred)]
+    if len(clean)!=len(pred): raise ValueError("PESQ pair count mismatch")
+    if workers is None:
+        workers=min(2,max(0,(os.cpu_count() or 1)-1)) if Path("/kaggle").exists() else 0
+    if workers>1 and getattr(pesq_function,"__module__","").startswith("pesq"):
+        from concurrent.futures import ProcessPoolExecutor
+        import multiprocessing
+        global _PESQ_POOL
+        if _PESQ_POOL is None:
+            _PESQ_POOL=ProcessPoolExecutor(max_workers=workers,mp_context=multiprocessing.get_context("spawn"))
+        values=list(_PESQ_POOL.map(_pesq_one,pairs,chunksize=4))
+    else:
+        values=[float(pesq_function(16000,c,y,"wb")) for c,y in pairs]
+    if not all(math.isfinite(v) for v in values): raise RuntimeError("Non-finite PESQ")
+    return values
+
 @torch.no_grad()
 def evaluate(model, loader, device, pesq_function, save_rows=False):
     model.eval()
-    values, rows, index = [], [], 0
+    predictions=[]; references=[]
     for noisy, clean in loader:
-        pred = model(noisy.to(device,non_blocking=True)).cpu().numpy()
-        noisy_np, clean_np = noisy.numpy(), clean.numpy()
-        for j in range(len(pred)):
-            # Match the output WAV's PCM16 domain when scoring.
-            wave = np.clip(pred[j], -1.0, 1.0)
-            reference = np.clip(clean_np[j], -1.0, 1.0)
-            score = float(pesq_function(SAMPLE_RATE, reference, wave, "wb"))
-            if not np.isfinite(score):
-                raise RuntimeError(f"Non-finite PESQ at validation file {index}")
-            values.append(score)
-            if save_rows:
-                rows.append([index, score])
-            index += 1
-    if index != len(loader.dataset):
-        raise RuntimeError("Validation is incomplete")
-    return float(np.mean(values)), rows
-
+        predictions.append(model(noisy.to(device,non_blocking=True)).cpu().float().numpy())
+        references.append(clean.numpy())
+    if not predictions: raise RuntimeError("Empty validation")
+    pred=np.concatenate(predictions); clean=np.concatenate(references)
+    if len(pred)!=len(loader.dataset): raise RuntimeError("Validation is incomplete")
+    values=score_waveforms(clean,pred,pesq_function)
+    return float(np.mean(values)),[[i,v] for i,v in enumerate(values)] if save_rows else []
 
 def write_csv(path: Path, fields, records):
     with path.open("w", newline="", encoding="utf-8") as f:
@@ -296,7 +318,8 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
         sources["extra_speech"]="https://www.openslr.org/resources/73/es_pe_female.zip"
     if not evaluation_only and (EXPERIMENT_CONFIG.get("data_profile")=="rir" or prepare_only):
         sources["rir"]="https://www.openslr.org/resources/28/rirs_noises.zip"
-    for key,url in sources.items():
+    def prepare_one(item):
+        key,url=item
         emit(key,"prepare")
         archive = base / (key+(".zip" if url.endswith(".zip") else ".tar.gz"))
         target = base / key
@@ -363,7 +386,15 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
             marker.touch()
             archive.unlink(missing_ok=True)
         emit(key,"ready")
-        records[key]={"url":url,"sha256":digest_path.read_text(encoding="ascii"),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "Apache-2.0" if key=="rir" else "CC-BY-4.0 (MUSAN individual terms apply)"}
+        return key,{"url":url,"sha256":digest_path.read_text(encoding="ascii"),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "Apache-2.0" if key=="rir" else "CC-BY-4.0 (MUSAN individual terms apply)"}
+    # Two concurrent archives on the CPU cache builder; bounded disk/network load.
+    # GPU jobs normally mount the cache; no parallel downloads on GPU by default.
+    if prepare_only and len(sources)>1:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            records=dict(pool.map(prepare_one,sources.items()))
+    else:
+        records=dict(map(prepare_one,sources.items()))
     if prepare_only:
         (base/"v4_cache_manifest.json").write_text(json.dumps({"format":"ralph-v4-public-cache-1","sources":sources,"records":records},indent=2),encoding="utf-8")
         return base
@@ -399,6 +430,8 @@ class SyntheticPairs(Dataset):
     def __init__(self,speech,noise,size,seed,dynamic,stress=False):
         self.speech,self.noise,self.size,self.seed,self.dynamic=speech,noise,size,seed,dynamic
         self.stress=stress
+        self.rirs=tuple(TRAIN_RIRS) if dynamic else ()
+        self.augmentation=EXPERIMENT_CONFIG.get("augmentation","base")
     def __len__(self):
         return self.size
     def __getitem__(self,i):
@@ -419,15 +452,15 @@ class SyntheticPairs(Dataset):
         snr=rng.uniform(-10,5) if self.stress else rng.uniform(-5,20)
         n=n*(np.sqrt(np.mean(c*c)+1e-8)/np.sqrt(np.mean(n*n)+1e-8))*10**(-snr/20)
         x=c+n
-        if self.dynamic and TRAIN_RIRS and rng.random()<0.5:
-            h,sr=sf.read(rng.choice(TRAIN_RIRS),dtype="float32",always_2d=True)
+        if self.dynamic and self.rirs and rng.random()<0.5:
+            h,sr=sf.read(rng.choice(self.rirs),dtype="float32",always_2d=True)
             h=h[:,0]
             if sr!=16000: h=scipy.signal.resample_poly(h,16000//math.gcd(sr,16000),sr//math.gcd(sr,16000))
             if len(h) and np.isfinite(h).all() and np.max(np.abs(h))>1e-8:
                 h=h[np.argmax(np.abs(h)):][:16000]
                 h=h/max(1e-8,float(np.linalg.norm(h)))
                 x=scipy.signal.fftconvolve(x,h)[:len(x)]
-        if self.stress or (self.dynamic and EXPERIMENT_CONFIG.get("augmentation")=="room_codec"):
+        if self.stress or (self.dynamic and self.augmentation=="room_codec"):
             # Train-only synthetic room tails and bandwidth degradation.
             if rng.random()<0.6:
                 impulse=np.zeros(2048,dtype=np.float32); impulse[0]=1
@@ -871,9 +904,6 @@ def make_loader(dataset,batch_size,shuffle,device,dynamic=False):
     workers=min(2,max(0,(os.cpu_count() or 1)-1)) if device.type=="cuda" and dynamic else 0
     opts={"num_workers":workers,"pin_memory":device.type=="cuda"}
     if workers: opts.update(persistent_workers=True,prefetch_factor=2,multiprocessing_context="spawn")
-    # Spawn cannot see runtime-only dataset globals (RIR profile). Keep those in-process.
-    if TRAIN_RIRS and workers:
-        opts={"num_workers":0,"pin_memory":device.type=="cuda"}
     return DataLoader(dataset,batch_size=batch_size,shuffle=shuffle,**opts)
 
 def run():
@@ -1136,4 +1166,5 @@ if __name__ == "__main__":
     elif "--self-test" in sys.argv:
         self_test()
     else:
-        run()
+        try: run()
+        finally: close_pesq_pool()
