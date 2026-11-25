@@ -283,27 +283,46 @@ def public_assets():
     for key,url in sources.items():
         archive = base / (key+(".zip" if url.endswith(".zip") else ".tar.gz"))
         target = base / key
-        if not (target / ".complete").exists():
+        marker=target/".complete"
+        digest_path=target/".sha256"
+        if not marker.exists() or not digest_path.exists():
+            import shutil
+            if target.exists(): shutil.rmtree(target)
+            target.mkdir(exist_ok=True)
             if not archive.exists():
                 with urllib.request.urlopen(url,timeout=60) as response, open(str(archive)+".partial","wb") as out:
-                    import shutil
                     shutil.copyfileobj(response,out,1024*1024)
                 Path(str(archive)+".partial").replace(archive)
-            target.mkdir(exist_ok=True)
+            h=hashlib.sha256()
+            with archive.open("rb") as f:
+                for chunk in iter(lambda:f.read(1048576),b""):
+                    h.update(chunk)
+            # Deterministic subset: keep enough training speakers/files without
+            # retaining the entire compressed and extracted corpus at once.
+            def retain(name,size):
+                path=Path(name)
+                if path.suffix.lower() not in (".wav",".flac"):
+                    return size<2*1024*1024 and (path.name.lower().endswith(".txt") or "license" in path.name.lower())
+                if key=="noise" and not ({"noise","music"} & set(path.parts)): return False
+                if key=="rir" and "simulated_rirs" not in path.parts: return False
+                if key=="train" and int(hashlib.sha256(name.encode()).hexdigest()[:8],16)%4!=0: return False
+                if key=="extra_speech" and int(hashlib.sha256(name.encode()).hexdigest()[:8],16)%2!=0: return False
+                return size<=32*1024*1024
             if archive.suffix==".zip":
                 with zipfile.ZipFile(archive) as zf:
                     for member in zf.infolist():
                         if not (target/member.filename).resolve().is_relative_to(target.resolve()): raise ValueError("Unsafe archive path")
-                    zf.extractall(target)
+                        if not member.is_dir() and retain(member.filename,member.file_size):
+                            zf.extract(member,target)
             else:
                 with tarfile.open(archive,"r:gz") as tf:
-                    tf.extractall(target, filter="data")
-            (target / ".complete").touch()
-        h=hashlib.sha256()
-        with archive.open("rb") as f:
-            for chunk in iter(lambda:f.read(1048576),b""):
-                h.update(chunk)
-        records[key]={"url":url,"sha256":h.hexdigest(),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "Apache-2.0" if key=="rir" else "CC-BY-4.0 (MUSAN individual terms apply)"}
+                    for member in tf:
+                        if member.isfile() and retain(member.name,member.size):
+                            tf.extract(member,target,filter="data")
+            digest_path.write_text(h.hexdigest(),encoding="ascii")
+            marker.touch()
+            archive.unlink(missing_ok=True)
+        records[key]={"url":url,"sha256":digest_path.read_text(encoding="ascii"),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "Apache-2.0" if key=="rir" else "CC-BY-4.0 (MUSAN individual terms apply)"}
     if "rir" in sources:
         TRAIN_RIRS[:] = sorted(p for p in (base/"rir").rglob("*.wav") if "simulated_rirs" in p.parts)
         if not TRAIN_RIRS: raise RuntimeError("No simulated room impulse responses")
@@ -332,8 +351,9 @@ def public_assets():
     return train,dev,tr,dv,test,te
 
 class SyntheticPairs(Dataset):
-    def __init__(self,speech,noise,size,seed,dynamic):
+    def __init__(self,speech,noise,size,seed,dynamic,stress=False):
         self.speech,self.noise,self.size,self.seed,self.dynamic=speech,noise,size,seed,dynamic
+        self.stress=stress
     def __len__(self):
         return self.size
     def __getitem__(self,i):
@@ -351,7 +371,7 @@ class SyntheticPairs(Dataset):
             k=rng.randint(0,len(y)-48000)
             return y[k:k+48000].astype(np.float32)
         c,n=clip(self.speech),clip(self.noise)
-        snr=rng.uniform(-5,20)
+        snr=rng.uniform(-10,5) if self.stress else rng.uniform(-5,20)
         n=n*(np.sqrt(np.mean(c*c)+1e-8)/np.sqrt(np.mean(n*n)+1e-8))*10**(-snr/20)
         x=c+n
         if self.dynamic and TRAIN_RIRS and rng.random()<0.5:
@@ -362,7 +382,7 @@ class SyntheticPairs(Dataset):
                 h=h[np.argmax(np.abs(h)):][:16000]
                 h=h/max(1e-8,float(np.linalg.norm(h)))
                 x=scipy.signal.fftconvolve(x,h)[:len(x)]
-        if self.dynamic and EXPERIMENT_CONFIG.get("augmentation")=="room_codec":
+        if self.stress or (self.dynamic and EXPERIMENT_CONFIG.get("augmentation")=="room_codec"):
             # Train-only synthetic room tails and bandwidth degradation.
             if rng.random()<0.6:
                 impulse=np.zeros(2048,dtype=np.float32); impulse[0]=1
@@ -580,7 +600,7 @@ def run():
         raise RuntimeError("Unexpected train split size")
     tr, dv, tn, dn, ts, tnoise = public_assets()
     train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
-    external_val = DataLoader(SyntheticPairs(dv,dn,64,2026,False),batch_size=4,shuffle=False)
+    external_val = DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)]),batch_size=4,shuffle=False)
     val_set = SpeechPairs(root, "validation")
     if len(val_set) != 164:
         raise RuntimeError("Unexpected validation split size")
@@ -618,7 +638,7 @@ def run():
     if cfg.get("final_audit"):
         if not warm_ref:
             raise RuntimeError("Final audit requires frozen checkpoint")
-        test_loader=DataLoader(SyntheticPairs(ts,tnoise,128,82491,False),batch_size=4,shuffle=False)
+        test_loader=DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(ts,tnoise,64,82491,False),SyntheticPairs(ts,tnoise,64,92491,False,stress=True)]),batch_size=4,shuffle=False)
         score,rows=evaluate(model,test_loader,device,pesq_function,save_rows=True)
         write_csv(WORK/"audit_per_file.csv",["index","pesq_wb"],rows)
         audit={"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref}
@@ -707,8 +727,9 @@ def run():
                         t.lerp_(p,0.01)
         scheduler.step()
         val_pesq, _ = evaluate(model, val_loader, device, pesq_function)
-        external_pesq, _ = evaluate(model, external_val, device, pesq_function)
-        joint = (val_pesq + external_pesq)/2
+        external_pesq, domain_rows = evaluate(model, external_val, device, pesq_function, save_rows=True)
+        domain_scores=[val_pesq,float(np.mean([r[1] for r in domain_rows[:32]])),float(np.mean([r[1] for r in domain_rows[32:]]))]
+        joint = 0.5*float(np.mean(domain_scores))+0.5*min(domain_scores)
         print(f"external_pesq={external_pesq:.4f} joint={joint:.4f}",flush=True)
         if joint > best_joint + 0.001:
             best_joint = joint
@@ -737,7 +758,9 @@ def run():
         metrics={"error":repr(exc)}
     result = {
         "metrics":metrics,
-        "evaluation_protocol":"v4.1-fixed-dev-v1",
+        "evaluation_protocol":"v4.2-fixed-dev-v2",
+        "domain_scores":{"challenge":best_score,"external_normal":float(np.mean([r[1] for r in external_rows[:32]])),"external_stress":float(np.mean([r[1] for r in external_rows[32:]]))},
+        "robust_score":0.5*float(np.mean([best_score,float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))]))+0.5*min(best_score,float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))),
         "distill":bool(cfg.get("distill")),
         "experiment": variant,
         "best_epoch": best_epoch,
