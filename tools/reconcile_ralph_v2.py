@@ -113,7 +113,16 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
             print("Download failed; leave unresolved.")
             return
         min_epochs = 1 if result_dir.name == "smoke" else 5
-        if adaptive.valid_full_result(result_dir, min_epochs=min_epochs) is None:
+        if info.get("kind") in ("v4_public", "v4_external"):
+            try:
+                import ralph_v4
+                ralph_v4.verify(result_dir, info["kind"])
+                valid = True
+            except (OSError, ValueError, KeyError, TypeError):
+                valid = False
+        else:
+            valid = adaptive.valid_full_result(result_dir, min_epochs=min_epochs) is not None
+        if not valid:
             print("Missing/invalid 164-score result, checkpoint or training metadata. "
                   "Keep unresolved for inspection.")
             return
