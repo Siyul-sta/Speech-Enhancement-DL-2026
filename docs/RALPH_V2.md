@@ -234,3 +234,9 @@ Get-Content (Join-Path $run.FullName "experiments.jsonl") -Tail 5
 ```
 
 `MODEL SWITCH: residual_phase -> magnitude`와 같은 출력이 뜨면 **실제로 모델 계열이 자동 전환된 것**입니다. 최대 성능 개선은 보장되지 않으며 과도한 Validation 반복 최적화에 따른 일반화 위험은 남습니다.
+
+## 4.5 목표 모드 (2026-11-25)
+
+새 명령 예시: `& .\\tools\\start_adaptive.ps1 -ConfirmedNoRemoteJob -TargetPesq 4.5 -Epochs 25`
+
+이 옵션을 쓸 때는 [PESQ 4.5 재시작 가이드](PESQ_45_RESTART.md)의 중복 GPU 작업/상태 복구 확인을 먼저 수행한다. V2는 유효한 전체 Validation 최고 점수가 목표에 도달한 경우에만 목표 달성으로 종료하고, 그 외에는 GPU 쿼터·오류·안전 제한을 지킨다. 목표 4.5는 달성을 보장하지 않는다.

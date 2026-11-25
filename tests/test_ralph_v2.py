@@ -22,6 +22,13 @@ spec.loader.exec_module(adaptive)
 
 
 class AdaptiveRalphTests(unittest.TestCase):
+    def test_pesq_target_requires_finite_verified_score(self):
+        self.assertFalse(adaptive.target_reached(float("nan"), 4.5))
+        self.assertFalse(adaptive.target_reached(float("inf"), 4.5))
+        self.assertFalse(adaptive.target_reached(4.4999, 4.5))
+        self.assertTrue(adaptive.target_reached(4.5, 4.5))
+        self.assertTrue(adaptive.target_reached(3.01, 3.0))
+
     def test_three_distinct_model_families(self):
         self.assertEqual(
             adaptive.FAMILIES, ("residual_phase", "magnitude", "complex")

@@ -30,6 +30,9 @@ import time
 from datetime import datetime, timezone
 
 import ralph_loop as legacy
+import research_v3
+
+RESEARCH_MODE = False
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "runs" / "ralph_v2"
@@ -264,13 +267,18 @@ def recovered_full_runs(states: dict) -> list[dict]:
             if family is None:
                 continue
             candidate_path = round_dir / "candidate.py"
-            base_path = run_dir / "families" / family / "best_source.py"
+            base_path = round_dir / "base_source.py"
+            if not base_path.is_file():
+                base_path = run_dir / "families" / family / "best_source.py"
             if not candidate_path.is_file() or not base_path.is_file():
                 continue
             candidate = candidate_path.read_text(encoding="utf-8")
             reference = base_path.read_text(encoding="utf-8")
             if candidate != reference:
-                validate_source(candidate, reference, family)
+                if "def train_batch(" in reference:
+                    research_v3.validate(candidate, reference, TEMPLATES[family][1])
+                else:
+                    validate_source(candidate, reference, family)
             else:
                 ast.parse(candidate)
             tag = run_dir.name.removeprefix("run_")
@@ -352,6 +360,8 @@ def record_for_json(record: dict) -> dict:
 
 def validate_source(candidate: str, before: str, family: str) -> list[str]:
     """AST structural lock: data, training, scoring, eval, imports unchanged."""
+    if RESEARCH_MODE and "def train_batch(" in before:
+        return research_v3.validate(candidate, before, TEMPLATES[family][1])
     if candidate == before:
         raise ValueError("No candidate changes; skip GPU")
     old = ast.parse(before)
@@ -409,7 +419,7 @@ def append_history(file: Path, entry: dict) -> None:
 
 def codex_propose(codex: str, *, workfile: Path, family: str,
                   champion: dict, family_state: dict, history: list[dict],
-                  round_dir: Path, model: str) -> str:
+                  round_dir: Path, model: str, target: float) -> str:
     short_history = [
         {k: entry.get(k) for k in ("round", "family", "score", "status", "hypothesis", "win_rate", "worst10_mean_delta", "mean_paired_delta")}
         for entry in history[-15:]
@@ -420,6 +430,8 @@ def codex_propose(codex: str, *, workfile: Path, family: str,
         "Read AGENTS.md. You MUST edit exactly ONE file: " + relative + ". "
         "This is an isolated scratch copy of a full trainer. "
         f"Current model family is {family}; its editable network class is {TEMPLATES[family][1]}. "
+        f"Target honest complete 164-file mean PESQ-WB={target:.4f}, which is near the metric ceiling; "
+        "never falsify scores or leak validation targets. "
         f"Global best complete 164-file PESQ-WB={champion['score']:.5f} "
         f"({champion['origin']}). "
         f"Best for this family={family_state['score']:.5f}. "
@@ -435,6 +447,22 @@ def codex_propose(codex: str, *, workfile: Path, family: str,
         "Do not call Kaggle, train a model, or commit changes. "
         "Explain in final output one expected benefit, one risk, and what changed."
     )
+    if RESEARCH_MODE:
+        instructions = (
+            "Autonomous Ralph V3. Read AGENTS.md V3 section. Edit only " + relative + ". "
+            f"Honest 164-clip Validation PESQ-WB target {target:.4f}; best {champion['score']:.5f}. "
+            f"Current family interface {TEMPLATES[family][1]}, score {family_state['score']:.5f}. "
+            f"Recent history: {json.dumps(short_history, ensure_ascii=False)[-10000:]}. "
+            "Choose substantive research based on failures, not minor parameter tweaking. "
+            "You may replace the internal architecture completely, add neural classes/helpers, "
+            "change STFT, time-frequency processing, ensemble jointly trained modules, losses, "
+            "optimizer, scheduler, train_batch, augment_train, finish_epoch. "
+            "Keep the named model constructor and noisy-only forward interface, plus all four hooks. "
+            "Train hooks receive only train tensors. No external data, file/network access, or pretrained downloads. "
+            "Never change run, self_test, evaluation, data loader, seed, protected constants or metric. "
+            "Keep existing imports; additional math/torch/numpy/collections/functools/itertools imports allowed. "
+            "Do not modify tracked files or run GPU jobs. Explain hypothesis, risk and expected improvement."
+        )
     summary = round_dir / "codex_summary.txt"
     logfile = round_dir / "codex_log.txt"
     argv = [
@@ -736,6 +764,11 @@ def preflight(args):
     return codex, kaggle, lock, initial_tracked
 
 
+def target_reached(score: float, target: float) -> bool:
+    """Stop only for an actual finite complete-validation champion."""
+    return math.isfinite(score) and score >= target
+
+
 def main():
     p = argparse.ArgumentParser(description="Stagnation-triggered architecture-switching Ralph V2")
     p.add_argument("--username", required=True)
@@ -746,11 +779,16 @@ def main():
     p.add_argument("--max-rounds", type=int, default=0, help="0 = until GPU quota/safety stop")
     p.add_argument("--stagnation-rounds", type=int, default=2)
     p.add_argument("--min-improvement", type=float, default=0.005)
+    p.add_argument("--target-pesq", type=float, default=4.5,
+                   help="Stop only if a verified 164-file full-run champion reaches this target")
     p.add_argument("--min-gpu-quota-hours", type=float, default=2.0)
     p.add_argument("--max-job-minutes", type=int, default=80)
     p.add_argument("--max-errors", type=int, default=3)
+    p.add_argument("--research-v3", action="store_true", help="Enable extended train-only research hooks")
     p.add_argument("--execute", action="store_true", help="Submit private Kaggle jobs; default is dry run")
     args = p.parse_args()
+    global RESEARCH_MODE
+    RESEARCH_MODE = args.research_v3
     if not (re.fullmatch(r"[a-zA-Z0-9_-]+", args.username)
             and re.fullmatch(r"[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+", args.dataset)
             and re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9._-]{1,79}", args.codex_model)):
@@ -759,6 +797,7 @@ def main():
             and 0 <= args.max_rounds <= 1000
             and 1 <= args.stagnation_rounds <= 20
             and 0 < args.min_improvement <= 0.25
+            and 1.0 <= args.target_pesq <= 4.5
             and 1 <= args.min_gpu_quota_hours <= 20
             and 15 <= args.max_job_minutes <= 180
             and 1 <= args.max_errors <= 10):
@@ -767,12 +806,17 @@ def main():
     OUTPUT.mkdir(parents=True, exist_ok=True)
     states = initial_families()
     recovered_full = recovered_full_runs(states)
-    recovered_smoke = recover_completed_smoke(states)
+    recovered_smoke = None if RESEARCH_MODE else recover_completed_smoke(states)
     champion = max(
         (v for v in states.values() if math.isfinite(v["score"])),
         key=lambda v: v["score"],
     )
     print(f"GLOBAL CHAMPION: {champion['score']:.4f} / {champion['origin']}", flush=True)
+    print(f"TARGET: verified Validation PESQ-WB {args.target_pesq:.4f}; "
+          "no metric modifications or private-test tuning", flush=True)
+    if target_reached(champion["score"], args.target_pesq):
+        print("TARGET ALREADY REACHED: no GPU job submitted", flush=True)
+        return
     for name, state in states.items():
         print(f"  family={name}, best={state['score']:.4f}", flush=True)
     print(
@@ -845,7 +889,11 @@ def main():
             round_dir = run_dir / f"round_{i:04d}"
             round_dir.mkdir(parents=True, exist_ok=True)
             candidate_file = round_dir / "candidate.py"
-            candidate_file.write_text(current["source"], encoding="utf-8")
+            base_source = current["source"]
+            if RESEARCH_MODE:
+                base_source = research_v3.upgrade(base_source, TEMPLATES[family][1])
+            (round_dir / "base_source.py").write_text(base_source, encoding="utf-8")
+            candidate_file.write_text(base_source, encoding="utf-8")
             print(
                 f"ROUND {i}: model family={family}, global={champion['score']:.4f}, "
                 f"family best={current['score']:.4f}",
@@ -876,9 +924,10 @@ def main():
                         codex, workfile=candidate_file, family=family,
                         champion=champion, family_state=current, history=history,
                         round_dir=round_dir, model=args.codex_model,
+                        target=args.target_pesq,
                     )
                     candidate = candidate_file.read_text(encoding="utf-8")
-                entry["edits"] = validate_source(candidate, current["source"], family)
+                entry["edits"] = validate_source(candidate, base_source, family)
                 assert_tracked_unchanged(initial_tracked)
                 entry["source_hash"] = hash_source(candidate)
                 entry["hypothesis"] = summary[:1000]
@@ -887,7 +936,7 @@ def main():
 
                 # First experiment for an untrained architecture receives a
                 # 2-epoch smoke test. Smoke scores can never become champions.
-                if family not in tried and current["checkpoint"] is None and not (
+                if (RESEARCH_MODE or (family not in tried and current["checkpoint"] is None)) and not (
                     i == 1 and recovered_smoke
                 ):
                     print(f"ROUND {i} new architecture: 2-epoch smoke first", flush=True)
@@ -899,6 +948,7 @@ def main():
                         ref="", remote_status="SUBMIT_PENDING", epochs=2,
                         current_epoch=None, live_pesq=None,
                     )
+                    legacy.require_quota(kaggle, args.min_gpu_quota_hours)
                     submitted = True
                     remote_job(
                         kaggle, source=candidate, variant=variant, args=args,
@@ -942,16 +992,17 @@ def main():
                 )
                 if new_record is None:
                     raise RuntimeError("Completed full job has invalid artifacts")
-                if score >= current["score"] + args.min_improvement:
+                if score > current["score"]:
                     states[family] = new_record
                     entry["family_improved"] = True
                     print(f"FAMILY IMPROVED: {family} {score:.4f}", flush=True)
                 else:
                     entry["family_improved"] = False
-                if score >= champion["score"] + args.min_improvement:
+                if score > champion["score"]:
+                    meaningful = score >= champion["score"] + args.min_improvement
                     champion = new_record
                     entry["global_improved"] = True
-                    stagnant = 0
+                    stagnant = 0 if meaningful else stagnant + 1
                     print(f"NEW GLOBAL CHAMPION PESQ-WB={score:.4f}", flush=True)
                 else:
                     entry["global_improved"] = False
@@ -996,6 +1047,17 @@ def main():
 
             append_history(run_dir / "experiments.jsonl", entry)
             history.append(entry)
+            if target_reached(champion["score"], args.target_pesq):
+                print(
+                    f"TARGET REACHED: verified 164-file Validation PESQ-WB="
+                    f"{champion['score']:.4f} >= {args.target_pesq:.4f}; no more GPU jobs",
+                    flush=True,
+                )
+                dashboard_event(
+                    run_dir, "complete",
+                    message=f"목표 달성: Validation PESQ-WB {champion['score']:.4f}",
+                )
+                break
             if errors >= args.max_errors:
                 print("STOP: too many consecutive local/model errors", flush=True)
                 break
@@ -1017,10 +1079,13 @@ def main():
         stop_heartbeat.set()
         heartbeat.join(timeout=2)
         dashboard_event(
-            run_dir, "error" if sys.exc_info()[0] else "stopped",
+            run_dir, "error" if sys.exc_info()[0] else
+            "complete" if target_reached(champion["score"], args.target_pesq) else "stopped",
             message=(
                 f"오류 또는 중단 · 마지막 최고 PESQ {champion['score']:.4f}"
                 if sys.exc_info()[0] else
+                f"목표 달성 · Validation PESQ {champion['score']:.4f}"
+                if target_reached(champion["score"], args.target_pesq) else
                 f"실험 종료 · 마지막 최고 PESQ {champion['score']:.4f}"
             ),
             remote_status="FINISHED",
