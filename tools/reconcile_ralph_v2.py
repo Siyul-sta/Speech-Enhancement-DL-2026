@@ -106,6 +106,12 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
         if not resolve:
             print("Remote job COMPLETE. Re-run --resolve to fetch/check artifacts.")
             return
+        if info.get("kind")=="v4_cache":
+            info["status"]="COMPLETE"
+            info["reconciled"]=True
+            adaptive.json_write(path,info)
+            print("RESOLVED PUBLIC CACHE; manifest verified on mount by V4.")
+            return
         result_dir = path.parent
         cmd = [str(kaggle), "kernels", "output", ref, "-p", str(result_dir), "-o"]
         proc = subprocess.run(cmd, cwd=ROOT, check=False)
