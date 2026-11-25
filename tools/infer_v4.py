@@ -37,7 +37,9 @@ def main():
     p.add_argument("input",type=Path)
     p.add_argument("output",type=Path)
     p.add_argument("--source",type=Path,required=True,help="Trusted archived experiment source.py; executable Python")
-    p.add_argument("--checkpoint",type=Path,required=True)
+    group=p.add_mutually_exclusive_group(required=True)
+    group.add_argument("--checkpoint",type=Path)
+    group.add_argument("--recipe",help="Archived public winner recipe, e.g. metricgan:1.0")
     p.add_argument("--device",default="cuda" if torch.cuda.is_available() else "cpu")
     args=p.parse_args()
     if args.input.resolve()==args.output.resolve(): raise ValueError("Refusing to overwrite input")
@@ -46,8 +48,12 @@ def main():
     spec.loader.exec_module(module)
     family=module.EXPERIMENT_CONFIG.get("architecture","residual")
     names={"residual":"ResidualPhaseUNet","temporal":"TemporalEnhancer","metricgan":"MetricGANTransfer","moe":"AdaptiveMixture","composed":"ComposedEnhancer","generated":"GeneratedEnhancer"}
-    model=getattr(module,names[family])().to(args.device).eval()
-    model.load_state_dict(torch.load(args.checkpoint,map_location=args.device,weights_only=True),strict=True)
+    if args.recipe:
+        fn=module.public_recipe(args.recipe,torch.device(args.device))
+        model=lambda x: torch.cat([fn(v) for v in x.split(1)])
+    else:
+        model=getattr(module,names[family])().to(args.device).eval()
+        model.load_state_dict(torch.load(args.checkpoint,map_location=args.device,weights_only=True),strict=True)
     audio,sr=sf.read(args.input,dtype="float32",always_2d=True)
     mono=resample(audio.mean(axis=1),sr,16000)
     y=resample(enhance(model,mono,args.device),16000,sr)
