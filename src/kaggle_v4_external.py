@@ -693,16 +693,24 @@ def decode_audit_audio(audio):
         g=math.gcd(sr,16000); x=scipy.signal.resample_poly(x,16000//g,sr//g).astype(np.float32)
     return x
 
+def parquet_audio_rows(url,columns=None):
+    """Synchronous Arrow batches, no background dataset iterator at shutdown."""
+    import fsspec
+    import pyarrow.parquet as pq
+    with fsspec.open(url,"rb",block_size=4*1024*1024,cache_type="readahead") as stream:
+        parquet=pq.ParquetFile(stream,pre_buffer=False)
+        try:
+            for batch in parquet.iter_batches(batch_size=8,columns=columns,use_threads=False):
+                yield from batch.to_pylist()
+        finally:
+            parquet.close()
+
 def urgent_rows(blind=False):
     """Read pinned Parquet directly, never execute a dataset repository script."""
-    from datasets import load_dataset, Audio
     config="test_blind" if blind else "test_nonblind"
     revision="231e45142538c710ae3ec3d7c8b6e81e9f848b01"
     url=f"https://huggingface.co/datasets/urgent-challenge/urgent2024_official/resolve/{revision}/data/{config}/{config}-00000-of-00001.parquet"
-    rows=load_dataset("parquet",data_files={"train":url},split="train",streaming=True,trust_remote_code=False)
-    rows=rows.cast_column("noisy_audio",Audio(decode=False))
-    if not blind: rows=rows.cast_column("clean_audio",Audio(decode=False))
-    return rows
+    return parquet_audio_rows(url)
 
 def urgent_audit(model,device,pesq_fn,limit=24,blind=False):
     """Frozen out-of-corpus evaluation; blind split is mixed real/simulated, no PESQ."""
@@ -711,20 +719,22 @@ def urgent_audit(model,device,pesq_fn,limit=24,blind=False):
     rows=[]
     if blind:
         from torchmetrics.functional.audio.dnsmos import deep_noise_suppression_mean_opinion_score as dns
-    for i,sample in enumerate(split):
-        if i%7!=0: continue
-        x=decode_audit_audio(sample["noisy_audio"])
-        y=enhance_long(model,x,device)
-        if blind:
-            scores=dns(torch.from_numpy(y)[None],16000,False).reshape(-1,4).mean(0).tolist()
-        else:
-            c=decode_audit_audio(sample["clean_audio"])
-            if abs(len(c)-len(y))>160: raise RuntimeError("URGENT reference alignment mismatch")
-            n=min(len(c),len(y)); c=c[:n]; y=y[:n]
-            scores=[float(pesq_fn(16000,c.clip(-1,1),y,"wb"))]
-        if not np.isfinite(scores).all(): raise RuntimeError("Nonfinite URGENT score")
-        rows.append([str(sample["id"]),*scores])
-        if len(rows)>=limit: break
+    from contextlib import closing
+    with closing(split):
+        for i,sample in enumerate(split):
+            if i%7!=0: continue
+            x=decode_audit_audio(sample["noisy_audio"])
+            y=enhance_long(model,x,device)
+            if blind:
+                scores=dns(torch.from_numpy(y)[None],16000,False).reshape(-1,4).mean(0).tolist()
+            else:
+                c=decode_audit_audio(sample["clean_audio"])
+                if abs(len(c)-len(y))>160: raise RuntimeError("URGENT reference alignment mismatch")
+                n=min(len(c),len(y)); c=c[:n]; y=y[:n]
+                scores=[float(pesq_fn(16000,c.clip(-1,1),y,"wb"))]
+            if not np.isfinite(scores).all(): raise RuntimeError("Nonfinite URGENT score")
+            rows.append([str(sample["id"]),*scores])
+            if len(rows)>=limit: break
     if len(rows)!=limit: raise RuntimeError("Incomplete URGENT audit")
     keys=("p808","sig","bak","ovrl") if blind else ("pesq_wb",)
     write_csv(WORK/("urgent_blind.csv" if blind else "urgent_paired.csv"),["id",*keys],rows)
@@ -734,21 +744,22 @@ def urgent_audit(model,device,pesq_fn,limit=24,blind=False):
 
 def fleurs_speech(split,limit=256):
     """Approximate clean read speech; fixed official Korean train/test split."""
-    from datasets import load_dataset, Audio
     if split not in ("train","test"): raise ValueError("Unsupported FLEURS split")
     revision="44ebc3e0222cda1571220d148f3e3163843747dd"
     root=(Path("/tmp/ralph_v4_fleurs") if Path("/kaggle").exists() else WORK/"fleurs")/split
     root.mkdir(parents=True,exist_ok=True)
     url=f"https://huggingface.co/datasets/google/fleurs/resolve/{revision}/ko_kr/{split}-00000-of-00001.parquet"
-    data=load_dataset("parquet",data_files={"train":url},split="train",streaming=True,trust_remote_code=False).cast_column("audio",Audio(decode=False))
+    data=parquet_audio_rows(url,columns=["audio"])
     paths=[]
-    for i,row in enumerate(data):
-        if len(paths)>=limit: break
-        x=decode_audit_audio(row["audio"])
-        if len(x)<16000 or np.sqrt(np.mean(x*x))<1e-5: continue
-        dest=root/f"clip_{i:05d}.wav"
-        sf.write(dest,x.clip(-1,1),16000,subtype="PCM_16")
-        paths.append(dest)
+    from contextlib import closing
+    with closing(data):
+        for i,row in enumerate(data):
+            if len(paths)>=limit: break
+            x=decode_audit_audio(row["audio"])
+            if len(x)<16000 or np.sqrt(np.mean(x*x))<1e-5: continue
+            dest=root/f"clip_{i:05d}.wav"
+            sf.write(dest,x.clip(-1,1),16000,subtype="PCM_16")
+            paths.append(dest)
     if len(paths)!=limit: raise RuntimeError("Incomplete FLEURS "+split)
     return paths
 
