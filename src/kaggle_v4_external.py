@@ -445,6 +445,35 @@ class MetricGANTransfer(nn.Module):
         if isinstance(mask,tuple): mask=mask[0]
         return self.resynthesize(torch.expm1(mask*features),x)
 
+
+class SepformerTransfer(nn.Module):
+    """Registered SepFormer encoder/mask network, trainable decoder adaptation."""
+    def __init__(self):
+        super().__init__()
+        try:
+            import speechbrain
+        except ImportError:
+            subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3","huggingface_hub<1"])
+        from speechbrain.inference.separation import SepformerSeparation
+        family=EXPERIMENT_CONFIG.get("architecture","sepformer_dns_transfer")
+        source={"sepformer_dns_transfer":"speechbrain/sepformer-dns4-16k-enhancement","sepformer_wham_transfer":"speechbrain/sepformer-wham16k-enhancement"}[family]
+        engine=SepformerSeparation.from_hparams(source=source,savedir=str(Path("/tmp/ralph_v4_sepformer")/family if Path("/kaggle").exists() else WORK/family),run_opts={"device":"cpu"},freeze_params=False)
+        if int(engine.hparams.num_spks)!=1: raise ValueError("Expected one enhanced source")
+        self.encoder=engine.mods.encoder.requires_grad_(False)
+        self.masknet=engine.mods.masknet.requires_grad_(False)
+        self.decoder=engine.mods.decoder.requires_grad_(True)
+    def forward(self,x):
+        self.encoder.eval(); self.masknet.eval()
+        with torch.no_grad():
+            z=self.encoder(x)
+            mask=self.masknet(z)
+            z=z*mask[0]
+        y=self.decoder(z)
+        if y.ndim==3 and y.shape[1]==1: y=y[:,0]
+        if y.ndim!=2: raise RuntimeError("SepFormer decoder shape")
+        return F.pad(y,(0,max(0,x.shape[-1]-y.shape[-1])))[:,:x.shape[-1]]
+
+
 class GeneratedEnhancer(nn.Module):
     def __init__(self):
         super().__init__()
@@ -737,6 +766,8 @@ def run():
                 super().__init__(); self.fn=public_recipe(cfg["public_recipe"],device)
             def forward(self,x): return torch.cat([self.fn(v) for v in x.split(1)])
         model=RecipeModel().to(device)
+    elif cfg.get("architecture") in ("sepformer_dns_transfer","sepformer_wham_transfer"):
+        model = SepformerTransfer().to(device)
     elif cfg.get("architecture") == "metricgan":
         model = MetricGANTransfer().to(device)
     elif cfg.get("architecture") == "composed":
