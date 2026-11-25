@@ -850,6 +850,9 @@ def run():
             train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,n//2,42,True),SyntheticPairs(korean,tn,n-n//2,43,True)])
         else:
             train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
+        if cfg.get("smoke"):
+            # Use 16 challenge and 16 external samples, but the complete fixed validation.
+            train_set=torch.utils.data.Subset(train_set,list(range(16))+list(range(1296,1312)))
         external_val = DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)]),batch_size=4,shuffle=False)
         val_set = SpeechPairs(root, "validation")
         if len(val_set) != 164:
@@ -989,6 +992,7 @@ def run():
     except Exception as exc:
         metrics={"error":repr(exc)}
     result = {
+        "smoke":bool(cfg.get("smoke")),
         "metrics":metrics,
         "evaluation_protocol":"v4.2-fixed-dev-v2",
         "domain_scores":{"challenge":best_score,"external_normal":float(np.mean([r[1] for r in external_rows[:32]])),"external_stress":float(np.mean([r[1] for r in external_rows[32:]]))},
