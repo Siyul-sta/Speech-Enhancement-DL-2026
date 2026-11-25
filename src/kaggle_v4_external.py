@@ -269,7 +269,7 @@ def write_csv(path: Path, fields, records):
 TRAIN_RIRS=[]
 def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
     import urllib.request, tarfile, hashlib
-    base = Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external"
+    base = WORK/"public_cache" if prepare_only else (Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external")
     base.mkdir(parents=True, exist_ok=True)
     cache=EXPERIMENT_CONFIG.get("public_cache")
     if cache:
@@ -286,7 +286,7 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
                "dev":"https://www.openslr.org/resources/12/dev-clean.tar.gz",
                "test":"https://www.openslr.org/resources/12/test-clean.tar.gz",
                "noise":"https://www.openslr.org/resources/17/musan.tar.gz"}
-    if not include_test: sources.pop("test")
+    if not include_test or prepare_only: sources.pop("test")
     if evaluation_only:
         sources.pop("train",None)
     records = {}
