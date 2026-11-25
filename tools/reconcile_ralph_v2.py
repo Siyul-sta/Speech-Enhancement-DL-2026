@@ -119,7 +119,7 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
             print("Download failed; leave unresolved.")
             return
         min_epochs = 1 if result_dir.name == "smoke" else 5
-        if info.get("kind") in ("v4_public", "v4_external", "v4_audit", "v4_smoke"):
+        if info.get("kind") in ("v4_public", "v4_external", "v4_audit", "v4_smoke", "v4_perf"):
             try:
                 import ralph_v4
                 ralph_v4.verify(result_dir, info["kind"])
