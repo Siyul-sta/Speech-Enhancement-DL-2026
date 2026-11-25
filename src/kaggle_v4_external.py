@@ -267,7 +267,7 @@ def write_csv(path: Path, fields, records):
 
 # Public training corpora: LibriSpeech, MUSAN and optional SLR73/SLR28.
 TRAIN_RIRS=[]
-def public_assets():
+def public_assets(evaluation_only=False):
     import urllib.request, tarfile, hashlib
     base = Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external"
     base.mkdir(parents=True, exist_ok=True)
@@ -275,10 +275,12 @@ def public_assets():
                "dev":"https://www.openslr.org/resources/12/dev-clean.tar.gz",
                "test":"https://www.openslr.org/resources/12/test-clean.tar.gz",
                "noise":"https://www.openslr.org/resources/17/musan.tar.gz"}
+    if evaluation_only:
+        sources.pop("train"); sources.pop("test")
     records = {}
-    if EXPERIMENT_CONFIG.get("data_profile")=="spanish":
+    if not evaluation_only and EXPERIMENT_CONFIG.get("data_profile")=="spanish":
         sources["extra_speech"]="https://www.openslr.org/resources/73/es_pe_female.zip"
-    if EXPERIMENT_CONFIG.get("data_profile")=="rir":
+    if not evaluation_only and EXPERIMENT_CONFIG.get("data_profile")=="rir":
         sources["rir"]="https://www.openslr.org/resources/28/rirs_noises.zip"
     for key,url in sources.items():
         archive = base / (key+(".zip" if url.endswith(".zip") else ".tar.gz"))
@@ -344,7 +346,7 @@ def public_assets():
     te=[p for p in noises if str(p.parent.relative_to(base/"noise")) in test_held]
     test=sorted((base/"test").rglob("*.flac"))
     train,dev,tr,dv,test,te=map(quality_paths,(train,dev,tr,dv,test,te))
-    if not all((train,dev,tr,dv,test,te)):
+    if not all((dev,tr,dv,te)) or (not evaluation_only and not all((train,test))):
         raise RuntimeError("Empty external corpus split")
     records["counts"]={"train":len(train),"dev":len(dev),"test":len(test),"train_noise":len(tr),"dev_noise":len(dv),"test_noise":len(te),"rir":len(TRAIN_RIRS)}
     (WORK/"external_manifest.json").write_text(json.dumps(records,indent=2))
