@@ -76,7 +76,7 @@ def locate_data_root() -> Path:
     archives = sorted(mount.glob("*.zip"))
     if len(archives) != 1:
         raise RuntimeError(f"Expected one .zip containing train/ and validation/ in {mount}; found {len(archives)}")
-    target = WORK / "speech_data"
+    target = Path("/tmp/ralph_v4_private_speech") if Path("/kaggle").exists() else WORK / "speech_data"
     target.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archives[0]) as zf:
         for member in zf.infolist():
@@ -267,10 +267,11 @@ def write_csv(path: Path, fields, records):
 # Public training corpora: LibriSpeech and MUSAN.
 def public_assets():
     import urllib.request, tarfile, hashlib
-    base = WORK / "external"
+    base = Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external"
     base.mkdir(parents=True, exist_ok=True)
     sources = {"train":"https://www.openslr.org/resources/12/train-clean-100.tar.gz",
                "dev":"https://www.openslr.org/resources/12/dev-clean.tar.gz",
+               "test":"https://www.openslr.org/resources/12/test-clean.tar.gz",
                "noise":"https://www.openslr.org/resources/17/musan.tar.gz"}
     records = {}
     for key,url in sources.items():
@@ -294,14 +295,19 @@ def public_assets():
     noises=sorted(p for p in (base/"noise").rglob("*.wav") if "noise" in p.relative_to(base/"noise").parts or "music" in p.relative_to(base/"noise").parts)
     groups=sorted({str(p.parent.relative_to(base/"noise")) for p in noises})
     random.Random(42).shuffle(groups)
-    held=set(groups[:max(1,len(groups)//5)])
-    tr=[p for p in noises if str(p.parent.relative_to(base/"noise")) not in held]
+    if len(groups)<3: raise RuntimeError("Need three disjoint noise groups")
+    k=max(1,len(groups)//5)
+    held=set(groups[:k])
+    test_held=set(groups[k:2*k])
+    tr=[p for p in noises if str(p.parent.relative_to(base/"noise")) not in held|test_held]
     dv=[p for p in noises if str(p.parent.relative_to(base/"noise")) in held]
-    if not all((train,dev,tr,dv)):
+    te=[p for p in noises if str(p.parent.relative_to(base/"noise")) in test_held]
+    test=sorted((base/"test").rglob("*.flac"))
+    if not all((train,dev,tr,dv,test,te)):
         raise RuntimeError("Empty external corpus split")
     records["counts"]={"train":len(train),"dev":len(dev),"train_noise":len(tr),"dev_noise":len(dv)}
     (WORK/"external_manifest.json").write_text(json.dumps(records,indent=2))
-    return train,dev,tr,dv
+    return train,dev,tr,dv,test,te
 
 class SyntheticPairs(Dataset):
     def __init__(self,speech,noise,size,seed,dynamic):
@@ -338,7 +344,7 @@ class MetricGANTransfer(nn.Module):
         subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3"])
         from speechbrain.inference.enhancement import SpectralMaskEnhancement
         engine=SpectralMaskEnhancement.from_hparams(source="speechbrain/metricgan-plus-voicebank",
-            savedir=str(WORK/"metricgan_weights"),run_opts={"device":"cpu"},freeze_params=False)
+            savedir=str(Path("/tmp/ralph_v4_metricgan") if Path("/kaggle").exists() else WORK/"metricgan_weights"),run_opts={"device":"cpu"},freeze_params=False)
         self.generator=engine.mods.enhance_model
         self.features=engine.hparams.compute_STFT
         self.resynthesize=engine.hparams.resynth
@@ -367,9 +373,9 @@ class TemporalEnhancer(nn.Module):
 
 class NoisyOnly(Dataset):
     """Read only noisy manifests; never read validation/test clean files."""
-    def __init__(self,root):
+    def __init__(self,root,transductive=False):
         self.paths=[]
-        for split in ("train","validation","test"):
+        for split in (("train","validation","test") if transductive else ("train",)):
             p=root/split/"samples.csv"
             if p.is_file():
                 for name in pd.read_csv(p,usecols=["noisy_path"])["noisy_path"]:
@@ -407,7 +413,7 @@ def run():
     train_set = SpeechPairs(root, "train")
     if len(train_set) != 1296:
         raise RuntimeError("Unexpected train split size")
-    tr, dv, tn, dn = public_assets()
+    tr, dv, tn, dn, ts, tnoise = public_assets()
     train_set = torch.utils.data.ConcatDataset([train_set, SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
     external_val = DataLoader(SyntheticPairs(dv,dn,64,2026,False),batch_size=4,shuffle=False)
     val_set = SpeechPairs(root, "validation")
@@ -435,15 +441,31 @@ def run():
             raise RuntimeError("Expected one checkpoint from configured private kernel")
         model.load_state_dict(torch.load(matches[0], map_location=device, weights_only=True), strict=True)
         print("Warm start loaded", flush=True)
-    unlabeled = NoisyOnly(root) if cfg.get("self_supervised") else None
+    unlabeled = NoisyOnly(root, bool(cfg.get("transductive"))) if cfg.get("self_supervised") else None
     unlabeled_loader = DataLoader(unlabeled,batch_size=cfg["batch_size"],shuffle=True) if unlabeled is not None else None
     if unlabeled_loader is not None:
         import copy
         teacher=copy.deepcopy(model).eval().requires_grad_(False)
+    if cfg.get("final_audit"):
+        if not warm_ref:
+            raise RuntimeError("Final audit requires frozen checkpoint")
+        test_loader=DataLoader(SyntheticPairs(ts,tnoise,128,82491,False),batch_size=4,shuffle=False)
+        score,rows=evaluate(model,test_loader,device,pesq_function,save_rows=True)
+        write_csv(WORK/"audit_per_file.csv",["index","pesq_wb"],rows)
+        (WORK/"result.json").write_text(json.dumps({"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref},indent=2))
+        return
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
     )
+    probe=torch.randn(1,48000,device=device)*0.05
+    out=model(probe)
+    if out.shape!=probe.shape or not torch.isfinite(out).all():
+        raise RuntimeError("Model contract failed")
+    out.square().mean().backward()
+    if not any(p.grad is not None and torch.isfinite(p.grad).all() for p in model.parameters() if p.requires_grad):
+        raise RuntimeError("No finite gradient")
+    optimizer.zero_grad(set_to_none=True)
     best_score, best_epoch, stale = float("-inf"), 0, 0
     best_joint = float("-inf")
     history = []
@@ -520,7 +542,8 @@ def run():
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "model": type(model).__name__,
         "model_family":cfg.get("architecture","residual"),
-        "transductive_noisy":bool(cfg.get("self_supervised")),
+        "transductive_noisy":bool(cfg.get("transductive")) and bool(cfg.get("self_supervised")),
+        "self_supervised":bool(cfg.get("self_supervised")),
         "unlabeled_files":len(unlabeled) if unlabeled is not None else 0,
         "architecture": cfg.get("architecture","residual"),
         "optimizer": "AdamW+CosineAnnealingLR",
