@@ -122,9 +122,14 @@ class Handler(BaseHTTPRequestHandler):
             payload=json.dumps(snapshot(poll_remote=True),ensure_ascii=False,allow_nan=False).encode("utf-8"); mime="application/json; charset=utf-8"
         else:
             self.send_error(404); return
-        self.send_response(200); self.send_header("Content-Type",mime)
-        self.send_header("Content-Length",str(len(payload))); self.send_header("Cache-Control","no-store")
-        self.end_headers(); self.wfile.write(payload)
+        try:
+            self.send_response(200); self.send_header("Content-Type",mime)
+            self.send_header("Content-Length",str(len(payload))); self.send_header("Cache-Control","no-store")
+            self.end_headers(); self.wfile.write(payload)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            # A browser refresh/tab close or local socket interruption can abort
+            # a response while status is being fetched. Only this client is gone.
+            self.close_connection=True
     def log_message(self,*args): pass
 
 def main():
