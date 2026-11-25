@@ -11,6 +11,7 @@ import shutil
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
+import v4_model_policy as policy
 import ralph_v2 as core
 import ralph_loop as legacy
 
@@ -28,6 +29,10 @@ def verify_rows(path, count, expected):
 
 def verify(folder, kind="v4_public"):
     r = json.loads((folder/"result.json").read_text(encoding="utf-8"))
+    if kind=="v4_audit":
+        if r.get("audit_files")!=128: raise ValueError("Wrong audit size")
+        verify_rows(folder/"audit_per_file.csv",128,r["audit_pesq"])
+        return r
     if r["validation_files"] != 164:
         raise ValueError("Expected 164 validation clips")
     verify_rows(folder/"validation_per_file.csv",164,r["best_validation_pesq_wb"])
@@ -44,7 +49,7 @@ def history():
     records=[]
     for path in sorted(core.OUTPUT.glob("run_v4*/round_*/*/remote_state.json")):
         state=json.loads(path.read_text(encoding="utf-8"))
-        if state.get("status")=="COMPLETE":
+        if state.get("status")=="COMPLETE" and state.get("kind")!="v4_audit":
             try:
                 records.append((state,verify(path.parent,state["kind"])))
             except (OSError,ValueError,KeyError):
@@ -54,15 +59,15 @@ def history():
 
 def propose_config(records, n, epochs, codex):
     """Codex chooses a typed research plan; no arbitrary evaluation code edits."""
-    architectures=("residual","temporal","metricgan")
-    fallback={"architecture":architectures[n%3],"self_supervised":bool(n%2),
-              "lr":0.0001,"external_size":[512,1024,2048][n%3]}
+    architectures=("residual","temporal","metricgan","generated")
+    fallback={"architecture":architectures[n%4] if codex else architectures[n%3],"self_supervised":bool(n%2),
+              "lr":0.0001,"external_size":[512,1024,2048][n%3],"loss_mode":["base","sisdr","waveform"][n%3]}
     if not codex: return fallback
     evidence=[{"kind":st["kind"],"result":r} for st,r in records[-12:]]
     prompt=("Return ONLY one JSON object, no code or markdown. Design next speech enhancement trial "
-            "to improve challenge and external domain PESQ. Allowed keys: architecture (residual, temporal, metricgan), "
+            "to improve challenge and external domain PESQ. Allowed keys: architecture (residual, temporal, metricgan, generated), "
             "self_supervised (boolean, uses noisy-only transductive consistency), lr (0.00001 to 0.001), "
-            "external_size (512,1024,2048). Avoid repeated failed or stagnant settings. "
+            "external_size (512,1024,2048), loss_mode (base, sisdr, waveform). Avoid repeated failed or stagnant settings. "
             "No filesystem edits, no training or external commands. History: "+json.dumps(evidence)[-14000:])
     try:
         p=subprocess.run([codex,"exec","--sandbox","read-only",prompt],cwd=ROOT,
@@ -70,12 +75,25 @@ def propose_config(records, n, epochs, codex):
         match=re.search(r'\{[^{}]*"architecture"[^{}]*\}',p.stdout,re.S)
         obj=json.loads(match.group(0))
         if (obj["architecture"] not in architectures or type(obj["self_supervised"]) is not bool
-            or not 0.00001<=float(obj["lr"])<=0.001 or obj["external_size"] not in (512,1024,2048)):
+            or not 0.00001<=float(obj["lr"])<=0.001 or obj["external_size"] not in (512,1024,2048) or obj["loss_mode"] not in ("base","sisdr","waveform")):
             raise ValueError("Invalid proposal")
         return {k:obj[k] for k in fallback}
     except Exception as exc:
         print("Codex proposal unavailable; using deterministic fallback:",str(exc),flush=True)
         return fallback
+
+def generate_model(codex,records):
+    prompt=("Return ONLY Python source for one class GeneratedEnhancer(nn.Module). "
+            "No imports, decorators, external files or global mutations. Available nn, torch, F, math. "
+            "__init__(self) and forward(self,x) required; x is mono waveform [batch,time], "
+            "return same shape. Design a substantive novel speech enhancement architecture "
+            "under 5M trainable parameters. History: "+json.dumps([r for st,r in records[-8:]])[-10000:])
+    p=subprocess.run([codex,"exec","--sandbox","read-only",prompt],cwd=ROOT,
+                     capture_output=True,encoding="utf-8",errors="replace",timeout=240,check=True)
+    code=p.stdout.strip()
+    if code.startswith("```"):
+        code=code.split("\n",1)[1].rsplit("```",1)[0]
+    return code,policy.validate_model(code)
 
 def submit(kaggle, source, tag, i, kind, config=None):
     folder=core.OUTPUT/("run_"+tag)/f"round_{i:04d}"/kind
@@ -102,6 +120,9 @@ def submit(kaggle, source, tag, i, kind, config=None):
         raise
     r=verify(folder,kind)
     core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind})
+    if kind=="v4_audit":
+        print("FINAL AUDIT",json.dumps(r),flush=True)
+        return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
     core.append_history(folder.parents[1]/"experiments.jsonl",{"round":i,"family":kind,"status":"COMPLETE","score":r["best_validation_pesq_wb"],"kernel":ref,"external_score":r.get("external_validation_pesq_wb"),"hypothesis":json.dumps(config or {})})
     core.dashboard_event(folder.parents[1],"scoring",message="V4 verified results",ref=ref,remote_status="COMPLETE")
     print(json.dumps(r,indent=2),flush=True)
@@ -109,6 +130,7 @@ def submit(kaggle, source, tag, i, kind, config=None):
 
 def main():
     p=argparse.ArgumentParser()
+    p.add_argument("--final-audit",action="store_true",help="Evaluate frozen best non-transductive built-in checkpoint once")
     p.add_argument("--execute",action="store_true")
     p.add_argument("--loop",action="store_true",help="Continue mixed-corpus training and warm-start search until quota/safety guard")
     p.add_argument("--codex-research",action="store_true",help="Use Codex for structured strategy proposals")
@@ -132,6 +154,14 @@ def main():
         records=history()
         codex=(shutil.which("codex") or shutil.which("codex.cmd")) if args.codex_research else None
         i=0
+        if args.final_audit:
+            eligible=[(st,r) for st,r in records if st["kind"]=="v4_external" and not r.get("transductive_noisy") and r.get("model_family")!="generated"]
+            if not eligible: raise RuntimeError("No eligible frozen checkpoint")
+            if any(core.OUTPUT.glob("run_v4*/round_*/v4_audit/remote_state.json")): raise RuntimeError("Audit already submitted; do not reuse for tuning")
+            st,r=max(eligible,key=lambda z:z[1]["joint_score"])
+            legacy.require_quota(kaggle,2)
+            submit(kaggle,sources["v4_external"],tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":st["ref"],"architecture":r.get("model_family","residual"),"final_audit":True})
+            return
         if not any(st["kind"]=="v4_public" for st,r in records) or not args.loop:
             legacy.require_quota(kaggle,2)
             i+=1
@@ -143,16 +173,26 @@ def main():
             except legacy.QuotaGuardReached as exc:
                 print("STOP",exc,flush=True); break
             plan=propose_config(records,n,args.epochs,codex)
+            candidate=sources["v4_external"]
+            if plan["architecture"]=="generated":
+                try:
+                    code,digest=generate_model(codex,records)
+                    candidate=policy.embed(candidate,code)
+                    plan["generated_hash"]=digest
+                except Exception as exc:
+                    print("Generated model rejected:",exc,flush=True)
+                    plan["architecture"]="temporal"
             external=[(st,r) for st,r in records if st["kind"]=="v4_external"
                       and r.get("model_family","residual")==plan["architecture"]
-                      and bool(r.get("transductive_noisy"))==plan["self_supervised"]]
+                      and bool(r.get("self_supervised"))==plan["self_supervised"]
+                      and r.get("generated_hash")==plan.get("generated_hash")]
             best=max(external,key=lambda pair:pair[1]["joint_score"],default=None)
             warm=best[0]["ref"] if best and n%4!=0 else None
             cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":4,"patience":7,"seed":42,"warm_ref":warm,**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
             try:
-                records.append(submit(kaggle,sources["v4_external"],tag,i,"v4_external",cfg))
+                records.append(submit(kaggle,candidate,tag,i,"v4_external",cfg))
                 errors=0
             except legacy.KaggleTerminalFailure as exc:
                 errors+=1
