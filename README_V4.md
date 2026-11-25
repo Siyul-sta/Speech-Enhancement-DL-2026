@@ -43,9 +43,21 @@ If a Kaggle job is interrupted, use tools/reconcile_ralph_v2.py, which understan
 
 ## Performance configuration
 - Public CPU cache prepares at most two archives concurrently; full source archives and fixed evaluation protocol remain unchanged.
-- Fixed synthetic development pairs are materialized once, 16 kHz long clips use exact random seek, CUDA training loaders use up to two spawned workers with pinned buffers.
+- Fixed synthetic development pairs are materialized once, 16 kHz long clips use exact random seek, CUDA training uses pinned buffers and defaults to zero loader workers; two spawned workers require the quality gate.
 - PESQ scoring uses up to two isolated spawned CPU processes, preserving file order and FP32 scoring inputs. No speedup claimed until Kaggle benchmark.
-- `--amp` is opt-in and only enables FP16 convolution forward for temporal/composed models, with FP32 loss, gradient scaling and FP32 evaluation. Default is FP32. AMP and loader performance require actual GPU verification.
+- `--amp` is experimental and only enables FP16 convolution forward for temporal/composed models, with FP32 loss, gradient scaling and FP32 evaluation. Ordinary research remains FP32 and serial-loader. No unapproved AMP/worker setting is applied to the loop.
+
+## Quality-first A/B benchmark (GPU, explicit execution)
+    py -u tools/ralph_v4.py --perf-benchmark --build-public-cache --epochs 15 --execute
+
+Six sequential full-data trials: temporal architecture, three matched seeds (42, 43, 44), serial FP32 baseline versus two-worker FP32 candidate. Add `--amp` to test the combined two-worker/AMP candidate separately. Seeded synthetic training pairs and epoch schedules are identical between each pair; validation and first-epoch training waveforms are fingerprinted. All 228 development clips remain fixed. No early stopping in benchmark; no benchmark scores enter research ranking. Each trial respects the existing quota/remote-state guard. The benchmark excludes public-cache build time and measures complete epoch times including validation. It is not a guarantee for other architectures or future GPU hardware.
+
+Acceptance requires no decrease in any of eight quality metrics on any seed (three PESQ domain means, robust PESQ, challenge/external SI-SDR and STOI), identical input fingerprints and matching hardware, and median paired epoch-time reduction >=5%. Missing/incomplete results, changed sources, or a quality regression reject the optimization. Report: `runs/ralph_v2/perf_gate_fp32.json` or `perf_gate_amp.json`.
+
+Only after an accepted report, run the exact approved profile with:
+    py -u tools/ralph_v4.py --validated-perf-run --epochs 15 --execute
+
+Use `--amp` only if the AMP report was approved. The approved run checks source hash, public cache, profile, runtime hardware and waveform fingerprints. Ordinary `--loop` intentionally does not generalize this approval to other configurations. If a gate fails, retain the default FP32 serial loader. Final independent audit is never used for this comparison.
 
 ## Remaining runtime risks
 Public model dependencies, remote model downloads, real external archives (large),
