@@ -32,6 +32,7 @@ def quality(result):
 def compare(pairs,epochs,amp=False):
     """Require all three paired seeds, unchanged fingerprints, no drop, >=5% speed gain."""
     reasons=[]; measurements=[]
+    first_validation=None
     if len(pairs)!=len(SEEDS): return {"accepted":False,"reasons":["Incomplete seed pairs"],"pairs":[]}
     try:
         for seed,(base,candidate) in zip(SEEDS,pairs):
@@ -44,6 +45,8 @@ def compare(pairs,epochs,amp=False):
                     raise ValueError("Missing data fingerprints")
             if base["hardware"]!=candidate["hardware"] or base["data_fingerprint"]!=candidate["data_fingerprint"] or base["training_fingerprint"]!=candidate["training_fingerprint"]:
                 raise ValueError("Mismatched data or hardware")
+            if first_validation is None: first_validation=base["data_fingerprint"]
+            elif first_validation!=base["data_fingerprint"]: raise ValueError("Validation changed between seeds")
             if base["hardware"].get("device") in ("cpu",None) or base["loader_workers"]!=0 or candidate["loader_workers"]!=2:
                 raise ValueError("Expected CUDA with serial versus two-worker loader")
             if base["precision"]!="fp32" or candidate["precision"]!=("amp_fp16_forward_fp32_loss" if amp else "fp32"):
@@ -56,7 +59,8 @@ def compare(pairs,epochs,amp=False):
             if len(t0)!=epochs or len(t1)!=epochs or not all(math.isfinite(t) and t>0 for t in t0+t1):
                 raise ValueError("Missing valid epoch timings")
             ratio=sum(t1)/sum(t0)
-            measurements.append({"seed":seed,"baseline_seconds":sum(t0),"candidate_seconds":sum(t1),"ratio":ratio,"delta":delta})
+            measurements.append({"seed":seed,"baseline_seconds":sum(t0),"candidate_seconds":sum(t1),"ratio":ratio,"delta":delta,
+                                 "hardware":candidate["hardware"],"data_fingerprint":candidate["data_fingerprint"],"training_fingerprint":candidate["training_fingerprint"]})
         ratio=statistics.median(m["ratio"] for m in measurements)
         if ratio>0.95: reasons.append("Median speed gain below 5%")
         return {"accepted":not reasons,"reasons":reasons,"pairs":measurements,"median_ratio":ratio}
@@ -66,4 +70,5 @@ def compare(pairs,epochs,amp=False):
 def authorized(report,source,cache,epochs,amp):
     return bool(report.get("accepted") is True and report.get("source_sha256")==signature(source)
                 and report.get("cache")==cache and report.get("profile")==profile(epochs)
-                and report.get("amp") is bool(amp) and report.get("seeds")==list(SEEDS))
+                and report.get("amp") is bool(amp) and report.get("seeds")==list(SEEDS)
+                and len(report.get("pairs",[]))==len(SEEDS) and report["pairs"][0].get("seed")==SEEDS[0])
