@@ -196,6 +196,7 @@ def checked_output(fn, noisy):
     return y.clamp(-1, 1)
 
 def run():
+    if "public_assets" not in globals(): raise RuntimeError("Use V4 controller to package shared evaluation helpers")
     WORK.mkdir(parents=True, exist_ok=True)
     seed_everything(42)
     root = locate_data_root()
@@ -207,6 +208,13 @@ def run():
     names = ("metricgan", "deepfilter", "sepformer_dns", "sepformer_wham")
     predictions, errors = {}, {}
     noisy = torch.from_numpy(data.noisy)
+    clean = torch.from_numpy(data.clean)
+    challenge_count=len(noisy)
+    _,dv,_,dn,_,_=public_assets(evaluation_only=True)
+    external=torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)])
+    pairs=[external[i] for i in range(64)]
+    noisy=torch.cat([noisy,torch.stack([x for x,y in pairs])])
+    clean=torch.cat([clean,torch.stack([y for x,y in pairs])])
     for name in names:
         try:
             fn = load_model(name, device)
@@ -235,19 +243,25 @@ def run():
     winner = None
     for name, pred in candidates.items():
         rows = []
-        for i in range(164):
-            score = float(pesq_fn(16000, np.clip(data.clean[i], -1, 1), pred[i].clamp(-1,1).numpy(), "wb"))
+        for i in range(len(noisy)):
+            score = float(pesq_fn(16000, np.clip(clean[i].numpy(), -1, 1), pred[i].clamp(-1,1).numpy(), "wb"))
             if not np.isfinite(score):
                 raise RuntimeError("Nonfinite PESQ")
             rows.append([i, score])
-        mean = float(np.mean([row[1] for row in rows]))
-        scores[name] = mean
-        print("PESQ", name, mean, flush=True)
-        if mean > best:
-            best, winner, best_rows = mean, name, rows
-    write_csv(WORK / "validation_per_file.csv", ["index","pesq_wb"], best_rows)
+        ds=[float(np.mean([row[1] for row in chunk])) for chunk in (rows[:challenge_count],rows[challenge_count:challenge_count+32],rows[challenge_count+32:])]
+        robust=0.5*float(np.mean(ds))+0.5*min(ds)
+        scores[name] = {"challenge":ds[0],"external_normal":ds[1],"external_stress":ds[2],"robust":robust}
+        print("PESQ", name, scores[name], flush=True)
+        if robust > best:
+            best, winner, best_rows = robust, name, rows
+    write_csv(WORK / "validation_per_file.csv", ["index","pesq_wb"], best_rows[:164])
+    write_csv(WORK / "external_validation.csv", ["index","pesq_wb"], [[i,row[1]] for i,row in enumerate(best_rows[164:])])
+    domains={k:scores[winner][k] for k in ("challenge","external_normal","external_stress")}
+    external_mean=(domains["external_normal"]+domains["external_stress"])/2
     result = {"experiment":"V4_PUBLIC_ZERO_SHOT", "validation_files":164,
-              "best_validation_pesq_wb":best, "winner":winner, "scores":scores,
+              "evaluation_protocol":"v4.2-fixed-dev-v2","domain_scores":domains,"external_validation_files":64,
+              "external_validation_pesq_wb":external_mean,"joint_score":(domains["challenge"]+external_mean)/2,"robust_score":best,
+              "best_validation_pesq_wb":domains["challenge"], "winner":winner, "scores":scores,
               "errors":errors, "selection":"global validation blend, no per-file oracle",
               "seed":42}
     (WORK / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
