@@ -76,7 +76,7 @@ def locate_data_root() -> Path:
     archives = sorted(mount.glob("*.zip"))
     if len(archives) != 1:
         raise RuntimeError(f"Expected one .zip containing train/ and validation/ in {mount}; found {len(archives)}")
-    target = WORK / "speech_data"
+    target = Path("/tmp/ralph_v4_private_speech") if Path("/kaggle").exists() else WORK / "speech_data"
     target.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(archives[0]) as zf:
         for member in zf.infolist():
@@ -165,7 +165,7 @@ def load_model(name, device):
         from speechbrain.inference.enhancement import SpectralMaskEnhancement
         engine = SpectralMaskEnhancement.from_hparams(
             source="speechbrain/metricgan-plus-voicebank",
-            savedir=str(WORK / "public_weights" / "metricgan"),
+            savedir=str(Path("/tmp/ralph_v4_public_metricgan") if Path("/kaggle").exists() else WORK / "public_weights" / "metricgan"),
             run_opts={"device": str(device)})
         return lambda x: engine.enhance_batch(x, lengths=torch.ones(x.shape[0], device=x.device))
     if name == "deepfilter":
