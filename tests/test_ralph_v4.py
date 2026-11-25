@@ -20,10 +20,27 @@ class ControllerTests(unittest.TestCase):
             w.writerows((i,value) for i in range(count))
     def test_plan_rotation(self):
         plans=[v4.propose_config([],n,2,None) for n in range(24)]
-        self.assertEqual({p["architecture"] for p in plans},{"residual","temporal","metricgan","moe"})
+        self.assertEqual({p["architecture"] for p in plans},{"residual","temporal","metricgan","moe","composed"})
         self.assertEqual({p["data_profile"] for p in plans},set(catalog.DATASETS))
         self.assertTrue(any(p["distill"] for p in plans))
         self.assertTrue(any(p["loss_mode"]=="composed" for p in plans))
+    def test_network_grammar(self):
+        spec=catalog.default_network(1)
+        self.assertEqual(catalog.validate_network(spec),spec)
+        spec["blocks"][0]["type"]="arbitrary"
+        with self.assertRaises(ValueError): catalog.validate_network(spec)
+    def test_robust_artifact(self):
+        with tempfile.TemporaryDirectory() as d:
+            path=Path(d)
+            self.rows(path/"validation_per_file.csv",164,3.0)
+            self.rows(path/"external_validation.csv",64,2.0)
+            (path/"best_model.pt").write_bytes(b"test")
+            r={"validation_files":164,"best_validation_pesq_wb":3.0,"external_validation_files":64,"external_validation_pesq_wb":2.0,"joint_score":2.5,"evaluation_protocol":"v4.2-fixed-dev-v2","domain_scores":{"challenge":3.0,"external_normal":2.0,"external_stress":2.0},"robust_score":0.5*7/3+1}
+            (path/"result.json").write_text(json.dumps(r))
+            self.assertAlmostEqual(v4.rank_score(v4.verify(path,"v4_external")),r["robust_score"])
+            r["robust_score"]+=.1
+            (path/"result.json").write_text(json.dumps(r))
+            with self.assertRaises(ValueError): v4.verify(path,"v4_external")
     def test_loss_bounds(self):
         self.assertEqual(catalog.validate_loss({"wave":1,"spectral":0,"sisdr":.2})["wave"],1)
         for bad in ({"wave":0,"spectral":0,"sisdr":1},{"wave":float("nan"),"spectral":1,"sisdr":0},{"wave":True,"spectral":1,"sisdr":0}):
