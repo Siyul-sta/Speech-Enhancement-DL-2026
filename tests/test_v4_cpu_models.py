@@ -10,6 +10,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path[:0]=[str(ROOT/"src"),str(ROOT/"tools")]
 import kaggle_v4_external as trainer
 import infer_v4
+import kaggle_v4_public as public
 import v4_research_catalog as catalog
 from unittest.mock import patch
 
@@ -61,6 +62,55 @@ class CpuModelTests(unittest.TestCase):
             x=np.random.default_rng(42).normal(0,.1,length).astype(np.float32)
             np.testing.assert_allclose(infer_v4.enhance(torch.nn.Identity(),x,"cpu"),x,atol=1e-7)
         self.assertEqual(len(infer_v4.resample(np.zeros(44100,dtype=np.float32),44100,16000)),16000)
+
+    def test_public_recipe_replay(self):
+        def fake(name,device):
+            return lambda x:x*(.2 if name=="metricgan" else .6)
+        x=torch.ones(1,100)*.5
+        with patch.object(public,"load_model",fake):
+            torch.testing.assert_close(public.public_recipe("metricgan:0.75","cpu")(x),x*.4)
+            torch.testing.assert_close(public.public_recipe("blend:metricgan:deepfilter:0.25","cpu")(x),x*.5)
+            with self.assertRaises(ValueError): public.public_recipe("metricgan:2","cpu")
+    def test_urgent_decode_and_long_audit(self):
+        import io
+        x=np.sin(np.arange(22050)*.1).astype(np.float32)*.1
+        buf=io.BytesIO()
+        sf.write(buf,x,22050,format="WAV",subtype="FLOAT")
+        y=trainer.decode_audit_audio({"bytes":buf.getvalue()})
+        self.assertEqual(len(y),16000)
+        np.testing.assert_allclose(trainer.enhance_long(torch.nn.Identity(),y,"cpu"),y,atol=1e-7)
+    def test_public_archive_fixture(self):
+        import io,tarfile,zipfile
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            # Tiny deterministic fixture, same extension and directory schema as OpenSLR.
+            def wav(freq,fmt):
+                buf=io.BytesIO()
+                sf.write(buf,np.sin(np.arange(16000)*freq).astype(np.float32)*.1,16000,format=fmt)
+                return buf.getvalue()
+            def tar(items):
+                buf=io.BytesIO()
+                with tarfile.open(fileobj=buf,mode="w:gz") as tf:
+                    for name,data in items:
+                        info=tarfile.TarInfo(name); info.size=len(data)
+                        tf.addfile(info,io.BytesIO(data))
+                return buf.getvalue()
+            train=tar([(f"LibriSpeech/train-clean-100/1/1/1-1-{i}.flac",wav(.05+i*.001,"FLAC")) for i in range(40)])
+            dev=tar([("LibriSpeech/dev-clean/2/2/2-2-1.flac",wav(.09,"FLAC"))])
+            noise=tar([(f"musan/noise/g{i}/n.wav",wav(.12+i*.03,"WAV")) for i in range(10)])
+            def fake(url,timeout=60):
+                return io.BytesIO(train if "train-clean" in url else dev if "dev-clean" in url else noise)
+            with patch.object(trainer,"WORK",root),patch.dict(trainer.EXPERIMENT_CONFIG,{"data_profile":"base","public_cache":None}),patch("urllib.request.urlopen",fake):
+                tr,dv,tn,dn,ts,te=trainer.public_assets()
+                self.assertTrue(tr and dv and tn and dn and te)
+                self.assertFalse(set(tn)&set(dn) or set(tn)&set(te) or set(dn)&set(te))
+                self.assertEqual(ts,[])
+                self.assertFalse(list((root/"external").glob("*.tar.gz")))
+                manifest=__import__("json").loads((root/"external_manifest.json").read_text())
+                self.assertNotIn("test",manifest)
+
     def test_wer(self):
         self.assertEqual(trainer.word_error_count("one two three","one four three"),(1,3))
         self.assertEqual(trainer.word_error_count("one two","one"),(1,2))
