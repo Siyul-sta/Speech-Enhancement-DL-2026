@@ -55,6 +55,14 @@ def validate(candidate, before, family_class):
         return [dump(n) for n in tree.body if name_of(n) is None and not isinstance(n, (ast.Import, ast.ImportFrom))]
     if fixed(old) != fixed(new):
         raise ValueError("Protected top-level execution modified")
+    reserved = PROTECTED | CONSTANTS | {"torch", "np", "nn", "F", "DataLoader", "Dataset", "json", "csv", "random", "time", "math", "sys", "Path", "pd", "sf", "subprocess", "importlib", "zipfile"}
+    for n in new.body:
+        if isinstance(n, (ast.Import, ast.ImportFrom)):
+            for alias in n.names:
+                if alias.name == "*" or ((alias.asname or alias.name.split(".")[0]) in reserved and dump(n) not in {dump(x) for x in old.body}):
+                    raise ValueError("Import shadows protected name")
+    if any(name in reserved and name not in a for name in b):
+        raise ValueError("Research definition shadows trusted dependency")
     old_imports = {dump(n) for n in old.body if isinstance(n, (ast.Import, ast.ImportFrom))}
     new_imports = {dump(n) for n in new.body if isinstance(n, (ast.Import, ast.ImportFrom))}
     if not old_imports <= new_imports:
@@ -79,6 +87,8 @@ def validate(candidate, before, family_class):
         elif not isinstance(n, (ast.ClassDef, ast.FunctionDef)):
             raise ValueError("Unsupported research definition")
         for item in ast.walk(n):
+            if isinstance(item, ast.Attribute) and isinstance(item.ctx, (ast.Store, ast.Del)) and isinstance(item.value, ast.Name) and item.value.id != "self":
+                raise ValueError("External attribute mutation prohibited")
             if isinstance(item, (ast.Import, ast.ImportFrom, ast.Global, ast.Nonlocal)):
                 raise ValueError("Nested import/global prohibited")
             if isinstance(item, ast.Name) and item.id in BAD_NAMES:
