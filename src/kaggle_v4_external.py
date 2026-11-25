@@ -432,12 +432,14 @@ class SyntheticPairs(Dataset):
         self.stress=stress
         self.rirs=tuple(TRAIN_RIRS) if dynamic else ()
         self.augmentation=EXPERIMENT_CONFIG.get("augmentation","base")
+        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and EXPERIMENT_CONFIG.get("perf_reproducible") else None
+        self.epoch=0
     def __len__(self):
         return self.size
     def __getitem__(self,i):
         import scipy.signal
         import math
-        rng=random if self.dynamic else random.Random(self.seed+i)
+        rng=(random.Random(self.perf_seed*1000000007+self.seed*1000003+self.epoch*100003+i) if self.perf_seed is not None else random) if self.dynamic else random.Random(self.seed+i)
         def clip(paths):
             path=rng.choice(paths)
             with sf.SoundFile(str(path)) as audio:
@@ -446,7 +448,9 @@ class SyntheticPairs(Dataset):
                     # Identical random crop to full-file decode, without reading unused audio.
                     k=rng.randint(0,len(audio)-48000)
                     audio.seek(k)
-                    return audio.read(48000,dtype="float32",always_2d=True).mean(axis=1).astype(np.float32)
+                    chunk=audio.read(48000,dtype="float32",always_2d=True).mean(axis=1).astype(np.float32)
+                    if len(chunk)!=48000 or not np.isfinite(chunk).all(): raise ValueError("Invalid audio crop")
+                    return chunk
                 y=audio.read(dtype="float32",always_2d=True).mean(axis=1)
             if sr!=16000:
                 g=math.gcd(sr,16000)
@@ -923,10 +927,32 @@ def fixed_pairs(dataset):
 
 def make_loader(dataset,batch_size,shuffle,device,dynamic=False):
     import os
-    workers=min(2,max(0,(os.cpu_count() or 1)-1)) if device.type=="cuda" and dynamic else 0
+    workers=min(int(EXPERIMENT_CONFIG.get("loader_workers",0)),2,max(0,(os.cpu_count() or 1)-1)) if device.type=="cuda" and dynamic else 0
     opts={"num_workers":workers,"pin_memory":device.type=="cuda"}
-    if workers: opts.update(persistent_workers=True,prefetch_factor=2,multiprocessing_context="spawn")
+    if workers: opts.update(persistent_workers=False,prefetch_factor=2,multiprocessing_context="spawn")
+    if shuffle and EXPERIMENT_CONFIG.get("perf_reproducible"):
+        opts["generator"]=torch.Generator().manual_seed(int(EXPERIMENT_CONFIG["seed"]))
     return DataLoader(dataset,batch_size=batch_size,shuffle=shuffle,**opts)
+
+def set_data_epoch(dataset,epoch):
+    if isinstance(dataset,SyntheticPairs):
+        dataset.epoch=epoch
+    elif isinstance(dataset,torch.utils.data.ConcatDataset):
+        for child in dataset.datasets: set_data_epoch(child,epoch)
+    elif isinstance(dataset,torch.utils.data.Subset):
+        set_data_epoch(dataset.dataset,epoch)
+
+def fingerprint_pairs(*datasets):
+    import hashlib
+    digest=hashlib.sha256()
+    for data in datasets:
+        digest.update(str(len(data)).encode())
+        for i in range(len(data)):
+            for wave in data[i]:
+                arr=wave.detach().cpu().contiguous().numpy()
+                digest.update(str(arr.shape).encode())
+                digest.update(arr.tobytes())
+    return digest.hexdigest()
 
 def run():
     cfg = EXPERIMENT_CONFIG
@@ -949,6 +975,9 @@ def run():
 
     is_audit=bool(cfg.get("final_audit"))
     smoke=bool(cfg.get("smoke"))
+    perf=bool(cfg.get("perf_reproducible"))
+    data_fingerprint=None
+    training_fingerprint=None
     root=None
     if not smoke:
         tr, dv, tn, dn, ts, tnoise = public_assets(evaluation_only=is_audit,include_test=is_audit)
@@ -975,6 +1004,11 @@ def run():
         val_set = SpeechPairs(root, "validation")
         if len(val_set) != 164:
             raise RuntimeError("Unexpected validation split size")
+        if perf:
+            data_fingerprint=fingerprint_pairs(val_set,external_val.dataset)
+            # Exact train pairs at each seed/epoch are defined by this schedule; hash epoch one.
+            set_data_epoch(train_set,1)
+            training_fingerprint=fingerprint_pairs(train_set)
         train_loader = make_loader(train_set,cfg["batch_size"],True,device,dynamic=not smoke)
         val_loader = make_loader(val_set,cfg["batch_size"],False,device)
     pesq_function = ensure_pesq()
@@ -1071,8 +1105,10 @@ def run():
     best_joint = float("-inf")
     history = []
     started = time.monotonic()
+    epoch_times=[]
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
+        if perf: set_data_epoch(train_set,epoch)
         losses = []
         epoch_started=time.monotonic()
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
@@ -1110,7 +1146,8 @@ def run():
         telemetry={"event":"epoch","epoch":epoch,"loss":float(np.mean(losses)),"challenge":float(val_pesq),"external":float(external_pesq),"robust":float(joint),"best":float(best_score),"elapsed_s":time.monotonic()-epoch_started}
         if all(math.isfinite(v) for v in telemetry.values() if isinstance(v,(float,int))):
             print("V4_TELEMETRY "+json.dumps(telemetry,allow_nan=False),flush=True)
-        if epoch >= 5 and stale >= int(cfg["patience"]):
+        epoch_times.append(time.monotonic()-epoch_started)
+        if not perf and epoch >= 5 and stale >= int(cfg["patience"]):
             break
 
     model.load_state_dict(torch.load(WORK / "best_model.pt", map_location=device, weights_only=True))
@@ -1127,6 +1164,12 @@ def run():
     result = {
         "smoke":bool(cfg.get("smoke")),
         "precision":"amp_fp16_forward_fp32_loss" if use_amp else "fp32",
+        "perf_reproducible":perf,
+        "loader_workers":train_loader.num_workers,
+        "data_fingerprint":data_fingerprint,
+        "training_fingerprint":training_fingerprint,
+        "epoch_seconds":epoch_times,
+        "hardware":{"device":torch.cuda.get_device_name(device) if device.type=="cuda" else "cpu","torch":str(torch.__version__),"cuda":torch.version.cuda,"cpu_count":__import__("os").cpu_count()},
         "metrics":metrics,
         "evaluation_protocol":"v4-smoke-fixture-v1" if smoke else "v4.2-fixed-dev-v2",
         "domain_scores":{"challenge":best_score,"external_normal":float(np.mean([r[1] for r in external_rows[:32]])),"external_stress":float(np.mean([r[1] for r in external_rows[32:]]))},
