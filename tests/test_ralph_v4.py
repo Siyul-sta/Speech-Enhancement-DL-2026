@@ -232,13 +232,14 @@ class ControllerTests(unittest.TestCase):
                 folder.mkdir(parents=True)
                 (folder/"remote_state.json").write_text(json.dumps({"kind":kind,"status":"COMPLETE","ref":"owner/test"}))
                 return {},{}
-            with patch.object(v4,"ROOT",root),patch.object(v4.core,"OUTPUT",root/"runs"),patch.object(v4.shutil,"which",return_value="mock"),patch.object(v4.legacy,"require_quota"),patch.object(v4,"submit",fake),patch.object(sys,"argv",["ralph_v4","--smoke","--execute"]):
+            with patch.object(v4,"ROOT",root),patch.object(v4.core,"OUTPUT",root/"runs"),patch.object(v4.shutil,"which",return_value="mock"),patch.object(v4.legacy,"require_quota"),patch.object(v4,"submit",fake),patch.object(v4,"build_public_cache",side_effect=AssertionError("Smoke must skip cache")),patch.object(sys,"argv",["ralph_v4","--smoke","--build-public-cache","--execute"]):
                 v4.main()
                 self.assertEqual(v4.history(),[])
             self.assertEqual(len(calls),1)
             self.assertEqual(calls[0][0],"v4_smoke")
             self.assertEqual(calls[0][1]["epochs"],2)
             self.assertEqual(calls[0][1]["external_size"],16)
+            self.assertIsNone(calls[0][1]["public_cache"])
             self.assertFalse((root/"runs"/"active.lock").exists())
 
     def test_source_compiles(self):
