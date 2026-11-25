@@ -26,6 +26,11 @@ V1–V3 checkpoints and modified local src/kaggle_train.py are not overwritten.
 CPU model tests need torch, numpy, pandas, scipy and soundfile.
 GitHub Actions uses no Kaggle credentials or private audio.
 
+## Isolated smoke (only after user authorizes GPU)
+    py -u tools/ralph_v4.py --smoke --build-public-cache --execute
+
+This runs one two-epoch Temporal CNN trial using 16 challenge and 16 external training examples and all 228 development evaluation clips. Its checkpoint/result is never used for model selection. The optional CPU public cache is created first if absent. Omit `--build-public-cache` to download directly inside the job.
+
 ## Execution (only after user authorizes GPU)
     py -u tools/ralph_v4.py --loop --codex-research --discover --build-public-cache --epochs 15 --max-rounds 1 --execute
 
