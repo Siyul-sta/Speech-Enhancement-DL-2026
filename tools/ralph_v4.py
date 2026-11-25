@@ -179,7 +179,7 @@ def submit(kaggle, source, tag, i, kind, config=None):
     compile(source,"run.py","exec")
     (job/"run.py").write_text(source,encoding="utf-8")
     (folder/"source.py").write_text(source,encoding="utf-8")
-    core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"true","enable_internet":"true","dataset_sources":[DATASET],"competition_sources":[],"kernel_sources":list(dict.fromkeys(config[k] for k in ("warm_ref","public_cache") if config and config.get(k)))})
+    core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"true","enable_internet":"true","dataset_sources":[] if kind=="v4_audit" else [DATASET],"competition_sources":[],"kernel_sources":list(dict.fromkeys(config[k] for k in ("warm_ref","public_cache") if config and config.get(k)))})
     state=folder/"remote_state.json"
     core.json_write(state,{"ref":ref,"status":"SUBMIT_PENDING","kind":kind})
     core.dashboard_event(folder.parents[1],"training",message="V4 "+kind,ref=ref,round=i,remote_status="SUBMIT_PENDING")
