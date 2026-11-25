@@ -204,12 +204,12 @@ def submit(kaggle, source, tag, i, kind, config=None):
 
 def public_with_external(public,external):
     tree=ast.parse(external)
-    names={"public_assets","SyntheticPairs","quality_paths"}
+    names={"public_assets","SyntheticPairs","quality_paths","_pesq_one","close_pesq_pool","score_waveforms"}
     fragments=[ast.get_source_segment(external,n) for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
-    if len(fragments)!=3: raise ValueError("Missing shared evaluation helper")
+    if len(fragments)!=len(names): raise ValueError("Missing shared evaluation helper")
     marker="def run():"
     if public.count(marker)!=1: raise ValueError("Invalid public runner")
-    return public.replace(marker,"TRAIN_RIRS=[]\n\n"+"\n\n".join(fragments)+"\n\n"+marker,1)
+    return public.replace(marker,"TRAIN_RIRS=[]\n_PESQ_POOL=None\n\n"+"\n\n".join(fragments)+"\n\n"+marker,1)
 
 def audit_with_public(external,public):
     names={"load_model","checked_output","public_recipe"}
@@ -219,6 +219,7 @@ def audit_with_public(external,public):
 
 def main():
     p=argparse.ArgumentParser()
+    p.add_argument("--amp",action="store_true",help="Experimental CUDA mixed precision for temporal/composed convolution models only")
     p.add_argument("--smoke",action="store_true",help="One isolated two-epoch training smoke; no leaderboard promotion")
     p.add_argument("--final-audit",action="store_true",help="Evaluate frozen best non-transductive built-in checkpoint once")
     p.add_argument("--allow-generated-code",action="store_true",help="Opt in to experimental generated Python; AST validation is not a security sandbox")
@@ -263,7 +264,7 @@ def main():
         if args.smoke:
             print("SMOKE: no public cache or corpus download required",flush=True)
             legacy.require_quota(kaggle,2)
-            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":"temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":None})
+            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":"temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":None,"amp":args.amp})
             return
         if args.final_audit:
             eligible=[(st,r) for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file()]
@@ -310,7 +311,7 @@ def main():
                       and (plan["architecture"]!="composed" or r.get("network_spec")==plan["network_spec"])]
             best=max(external,key=lambda pair:rank_score(pair[1]),default=None)
             warm=best[0]["ref"] if best and n%4!=0 else None
-            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,**plan}
+            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,"amp":args.amp,**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
             try:
