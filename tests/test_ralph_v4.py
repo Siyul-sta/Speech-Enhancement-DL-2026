@@ -98,6 +98,34 @@ class ControllerTests(unittest.TestCase):
             self.assertIsNone(state["best"])
             self.assertEqual(state["experiments"],[])
 
+
+    def test_dashboard_remote_status_and_ranking(self):
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d); run=root/"run_v4test"
+            for i,kind,score,transductive in [(1,"v4_public",2.2,False),(2,"v4_external",2.1,False),(3,"v4_smoke",4.0,False),(4,"v4_external",4.1,True),(5,"v4_cache",None,False)]:
+                path=run/f"round_{i:04d}"/kind
+                path.mkdir(parents=True)
+                state={"status":"SUBMIT_PENDING" if score is None else "COMPLETE","kind":kind,"ref":f"owner/job-{i}"}
+                (path/"remote_state.json").write_text(json.dumps(state),encoding="utf-8")
+                if score is not None:
+                    (path/"result.json").write_text(json.dumps({"robust_score":score,"transductive_noisy":transductive,"evaluation_protocol":"v4.2-fixed-dev-v2"}),encoding="utf-8")
+            with patch.object(dashboard_v4,"remote_status",return_value={"status":"RUNNING","error":None}) as remote:
+                state=dashboard_v4.snapshot(root,poll_remote=True)
+            remote.assert_called_once_with("owner/job-5")
+            self.assertEqual(state["remote"]["status"],"RUNNING")
+            self.assertEqual(state["active"]["status"],"SUBMIT_PENDING")
+            self.assertEqual(state["best"]["kind"],"v4_public")
+            self.assertEqual(state["counts"]["ranked"],2)
+            self.assertEqual(json.loads((run/"round_0005"/"v4_cache"/"remote_state.json").read_text())["status"],"SUBMIT_PENDING")
+
+    def test_dashboard_remote_query_is_read_only(self):
+        from types import SimpleNamespace
+        with patch.dict(dashboard_v4.REMOTE_CACHE,{},clear=True),patch.object(dashboard_v4.shutil,"which",return_value="mock"),patch.object(dashboard_v4.subprocess,"run",return_value=SimpleNamespace(returncode=0,stdout="KernelWorkerStatus.RUNNING",stderr="")) as call:
+            self.assertEqual(dashboard_v4.remote_status("owner/test")["status"],"RUNNING")
+            self.assertEqual(dashboard_v4.remote_status("owner/test")["status"],"RUNNING")
+            call.assert_called_once()
+            self.assertEqual(call.call_args.args[0],["mock","kernels","status","owner/test"])
+
     def test_public_cache_cpu_submission(self):
         from types import SimpleNamespace
         source=(ROOT/"src/kaggle_v4_external.py").read_text(encoding="utf-8")
