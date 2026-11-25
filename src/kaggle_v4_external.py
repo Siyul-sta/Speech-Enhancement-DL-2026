@@ -633,6 +633,68 @@ def transcription_audit(model,speech,noise,device):
     return {"wer":errors/words,"words":words}
 
 
+
+@torch.no_grad()
+def enhance_long(model,x,device):
+    x=np.asarray(x,dtype=np.float32)
+    if x.ndim!=1 or not len(x) or not np.isfinite(x).all(): raise ValueError("Invalid audit waveform")
+    out=np.zeros(len(x),np.float64); weights=np.zeros(len(x),np.float64)
+    taper=np.maximum(np.hanning(48000),1e-3)
+    for start in range(0,len(x),24000):
+        segment=x[start:start+48000]; n=len(segment)
+        y=model(torch.from_numpy(np.pad(segment,(0,48000-n)))[None].to(device))
+        if y.shape!=(1,48000) or not torch.isfinite(y).all(): raise RuntimeError("Audit output contract failed")
+        out[start:start+n]+=y.cpu().numpy()[0,:n]*taper[:n]
+        weights[start:start+n]+=taper[:n]
+        if start+n==len(x): break
+    return (out/weights).astype(np.float32).clip(-1,1)
+
+def decode_audit_audio(audio):
+    import io, scipy.signal
+    if isinstance(audio,dict) and audio.get("bytes") is not None:
+        x,sr=sf.read(io.BytesIO(audio["bytes"]),dtype="float32",always_2d=True)
+        x=x.mean(1)
+    elif isinstance(audio,dict) and "array" in audio:
+        x=np.asarray(audio["array"],dtype=np.float32); sr=int(audio["sampling_rate"])
+        if x.ndim!=1: raise ValueError("Expected mono URGENT audio")
+    else:
+        raise ValueError("Missing audio payload")
+    if sr<=0 or not len(x) or not np.isfinite(x).all(): raise ValueError("Invalid URGENT audio")
+    if sr!=16000:
+        g=math.gcd(sr,16000); x=scipy.signal.resample_poly(x,16000//g,sr//g).astype(np.float32)
+    return x
+
+def urgent_audit(model,device,pesq_fn,limit=24,blind=False):
+    """Frozen out-of-corpus evaluation; blind split is mixed real/simulated, no PESQ."""
+    from datasets import load_dataset, Audio
+    config="test_blind" if blind else "test_nonblind"
+    splits=load_dataset("urgent-challenge/urgent2024_official",config,streaming=True)
+    split=next(iter(splits.values()))
+    split=split.cast_column("noisy_audio",Audio(decode=False))
+    if not blind: split=split.cast_column("clean_audio",Audio(decode=False))
+    rows=[]
+    if blind:
+        from torchmetrics.functional.audio.dnsmos import deep_noise_suppression_mean_opinion_score as dns
+    for i,sample in enumerate(split):
+        if i%7!=0: continue
+        x=decode_audit_audio(sample["noisy_audio"])
+        y=enhance_long(model,x,device)
+        if blind:
+            scores=dns(torch.from_numpy(y)[None],16000,False).reshape(-1,4).mean(0).tolist()
+        else:
+            c=decode_audit_audio(sample["clean_audio"])
+            if abs(len(c)-len(y))>160: raise RuntimeError("URGENT reference alignment mismatch")
+            n=min(len(c),len(y)); c=c[:n]; y=y[:n]
+            scores=[float(pesq_fn(16000,c.clip(-1,1),y,"wb"))]
+        if not np.isfinite(scores).all(): raise RuntimeError("Nonfinite URGENT score")
+        rows.append([str(sample["id"]),*scores])
+        if len(rows)>=limit: break
+    if len(rows)!=limit: raise RuntimeError("Incomplete URGENT audit")
+    keys=("p808","sig","bak","ovrl") if blind else ("pesq_wb",)
+    write_csv(WORK/("urgent_blind.csv" if blind else "urgent_paired.csv"),["id",*keys],rows)
+    return {"count":len(rows),"scores":dict(zip(keys,map(float,np.mean([r[1:] for r in rows],axis=0)))),"split":config,"sample_rule":"every seventh item; fixed 24 items; pretrained overlap not established"}
+
+
 def run():
     cfg = EXPERIMENT_CONFIG
     variant = cfg["id"]
@@ -669,7 +731,13 @@ def run():
         val_set, batch_size=cfg["batch_size"], shuffle=False, num_workers=0
     )
     pesq_function = ensure_pesq()
-    if cfg.get("architecture") == "metricgan":
+    if cfg.get("public_recipe"):
+        class RecipeModel(nn.Module):
+            def __init__(self):
+                super().__init__(); self.fn=public_recipe(cfg["public_recipe"],device)
+            def forward(self,x): return torch.cat([self.fn(v) for v in x.split(1)])
+        model=RecipeModel().to(device)
+    elif cfg.get("architecture") == "metricgan":
         model = MetricGANTransfer().to(device)
     elif cfg.get("architecture") == "composed":
         model = ComposedEnhancer().to(device)
@@ -696,12 +764,18 @@ def run():
         import copy
         teacher=copy.deepcopy(model).eval().requires_grad_(False)
     if cfg.get("final_audit"):
-        if not warm_ref:
-            raise RuntimeError("Final audit requires frozen checkpoint")
+        if not warm_ref and not cfg.get("public_recipe"):
+            raise RuntimeError("Final audit requires frozen checkpoint or recipe")
         test_loader=DataLoader(torch.utils.data.ConcatDataset([SyntheticPairs(ts,tnoise,64,82491,False),SyntheticPairs(ts,tnoise,64,92491,False,stress=True)]),batch_size=4,shuffle=False)
         score,rows=evaluate(model,test_loader,device,pesq_function,save_rows=True)
         write_csv(WORK/"audit_per_file.csv",["index","pesq_wb"],rows)
-        audit={"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref}
+        audit={"experiment":"V4_FINAL_AUDIT","audit_pesq":score,"audit_files":128,"warm_ref":warm_ref,"public_recipe":cfg.get("public_recipe")}
+        if cfg.get("audit_urgent"):
+            try:
+                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","torchmetrics","onnxruntime","librosa"])
+                audit["urgent_paired"]=urgent_audit(model,device,pesq_function)
+                audit["urgent_blind"]=urgent_audit(model,device,pesq_function,blind=True)
+            except Exception as exc: audit["urgent_error"]=repr(exc)
         if cfg.get("audit_aux"):
             for name in ("dnsmos","wer"):
                 try:
