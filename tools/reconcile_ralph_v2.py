@@ -99,7 +99,7 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
         info["ref"] = ref
         adaptive.json_write(path, info)
         print("Verified and saved corrected actual Kaggle notebook ref.")
-    if worker in ("RUNNING", "QUEUED", "PENDING", "INITIALIZING"):
+    if worker in ("RUNNING", "QUEUED", "PENDING", "INITIALIZING", "CANCEL_REQUESTED"):
         print("Remote GPU may still be in use. NOT RESOLVED.")
         return
     if worker == "COMPLETE":
@@ -122,10 +122,11 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
         adaptive.json_write(path, info)
         print("RESOLVED COMPLETE. Verified checkpoint, result, 164 PESQ rows.")
         return
-    if worker in ("ERROR", "CANCELLED", "CANCELED"):
+    if worker in ("ERROR", "CANCELLED", "CANCELED", "CANCEL_ACKNOWLEDGED"):
         if resolve:
             info["status"] = "ERROR_TERMINAL"
             info["reconciled"] = True
+            info["terminal_remote_status"] = worker
             adaptive.json_write(path, info)
             print("RESOLVED TERMINAL ERROR; no running notebook reported.")
         else:
