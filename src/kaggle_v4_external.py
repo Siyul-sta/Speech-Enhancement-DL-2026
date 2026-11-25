@@ -693,14 +693,21 @@ def decode_audit_audio(audio):
         g=math.gcd(sr,16000); x=scipy.signal.resample_poly(x,16000//g,sr//g).astype(np.float32)
     return x
 
-def urgent_audit(model,device,pesq_fn,limit=24,blind=False):
-    """Frozen out-of-corpus evaluation; blind split is mixed real/simulated, no PESQ."""
+def urgent_rows(blind=False):
+    """Read pinned Parquet directly, never execute a dataset repository script."""
     from datasets import load_dataset, Audio
     config="test_blind" if blind else "test_nonblind"
-    splits=load_dataset("urgent-challenge/urgent2024_official",config,streaming=True)
-    split=next(iter(splits.values()))
-    split=split.cast_column("noisy_audio",Audio(decode=False))
-    if not blind: split=split.cast_column("clean_audio",Audio(decode=False))
+    revision="231e45142538c710ae3ec3d7c8b6e81e9f848b01"
+    url=f"https://huggingface.co/datasets/urgent-challenge/urgent2024_official/resolve/{revision}/data/{config}/{config}-00000-of-00001.parquet"
+    rows=load_dataset("parquet",data_files={"train":url},split="train",streaming=True,trust_remote_code=False)
+    rows=rows.cast_column("noisy_audio",Audio(decode=False))
+    if not blind: rows=rows.cast_column("clean_audio",Audio(decode=False))
+    return rows
+
+def urgent_audit(model,device,pesq_fn,limit=24,blind=False):
+    """Frozen out-of-corpus evaluation; blind split is mixed real/simulated, no PESQ."""
+    config="test_blind" if blind else "test_nonblind"
+    split=urgent_rows(blind)
     rows=[]
     if blind:
         from torchmetrics.functional.audio.dnsmos import deep_noise_suppression_mean_opinion_score as dns
@@ -732,7 +739,8 @@ def fleurs_speech(split,limit=256):
     revision="44ebc3e0222cda1571220d148f3e3163843747dd"
     root=(Path("/tmp/ralph_v4_fleurs") if Path("/kaggle").exists() else WORK/"fleurs")/split
     root.mkdir(parents=True,exist_ok=True)
-    data=load_dataset("google/fleurs","ko_kr",revision=revision,split=split,streaming=True).cast_column("audio",Audio(decode=False))
+    url=f"https://huggingface.co/datasets/google/fleurs/resolve/{revision}/ko_kr/{split}-00000-of-00001.parquet"
+    data=load_dataset("parquet",data_files={"train":url},split="train",streaming=True,trust_remote_code=False).cast_column("audio",Audio(decode=False))
     paths=[]
     for i,row in enumerate(data):
         if len(paths)>=limit: break
