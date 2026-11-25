@@ -43,9 +43,11 @@ def verify(folder, kind="v4_public"):
     if r["validation_files"] != 164:
         raise ValueError("Expected 164 validation clips")
     verify_rows(folder/"validation_per_file.csv",164,r["best_validation_pesq_wb"])
-    if kind == "v4_external":
-        if r["external_validation_files"] != 64 or not (folder/"best_model.pt").is_file() or (folder/"best_model.pt").stat().st_size==0:
-            raise ValueError("Missing external evaluation or checkpoint")
+    if kind=="v4_external" or r.get("evaluation_protocol")=="v4.2-fixed-dev-v2":
+        if r["external_validation_files"] != 64:
+            raise ValueError("Missing external evaluation")
+        if kind=="v4_external" and (not (folder/"best_model.pt").is_file() or (folder/"best_model.pt").stat().st_size==0):
+            raise ValueError("Missing checkpoint")
         external_rows=verify_rows(folder/"external_validation.csv",64,r["external_validation_pesq_wb"])
         joint=(r["best_validation_pesq_wb"]+r["external_validation_pesq_wb"])/2
         if not math.isfinite(float(r["joint_score"])) or abs(joint-r["joint_score"])>1e-6:
@@ -67,7 +69,7 @@ def history():
         if state.get("status")=="COMPLETE" and state.get("kind")!="v4_audit":
             try:
                 r=verify(path.parent,state["kind"])
-                if state["kind"]=="v4_external" and r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": continue
+                if r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": continue
                 state["source_path"]=str(path.parent/"source.py")
                 records.append((state,r))
             except (OSError,ValueError,KeyError):
@@ -154,6 +156,15 @@ def submit(kaggle, source, tag, i, kind, config=None):
     print(json.dumps(r,indent=2),flush=True)
     return {"ref":ref,"kind":kind,"status":"COMPLETE","source_path":str(folder/"source.py")},r
 
+def public_with_external(public,external):
+    tree=ast.parse(external)
+    names={"public_assets","SyntheticPairs","quality_paths"}
+    fragments=[ast.get_source_segment(external,n) for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
+    if len(fragments)!=3: raise ValueError("Missing shared evaluation helper")
+    marker="def run():"
+    if public.count(marker)!=1: raise ValueError("Invalid public runner")
+    return public.replace(marker,"TRAIN_RIRS=[]\n\n"+"\n\n".join(fragments)+"\n\n"+marker,1)
+
 def main():
     p=argparse.ArgumentParser()
     p.add_argument("--final-audit",action="store_true",help="Evaluate frozen best non-transductive built-in checkpoint once")
@@ -168,6 +179,7 @@ def main():
     args=p.parse_args()
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
+    sources["v4_public"]=public_with_external(sources["v4_public"],sources["v4_external"])
     for k,s in sources.items(): compile(s,k,"exec")
     core.no_uncertain_prior_jobs()
     print("V4: public benchmark; optional continuous external-data and warm-start research; no PESQ cutoff")
