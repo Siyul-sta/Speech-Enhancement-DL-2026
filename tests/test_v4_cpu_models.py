@@ -134,6 +134,26 @@ class CpuModelTests(unittest.TestCase):
         self.assertTrue(all(p.grad is None for p in distill.parameters()))
         self.assertTrue(all(p.grad is None for p in teacher.parameters()))
 
+
+    def test_frozen_audit_does_not_read_private_data(self):
+        import json
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            config={"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"final_audit":True,"public_recipe":"metricgan:1.0"}
+            calls=[]
+            def assets(**kwargs):
+                self.assertTrue(kwargs["evaluation_only"] and kwargs["include_test"])
+                return [],[],[],[],["public speech"],["public noise"]
+            def evaluate(model,loader,device,pesq_function,save_rows=False):
+                self.assertEqual(len(loader.dataset),128)
+                self.assertFalse(model.training)
+                return 2.0,[[i,2.0] for i in range(128)]
+            with patch.object(trainer,"WORK",root),patch.object(trainer,"EXPERIMENT_CONFIG",config),patch.object(trainer,"public_assets",assets),patch.object(trainer,"locate_data_root",side_effect=AssertionError("Private data access forbidden")),patch.object(trainer,"ensure_pesq",return_value=None),patch.object(trainer,"public_recipe",lambda recipe,device:lambda x:x,create=True),patch.object(trainer,"evaluate",evaluate):
+                trainer.run()
+            result=json.loads((root/"result.json").read_text())
+            self.assertEqual(result["audit_files"],128)
+            self.assertEqual(result["public_recipe"],"metricgan:1.0")
+
     def test_wer(self):
         self.assertEqual(trainer.word_error_count("one two three","one four three"),(1,3))
         self.assertEqual(trainer.word_error_count("one two","one"),(1,2))
