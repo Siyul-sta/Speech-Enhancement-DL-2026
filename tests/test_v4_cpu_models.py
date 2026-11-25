@@ -112,6 +112,61 @@ class CpuModelTests(unittest.TestCase):
                 self.assertNotIn("test",manifest)
 
 
+
+    def test_fixed_validation_materialization_and_seek(self):
+        import random
+        with tempfile.TemporaryDirectory() as d:
+            c=Path(d)/"c.wav"; n=Path(d)/"n.wav"
+            rng=np.random.default_rng(9)
+            sf.write(c,rng.normal(0,.05,(75000,2)),16000,subtype="FLOAT")
+            sf.write(n,rng.normal(0,.02,90000),16000,subtype="FLOAT")
+            source=trainer.SyntheticPairs([c],[n],4,2026,False)
+            old_read=sf.read
+            r=random.Random(2026)
+            def original_clip(paths):
+                y,sr=old_read(r.choice(paths),dtype="float32",always_2d=True)
+                y=y.mean(1)
+                k=r.randint(0,len(y)-48000)
+                return y[k:k+48000].astype(np.float32)
+            clean,noise=original_clip([c]),original_clip([n])
+            snr=r.uniform(-5,20)
+            noise=noise*(np.sqrt(np.mean(clean*clean)+1e-8)/np.sqrt(np.mean(noise*noise)+1e-8))*10**(-snr/20)
+            expected=clean+noise
+            scale=max(1.,float(np.max(np.abs(expected))),float(np.max(np.abs(clean))))
+            x,y=source[0]
+            np.testing.assert_array_equal(x.numpy(),(expected/scale).astype(np.float32))
+            frozen=trainer.fixed_pairs(source)
+            for i in range(4):
+                for a,b in zip(source[i],frozen[i]): self.assertTrue(torch.equal(a,b))
+
+    def test_smoke_full_cpu_run_without_public_download(self):
+        import json
+        class Fixture(torch.utils.data.Dataset):
+            def __init__(self,root,split):
+                n=1296 if split=="train" else 164
+                c=np.sin(np.arange(48000)*.05).astype(np.float32)*.1
+                self.clean=np.broadcast_to(c,(n,48000))
+                self.noisy=np.broadcast_to(c+.01,(n,48000))
+            def __len__(self): return len(self.clean)
+            def __getitem__(self,i):
+                return torch.tensor(self.noisy[i]),torch.tensor(self.clean[i])
+        class Tiny(torch.nn.Module):
+            def __init__(self):
+                super().__init__(); self.scale=torch.nn.Parameter(torch.tensor(.9))
+            def forward(self,x): return x*self.scale
+        cfg={"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"smoke":True,"architecture":"temporal","external_size":16}
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            with patch.object(trainer,"WORK",root),patch.object(trainer,"EXPERIMENT_CONFIG",cfg),patch.object(trainer,"SpeechPairs",Fixture),patch.object(trainer,"TemporalEnhancer",Tiny),patch.object(trainer,"locate_data_root",return_value=root),patch.object(trainer,"public_assets",side_effect=AssertionError("Public download forbidden")),patch.object(trainer,"ensure_pesq",return_value=lambda sr,c,y,mode: float(3-np.mean((c-y)**2))),patch.object(trainer.subprocess,"check_call"),patch.object(trainer,"additional_metrics",return_value={}):
+                trainer.run()
+            result=json.loads((root/"result.json").read_text())
+            self.assertEqual(result["evaluation_protocol"],"v4-smoke-fixture-v1")
+            self.assertEqual(result["epochs_completed"],2)
+            self.assertEqual(result["validation_files"],164)
+            self.assertEqual(result["external_validation_files"],64)
+            self.assertTrue((root/"best_model.pt").is_file())
+            self.assertEqual(len((root/"validation_per_file.csv").read_text().splitlines()),165)
+
     def test_training_steps_actual_weights(self):
         import copy
         model=trainer.TemporalEnhancer().train()
