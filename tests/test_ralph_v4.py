@@ -118,6 +118,23 @@ class ControllerTests(unittest.TestCase):
             self.assertEqual(state["counts"]["ranked"],2)
             self.assertEqual(json.loads((run/"round_0005"/"v4_cache"/"remote_state.json").read_text())["status"],"SUBMIT_PENDING")
 
+
+    def test_dashboard_client_disconnect(self):
+        from unittest.mock import Mock
+        for error in (ConnectionAbortedError(10053,"aborted"),ConnectionResetError(10054,"reset"),BrokenPipeError("closed")):
+            with self.subTest(error=type(error).__name__):
+                handler=Mock()
+                handler.path="/"
+                handler.close_connection=False
+                handler.wfile.write.side_effect=error
+                dashboard_v4.Handler.do_GET(handler)
+                self.assertTrue(handler.close_connection)
+        handler=Mock()
+        handler.path="/"
+        handler.wfile.write.side_effect=ValueError("unexpected")
+        with self.assertRaises(ValueError):
+            dashboard_v4.Handler.do_GET(handler)
+
     def test_dashboard_remote_query_is_read_only(self):
         from types import SimpleNamespace
         with patch.dict(dashboard_v4.REMOTE_CACHE,{},clear=True),patch.object(dashboard_v4.shutil,"which",return_value="mock"),patch.object(dashboard_v4.subprocess,"run",return_value=SimpleNamespace(returncode=0,stdout="KernelWorkerStatus.RUNNING",stderr="")) as call:
