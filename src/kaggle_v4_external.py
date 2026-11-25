@@ -268,7 +268,9 @@ def write_csv(path: Path, fields, records):
 # Public training corpora: LibriSpeech, MUSAN and optional SLR73/SLR28.
 TRAIN_RIRS=[]
 def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
-    import urllib.request, tarfile, hashlib
+    import urllib.request, tarfile, hashlib, time
+    def emit(key,stage,**values):
+        print("V4_TELEMETRY "+json.dumps({"event":"data","dataset":key,"stage":stage,**values},allow_nan=False),flush=True)
     base = WORK/"public_cache" if prepare_only else (Path("/tmp/ralph_v4_external") if Path("/kaggle").exists() else WORK / "external")
     base.mkdir(parents=True, exist_ok=True)
     cache=EXPERIMENT_CONFIG.get("public_cache")
@@ -295,6 +297,7 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
     if not evaluation_only and (EXPERIMENT_CONFIG.get("data_profile")=="rir" or prepare_only):
         sources["rir"]="https://www.openslr.org/resources/28/rirs_noises.zip"
     for key,url in sources.items():
+        emit(key,"prepare")
         archive = base / (key+(".zip" if url.endswith(".zip") else ".tar.gz"))
         target = base / key
         if cache_root is not None and key!="test":
@@ -311,9 +314,24 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
             if target.exists(): shutil.rmtree(target)
             target.mkdir(exist_ok=True)
             if not archive.exists():
+                started=time.monotonic()
+                received=0; last_report=started
                 with urllib.request.urlopen(url,timeout=60) as response, open(str(archive)+".partial","wb") as out:
-                    shutil.copyfileobj(response,out,1024*1024)
+                    header=response.headers.get("Content-Length") if hasattr(response,"headers") else None
+                    total=int(header) if header and header.isdigit() and int(header)>0 else None
+                    emit(key,"download",bytes=0,total_bytes=total,elapsed_s=0)
+                    while True:
+                        chunk=response.read(1024*1024)
+                        if not chunk: break
+                        out.write(chunk); received+=len(chunk)
+                        now=time.monotonic()
+                        if now-last_report>=5:
+                            emit(key,"download",bytes=received,total_bytes=total,elapsed_s=now-started)
+                            last_report=now
+                    emit(key,"download",bytes=received,total_bytes=total,elapsed_s=time.monotonic()-started)
+                    if total is not None and received!=total: raise IOError("Incomplete public archive download")
                 Path(str(archive)+".partial").replace(archive)
+            emit(key,"checksum")
             h=hashlib.sha256()
             with archive.open("rb") as f:
                 for chunk in iter(lambda:f.read(1048576),b""):
@@ -329,6 +347,7 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
                 if key=="train" and int(hashlib.sha256(name.encode()).hexdigest()[:8],16)%4!=0: return False
                 if key=="extra_speech" and int(hashlib.sha256(name.encode()).hexdigest()[:8],16)%2!=0: return False
                 return size<=32*1024*1024
+            emit(key,"extract")
             if archive.suffix==".zip":
                 with zipfile.ZipFile(archive) as zf:
                     for member in zf.infolist():
@@ -343,6 +362,7 @@ def public_assets(evaluation_only=False,include_test=False,prepare_only=False):
             digest_path.write_text(h.hexdigest(),encoding="ascii")
             marker.touch()
             archive.unlink(missing_ok=True)
+        emit(key,"ready")
         records[key]={"url":url,"sha256":digest_path.read_text(encoding="ascii"),"license":"CC-BY-SA-4.0" if key=="extra_speech" else "Apache-2.0" if key=="rir" else "CC-BY-4.0 (MUSAN individual terms apply)"}
     if prepare_only:
         (base/"v4_cache_manifest.json").write_text(json.dumps({"format":"ralph-v4-public-cache-1","sources":sources,"records":records},indent=2),encoding="utf-8")
@@ -964,9 +984,18 @@ def run():
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
         losses = []
-        for noisy, clean in train_loader:
+        epoch_started=time.monotonic()
+        for batch_idx,(noisy, clean) in enumerate(train_loader,1):
             noisy, clean = noisy.to(device), clean.to(device)
             losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None))
+            if batch_idx==1 or batch_idx%10==0 or batch_idx==len(train_loader):
+                telemetry={"event":"batch","epoch":epoch,"epochs":int(cfg["epochs"]),"batch":batch_idx,"batches":len(train_loader),"loss":float(losses[-1]),"elapsed_s":time.monotonic()-epoch_started}
+                if device.type=="cuda":
+                    telemetry.update(gpu_alloc_mib=torch.cuda.memory_allocated(device)/1048576,gpu_total_mib=torch.cuda.get_device_properties(device).total_memory/1048576)
+                    try: telemetry["gpu_util"]=float(torch.cuda.utilization(device))
+                    except Exception: pass
+                if math.isfinite(telemetry["loss"]):
+                    print("V4_TELEMETRY "+json.dumps(telemetry,allow_nan=False),flush=True)
         if unlabeled_loader is not None and epoch >= 2:
             for k,x in enumerate(unlabeled_loader):
                 if k>=64: break
@@ -988,6 +1017,9 @@ def run():
                   ["epoch", "train_loss", "validation_pesq_wb", "best_pesq_wb", "stale_epochs"],
                   history)
         print(f"epoch={epoch} loss={np.mean(losses):.5f} val_pesq={val_pesq:.4f} best={best_score:.4f}", flush=True)
+        telemetry={"event":"epoch","epoch":epoch,"loss":float(np.mean(losses)),"challenge":float(val_pesq),"external":float(external_pesq),"robust":float(joint),"best":float(best_score),"elapsed_s":time.monotonic()-epoch_started}
+        if all(math.isfinite(v) for v in telemetry.values() if isinstance(v,(float,int))):
+            print("V4_TELEMETRY "+json.dumps(telemetry,allow_nan=False),flush=True)
         if epoch >= 5 and stale >= int(cfg["patience"]):
             break
 
