@@ -180,6 +180,15 @@ def load_model(name, device):
         return infer
     if name == "deepfilter":
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "deepfilternet==0.5.6"])
+        # DF 0.5.6 uses the older torchaudio AudioMetaData import.
+        import types, torchaudio
+        try:
+            from torchaudio.backend.common import AudioMetaData
+        except ImportError:
+            from torchaudio import AudioMetaData
+            backend=types.ModuleType("torchaudio.backend"); backend.__path__=[]
+            common=types.ModuleType("torchaudio.backend.common"); common.AudioMetaData=AudioMetaData
+            backend.common=common; sys.modules["torchaudio.backend"]=backend; sys.modules["torchaudio.backend.common"]=common
         from df.enhance import init_df, enhance
         import torchaudio.functional as AF
         model, state, *_ = init_df()
@@ -188,6 +197,22 @@ def load_model(name, device):
             return AF.resample(out.cpu(), 48000, 16000).to(x.device)
         return infer
     raise ValueError(name)
+
+def public_recipe(recipe,device):
+    """Replay exactly the global validation-selected blend; no clean input."""
+    parts=recipe.split(":")
+    if len(parts)==2:
+        name,alpha=parts
+        alpha=float(alpha)
+        if not 0<=alpha<=1: raise ValueError("Invalid blend")
+        a=load_model(name,device)
+        return lambda x: alpha*checked_output(a,x)+(1-alpha)*x
+    if len(parts)==4 and parts[0]=="blend":
+        _,a,b,alpha=parts; alpha=float(alpha)
+        if not 0<=alpha<=1: raise ValueError("Invalid blend")
+        fa,fb=load_model(a,device),load_model(b,device)
+        return lambda x: alpha*checked_output(fa,x)+(1-alpha)*checked_output(fb,x)
+    raise ValueError("Invalid public recipe")
 
 def checked_output(fn, noisy):
     y = fn(noisy)
@@ -228,6 +253,7 @@ def run():
             print("MODEL_FAILED", name, repr(exc), flush=True)
     if not predictions:
         raise RuntimeError("No public model succeeded: " + str(errors))
+    (WORK/"public_models_status.json").write_text(json.dumps({"succeeded":list(predictions),"errors":errors},indent=2),encoding="utf-8")
     # Fixed global blend grid; no per-file clean-informed oracle.
     candidates = {}
     for name, pred in predictions.items():
