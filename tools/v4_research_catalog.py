@@ -11,6 +11,7 @@ import xml.etree.ElementTree as ET
 
 DATASETS = {
     "base": {"sources":["LibriSpeech SLR12","MUSAN SLR17"],"role":"train/dev/test split"},
+    "rir":{"sources":["LibriSpeech SLR12","MUSAN SLR17","RIRS_NOISES SLR28"],"role":"train-only simulated room responses","license":"Apache-2.0"},
     "spanish": {"sources":["LibriSpeech SLR12","MUSAN SLR17","SLR73 Peruvian Spanish"],"role":"additional training speech only","license":"CC-BY-SA-4.0"},
 }
 MODELS = {
