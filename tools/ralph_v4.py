@@ -80,7 +80,7 @@ def history():
 
 def propose_config(records, n, epochs, codex, discovery=None, allow_generated=False, failures=None):
     """Codex chooses a typed research plan; no arbitrary evaluation code edits."""
-    architectures=("residual","temporal","metricgan","moe","composed")+(("generated",) if allow_generated else ())
+    architectures=("residual","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer")+(("generated",) if allow_generated else ())
     fallback={"architecture":architectures[n%len(architectures)],"self_supervised":bool(n%2),
               "lr":0.0001,"external_size":[512,1024,2048][n%3],"loss_mode":["base","sisdr","waveform","composed"][n%4],"distill":bool(n%3==2),"transductive":False,"data_profile":["base","spanish","rir"][n%3],"augmentation":["base","room_codec"][n%2],"loss_weights":{"wave":0.2,"spectral":0.3,"sisdr":0.5},"network_spec":catalog.default_network(n)}
     if not codex: return fallback
@@ -297,7 +297,7 @@ def main():
                       and (plan["architecture"]!="composed" or r.get("network_spec")==plan["network_spec"])]
             best=max(external,key=lambda pair:rank_score(pair[1]),default=None)
             warm=best[0]["ref"] if best and n%4!=0 else None
-            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,**plan}
+            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
             try:
@@ -310,7 +310,8 @@ def main():
                 print("Terminal experiment error",str(exc),flush=True)
                 if errors>=3: break
                 continue
-            ranked=max((r for st,r in records if st["kind"]=="v4_external"),key=rank_score)
+            ranked=max((r for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy")),key=rank_score,default=None)
+            if ranked is None: continue
             core.json_write(core.OUTPUT/("run_"+tag)/"v4_best.json",ranked)
             print("BEST ROBUST",rank_score(ranked),"joint",ranked["joint_score"],"challenge",ranked["best_validation_pesq_wb"],"external",ranked["external_validation_pesq_wb"],flush=True)
     finally:
