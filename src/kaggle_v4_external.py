@@ -770,6 +770,8 @@ class CMGANTransfer(torch.nn.Module):
 def speechbrain_adapter_setup():
     # SpeechBrain 1.0.3 calls a removed diagnostic API in torchaudio >=2.9.
     # Our adapters process tensors; WAV I/O is soundfile, not torchaudio.
+    from importlib.metadata import version
+    if version("speechbrain")!="1.0.3" or version("hyperpyyaml")!="1.2.2": raise RuntimeError("V5.7.1 requires speechbrain==1.0.3 and hyperpyyaml==1.2.2")
     import torchaudio
     if not hasattr(torchaudio,"list_audio_backends"):
         torchaudio.list_audio_backends=lambda: []
