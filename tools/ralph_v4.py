@@ -82,7 +82,7 @@ def history():
 
 def propose_config(records, n, epochs, codex, discovery=None, allow_generated=False, failures=None):
     """Codex chooses a typed research plan; no arbitrary evaluation code edits."""
-    architectures=("residual","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer")+(("generated",) if allow_generated else ())
+    architectures=("residual","residual_relaxed","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer")+(("generated",) if allow_generated else ())
     fallback={"architecture":architectures[n%len(architectures)],"self_supervised":bool(n%2),"self_mode":["consistency","remix"][(n//2)%2],
               "lr":0.0001,"external_size":[512,1024,2048][n%3],"loss_mode":["base","sisdr","waveform","composed"][n%4],"distill":bool(n%3==2),"transductive":False,"data_profile":["base","spanish","rir","korean"][n%4],"augmentation":["base","room_codec"][n%2],"loss_weights":{"wave":0.2,"spectral":0.3,"sisdr":0.5},"network_spec":catalog.default_network(n)}
     if not codex: return fallback
@@ -266,12 +266,15 @@ def main():
     p.add_argument("--public-cache-ref",help="Existing compatible public corpus kernel output")
     p.add_argument("--execute",action="store_true")
     p.add_argument("--loop",action="store_true",help="Continue mixed-corpus training and warm-start search until quota/safety guard")
+    p.add_argument("--challenge-focus",action="store_true",help="Select training checkpoint by challenge PESQ; keep external scoring unchanged")
+    p.add_argument("--focus-architecture",choices=("residual","residual_relaxed","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer"),help="Override architecture for a controlled trial")
     p.add_argument("--codex-research",action="store_true",help="Use Codex for structured strategy proposals")
     p.add_argument("--max-rounds",type=int,default=0,help="0 means until quota/safety stop")
     p.add_argument("--epochs",type=int,default=15,choices=range(2,101))
     args=p.parse_args()
     if sum(map(bool,(args.smoke,args.loop,args.final_audit,args.perf_benchmark,args.validated_perf_run)))>1: p.error("Choose exactly one execution mode")
     if args.amp and not (args.smoke or args.perf_benchmark or args.validated_perf_run): p.error("--amp requires smoke or the quality-gated performance mode")
+    if (args.challenge_focus or args.focus_architecture) and not args.loop: p.error("Focus options require --loop")
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
     sources["v4_public"]=public_with_external(sources["v4_public"],sources["v4_external"])
@@ -343,6 +346,7 @@ def main():
                 discovery=catalog.discover()
                 core.json_write(core.OUTPUT/("run_"+tag)/"public_research.json",discovery)
             plan=propose_config(records,n,args.epochs,codex,discovery,args.allow_generated_code,failures[-8:])
+            if args.focus_architecture: plan["architecture"]=args.focus_architecture
             candidate=sources["v4_external"]
             if plan["architecture"]=="generated":
                 try:
@@ -358,9 +362,9 @@ def main():
                       and bool(r.get("transductive_noisy"))==plan["transductive"]
                       and r.get("generated_hash")==plan.get("generated_hash")
                       and (plan["architecture"]!="composed" or r.get("network_spec")==plan["network_spec"])]
-            best=max(external,key=lambda pair:rank_score(pair[1]),default=None)
+            best=max(external,key=lambda pair:pair[1]["best_validation_pesq_wb"] if args.challenge_focus else rank_score(pair[1]),default=None)
             warm=best[0]["ref"] if best and n%4!=0 else None
-            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,"amp":args.amp,**plan}
+            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,"amp":args.amp,"selection_target":"challenge" if args.challenge_focus else "robust",**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
             try:
@@ -377,6 +381,11 @@ def main():
             if ranked is None: continue
             core.json_write(core.OUTPUT/("run_"+tag)/"v4_best.json",ranked)
             print("BEST ROBUST",rank_score(ranked),"joint",ranked["joint_score"],"challenge",ranked["best_validation_pesq_wb"],"external",ranked["external_validation_pesq_wb"],flush=True)
+            best_challenge=max(( (st,r) for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy")),key=lambda pair:pair[1]["best_validation_pesq_wb"],default=None)
+            if best_challenge:
+                st,r=best_challenge
+                core.json_write(core.OUTPUT/("run_"+tag)/"v5_best_challenge.json",{"remote_ref":st.get("ref"),"source_path":st.get("source_path"),"result":r})
+                print("BEST CHALLENGE",r["best_validation_pesq_wb"],"ref",st.get("ref"),flush=True)
     finally:
         if "tag" in locals():
             core.dashboard_event(core.OUTPUT/("run_"+tag),"stopped",message="Controller stopped; check remote state before resuming")
