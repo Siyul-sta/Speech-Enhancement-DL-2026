@@ -52,6 +52,17 @@ def load_bundle(config,device):
         models.append((w,model))
     if not math.isclose(sum(w for w,m in models),1.,abs_tol=1e-6):
         raise ValueError("Fixed weights must sum to one")
+    if cfg.get("gating") is not None:
+        from v55_gating import EnsembleGate,GatedEnsemble
+        g=cfg["gating"]
+        if not isinstance(g,dict) or g.get("mode") not in ("clip","frequency") or g.get("experts")!=len(models):
+            raise ValueError("Invalid gating config")
+        checkpoint=safe_path(config.parent,g["checkpoint"])
+        if sha256(checkpoint)!=g["checkpoint_sha256"]: raise ValueError("Gate checkpoint hash mismatch")
+        gate=EnsembleGate(len(models),g["mode"]).to(device)
+        gate.load_state_dict(torch.load(checkpoint,map_location=device,weights_only=True),strict=True)
+        if not all(torch.isfinite(p).all() for p in gate.parameters()): raise ValueError("Nonfinite gate weights")
+        return [(1.,GatedEnsemble([m for _,m in models],gate).to(device).eval())]
     return models
 
 def read_wav(path):
