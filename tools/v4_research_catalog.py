@@ -20,6 +20,7 @@ MODELS = {
     "sepformer_dns":"speechbrain/sepformer-dns4-16k-enhancement",
     "sepformer_wham":"speechbrain/sepformer-wham16k-enhancement",
     "deepfilter":"DeepFilterNet",
+    "cmgan":"ruizhecao96/CMGAN",
 }
 LOSS_KEYS=("wave","spectral","sisdr")
 def validate_loss(weights):
