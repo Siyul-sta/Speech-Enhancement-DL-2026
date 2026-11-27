@@ -94,11 +94,12 @@ def trial_cfg(p,name,epochs,seed,cache,sha,action,parent=None):
                v56_action=action,v56_source_sha=sha)
     return cfg
 
-def smoke_cfg(arch,sha):
+def smoke_cfg(arch,sha,policies=None):
     p={"architecture":arch,"epochs":2,"batch_size":1 if arch.startswith(("cascade_","sepformer_")) or arch=="cmgan_transfer" else 4,
        "id":"V3_RESIDUAL_PHASE","patience":2,"seed":42,"smoke":True,"external_size":16,"public_cache":None,
        "amp":False,"pesq_aware":False,"data_profile":"base","selection_target":"challenge"}
-    p.update(v56_key=key_for(sha,"smoke",arch,2,42,None),v56_action="smoke",v56_source_sha=sha)
+    if policies and arch in policies: p["sepformer_scale_policies"]={arch:policies[arch]}
+    p.update(v56_key=key_for(sha,"smoke",arch,2,42,None,settings=p.get("sepformer_scale_policies")),v56_action="smoke",v56_source_sha=sha)
     return p
 
 def observed_epoch_hours(records,arch):
@@ -127,7 +128,7 @@ def promotion_value(result,records,cfg):
     # High PESQ still matters even if an excellent pretrained starting point gains little.
     return score+.30*max(-1.,min(1.,rate))
 
-def next_trial(records,ledger,sha,cache,epochs,remaining,job_limit,seed=42):
+def next_trial(records,ledger,sha,cache,epochs,remaining,job_limit,seed=42,policies=None):
     """One successive-halving-like promotion per two new pilots, then seed expansion.
     Complete verified results only. Terminal failures are not automatically retried.
     """
@@ -141,6 +142,7 @@ def next_trial(records,ledger,sha,cache,epochs,remaining,job_limit,seed=42):
             by_stage.setdefault(field+":"+r[field],[]).append((st,r))
     pilots=[];promotions=[];matched={}
     for name,p,low,high in catalog:
+        if policies and p["architecture"] in policies: p={**p,"sepformer_scale_policies":{p["architecture"]:policies[p["architecture"]]}}
         cfg=trial_cfg(p,name,low,seed,cache,sha,"pilot")
         exact=next(((st,r) for st,r in by_stage.get(name,[]) if r.get("v56_key")==cfg["v56_key"]),None)
         if exact: matched[name]=exact
@@ -161,7 +163,7 @@ def next_trial(records,ledger,sha,cache,epochs,remaining,job_limit,seed=42):
     prefer_promotion=len(matched)>=4 and completed_promotions<len(matched)//2
     order=(promotions+pilots if prefer_promotion else pilots+promotions)
     for name,cfg in order:
-        s=smoke_cfg(cfg["architecture"],sha)
+        s=smoke_cfg(cfg["architecture"],sha,policies)
         existing=ledger.get(s["v56_key"])
         if existing and not verified_smoke(s["v56_key"],ledger): continue
         estimate=cost_hours(cfg,records)
@@ -203,6 +205,9 @@ def run(args):
     if not args.allow_public_assets: raise RuntimeError("Confirm instructor permission for licensed external corpora/pretrained models with --allow-public-assets")
     from v571_preflight import require_report,REPORT
     preflight=require_report(getattr(args,"preflight_report",None) or REPORT)
+    from v572_scale_audit import require_report as require_scale
+    policies=require_scale(data_root=args.data_root)
+    if preflight.get("sepformer_scale_policies")!=policies: raise RuntimeError("Re-run V5.7.1 preflight with selected amplitude policies")
     if args.data_root:
         import v55_ensemble as ensemble
         from pesq import pesq  # fail before GPU if optional ensemble dependency missing
@@ -238,17 +243,17 @@ def run(args):
                 remaining=min(quota_hours(kaggle)-args.reserve_hours,budget-spent)
                 if remaining<=0: print("STOP budget after ensemble",flush=True);break
             cfg=None;source=external;kind="v4_external"
-            public_key=key_for(psha,"public","public",2,42,cache)
+            public_key=key_for(psha,"public","public",2,42,cache,settings=policies)
             if public_key not in ledger and remaining>=.45 and args.max_job_minutes/60>=.45:
                 cfg={"id":"V4_PUBLIC_ZERO_SHOT","architecture":"public","epochs":2,"seed":42,"public_cache":cache,
-                     "v5_public":True,"v571_recipe":True,"selection_target":"challenge","v56_key":public_key,"v56_action":"public","v56_source_sha":psha}
+                     "v5_public":True,"v571_recipe":True,"sepformer_scale_policies":policies,"selection_target":"challenge","v56_key":public_key,"v56_action":"public","v56_source_sha":psha}
                 source=public;kind="v4_public"
             else:
                 # Search current seed first; expand deterministically only when its
                 # affordable candidate space is exhausted. No target-PESQ cutoff.
                 seeds=sorted({42}|{int(r["seed"]) for _,r in records if r.get("v56_source_sha")==sha and r.get("v56_action") in ("pilot","promote")})
                 for seed in seeds+[max(seeds)+1]:
-                    cfg=next_trial(records,ledger,sha,cache,args.epochs,remaining,args.max_job_minutes/60,seed)
+                    cfg=next_trial(records,ledger,sha,cache,args.epochs,remaining,args.max_job_minutes/60,seed,policies)
                     if cfg: break
                 if cfg and cfg["v56_action"]=="smoke": kind="v4_smoke"
             if cfg is None: print("STOP no affordable eligible trial",flush=True);break
