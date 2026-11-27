@@ -391,12 +391,14 @@ def submit(kaggle, source, tag, i, kind, config=None):
 
 def public_with_external(public,external):
     tree=ast.parse(external)
-    names={"public_assets","SyntheticPairs","quality_paths","_pesq_one","close_pesq_pool","score_waveforms","cmgan_assets","CMGANTransfer","speechbrain_adapter_setup","speechbrain_spec","archive_speechbrain_config","MetricGANTransfer","SepformerTransfer"}
+    names={"public_assets","SyntheticPairs","quality_paths","_pesq_one","close_pesq_pool","score_waveforms","cmgan_assets","CMGANTransfer","speechbrain_adapter_setup","speechbrain_spec","archive_speechbrain_config","MetricGANTransfer","SepformerTransfer","sepformer_scale_policy","sepformer_scale_output"}
     fragments=[ast.get_source_segment(external,n) for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
+    constants=[ast.get_source_segment(external,n) for n in tree.body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="SEPFORMER_SCALE_MODES" for t in n.targets)]
+    if len(constants)!=1: raise ValueError("Missing SepFormer scale modes")
     if len(fragments)!=len(names): raise ValueError("Missing shared evaluation helper")
     marker="def run():"
     if public.count(marker)!=1: raise ValueError("Invalid public runner")
-    return public.replace(marker,"TRAIN_RIRS=[]\n_PESQ_POOL=None\n\n"+"\n\n".join(fragments)+"\n\n"+marker,1)
+    return public.replace(marker,"TRAIN_RIRS=[]\n_PESQ_POOL=None\n\n"+"\n\n".join(constants+fragments)+"\n\n"+marker,1)
 
 def audit_with_public(external,public):
     names={"load_model","checked_output","public_recipe"}
