@@ -95,7 +95,7 @@ class V56Tests(unittest.TestCase):
                 calls.append((kind,cfg))
                 self.assertTrue((output/"active.lock").exists())
                 return {"ref":"owner/job-1","kind":kind},{"best_validation_pesq_wb":2.5}
-            with patch("v571_preflight.require_report",return_value={"families":{},"cmgan_root":str(output)}),patch.object(v.core,"OUTPUT",output),patch.object(v.core,"no_uncertain_prior_jobs"),patch.object(v4,"history",return_value=[]),patch.object(v4,"find_public_cache",return_value=None),patch.object(v.shutil,"which",return_value="mock"),patch.object(v,"quota_hours",return_value=23.),patch.object(v4,"submit",submit):
+            with patch("v572_scale_audit.require_report",return_value={}),patch("v571_preflight.require_report",return_value={"families":{},"cmgan_root":str(output),"sepformer_scale_policies":{}}),patch.object(v.core,"OUTPUT",output),patch.object(v.core,"no_uncertain_prior_jobs"),patch.object(v4,"history",return_value=[]),patch.object(v4,"find_public_cache",return_value=None),patch.object(v.shutil,"which",return_value="mock"),patch.object(v,"quota_hours",return_value=23.),patch.object(v4,"submit",submit):
                 v.run(args)
             self.assertEqual(len(calls),1)
             self.assertEqual(calls[0][0],"v4_public")
