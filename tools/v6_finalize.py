@@ -74,6 +74,32 @@ def package_expert(root,index,row,mp_root,cmgan_root,train_sha,allow_download):
         for n in ("models/model.py","models/transformer.py","utils.py","LICENSE","best_ckpt/config.json"):
             p=assets/n;p.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(root_src/n,p)
         spec["asset_root"]=assets.relative_to(root).as_posix()
+    elif base in ("semamba","semambapp","rose_cd"):
+        # Use the exact archived source and pinned asset metadata, not current model code.
+        import importlib.util
+        sp=importlib.util.spec_from_file_location("v6_advanced_package_"+str(index),dest/"source.py")
+        mod=importlib.util.module_from_spec(sp);sp.loader.exec_module(mod)
+        src=Path(mp_root)/base;assets=dest/"assets"
+        if base=="semamba":
+            mod.v6_sem_assets(src,allow_download,include_weights=False)
+            names=[n for n in mod.V6_SEM_FILES if not n.endswith(".pth")]
+        elif base=="semambapp":
+            mod.v6_pp_assets(src,allow_download,include_weights=False)
+            names=list(mod.V6_PP_FILES)
+        else:
+            mod.v6_rose_assets(src,allow_download,include_weights=False)
+            names=list(mod.V6_ROSE_FILES)
+        for n in names:
+            target=assets/n;target.parent.mkdir(parents=True,exist_ok=True);shutil.copy2(src/n,target)
+        if base in ("semambapp","rose_cd"):
+            lock=json.loads((folder/"v6_hf_lock.json").read_text(encoding="utf-8"))
+            if lock!=cfg.get("v6_hf_lock"): raise ValueError("Advanced HF lock mismatch")
+            write(assets/"hf_lock.json",lock)
+        if base=="rose_cd":
+            shutil.copy2(folder/"rose_config.json",assets/"rose_config.json")
+        spec["asset_root"]=assets.relative_to(root).as_posix()
+        if base=="semambapp":
+            (assets/"UPSTREAM_NOTICE.txt").write_text("Personal local use: upstream source Eddieyjlee/SEMambapp pinned by blob. Check source redistribution rights and GPL-2.0 checkpoint terms before sharing. Do not upload this package publicly.",encoding="utf-8")
     elif base in public.PUBLIC:
         assets=dest/"assets"
         spec["public_assets"]=public.package_public(base,folder,(dest/"source.py").read_text(encoding="utf-8"),assets,allow_download,cmgan_root)
