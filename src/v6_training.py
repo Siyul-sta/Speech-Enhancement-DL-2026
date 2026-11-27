@@ -30,7 +30,7 @@ class V6Refiner(nn.Module):
 
 def v6_make_model(cfg,mp_root=None,pretrained=True,coarse=None):
     family=cfg["architecture"]
-    base=cfg.get("v6_base_family",family)
+    base=(cfg.get("v6_base_family") or family)
     if coarse is None:
         if base in V6_MP_FAMILIES:
             mp_root=Path(mp_root) if mp_root else WORK/"v6_mp_assets"
@@ -220,10 +220,17 @@ def v6_run():
     if abs(score-best)>1e-5 or score<base-1e-5: raise RuntimeError("Best checkpoint failed replay")
     if parent and any(a<b-float(cfg.get("v6_external_margin",.15))-1e-5 for a,b in zip(dom,root_domains)): raise RuntimeError("Parent domain guard failed")
     if cfg.get("v6_depth"):
-        # Compare final and coarse on identical full validation; no oracle.
+        # Compare every fixed stage on the same full validation set.
         coarse_score,cr=evaluate(model.coarse,val,device,pesq_fn,save_rows=True)
         write_csv(WORK/"coarse_validation.csv",["index","pesq_wb"],cr)
-    else: coarse_score=None
+        stage_scores={"coarse":coarse_score}
+        for depth in range(1,int(cfg["v6_depth"])+1):
+            class StageView(nn.Module):
+                def forward(self,x): return model.forward_stages(x)[depth]
+            stage_score,sr=evaluate(StageView(),val,device,pesq_fn,save_rows=True)
+            stage_scores[str(depth)]=stage_score
+            write_csv(WORK/f"stage_{depth}_validation.csv",["index","pesq_wb"],sr)
+    else: coarse_score=None;stage_scores=None
     write_csv(WORK/"validation_per_file.csv",["index","pesq_wb"],rows)
     write_csv(WORK/"external_validation.csv",["index","pesq_wb"],er)
     result={"experiment":"V6_MAX_PESQ","evaluation_protocol":"v4-smoke-fixture-v1" if smoke else "v4.2-fixed-dev-v2",
@@ -237,8 +244,8 @@ def v6_run():
         "v6":{"protocol":"v6-max-pesq-v1","parent":parent,"attempted_epochs":attempted+len(history),"checkpoint_epoch":offset+best_epoch,
             "checkpoint_sha256":v6_sha(WORK/"best_model.pt"),"root_external_domains":root_domains,"start_pesq":base,"gain":score-base,
             "lr":opt.param_groups[0]["lr"] if opt else lr,"optimizer_restored":False,"critic_updates":updates,"metric_steps":metric_steps,
-            "critic_calibration":calibration,"coarse_score":coarse_score,"fit_count":len(v6_split(train)[0]),
-            "training_pairs_per_epoch":len(loader.dataset),"mode":mode,"base_family":cfg.get("v6_base_family",cfg["architecture"])}}
+            "critic_calibration":calibration,"coarse_score":coarse_score,"stage_scores":stage_scores,"fit_count":len(v6_split(train)[0]),
+            "training_pairs_per_epoch":len(loader.dataset),"mode":mode,"base_family":(cfg.get("v6_base_family") or cfg["architecture"])}}
     (WORK/"result.json").write_text(json.dumps(result,indent=2,allow_nan=False),encoding="utf-8")
     print("FINAL_RESULT "+json.dumps(result,allow_nan=False),flush=True)
 
