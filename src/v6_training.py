@@ -89,8 +89,11 @@ def v6_loaders(cfg,device):
                     korean=(v6_zeroth(WORK/"v6_external_korean",z) if z else [])+fleurs_speech("train",limit=f)
             # Additional DNS noise is train-only; fixed external validation remains unchanged.
             tn=list(tn)+cached_noise
-            mix=V6CrossMix(train,fit,tr+korean,tn,int(cfg["v6_mix"]),int(cfg["seed"]),hard=cfg.get("v6_hard",False))
-            public=SyntheticPairs(tr+korean,tn,int(cfg["v6_public_mix"]),42,True)
+            mix=V6CrossMix(train,fit,tr,tn,int(cfg["v6_mix"]),int(cfg["seed"]),hard=cfg.get("v6_hard",False),korean=korean)
+            n=int(cfg["v6_public_mix"])
+            if korean and n>=2:
+                public=torch.utils.data.ConcatDataset([SyntheticPairs(tr,tn,n//2,42,True),SyntheticPairs(korean,tn,n-n//2,43,True)])
+            else: public=SyntheticPairs(tr,tn,n,42,True)
             data=torch.utils.data.ConcatDataset([data,mix,public])
             print("V6_DATA "+json.dumps({"fit":len(fit),"calibration":len(cal),"gate_fit":len(gate_fit),"gate_select":len(gate_select),
                    "external_speech_files":len(tr),"korean_files":len(korean),"extra_dns_noise_files":len(cached_noise),"crossmix_per_epoch":len(mix),"public_per_epoch":len(public)}),flush=True)
