@@ -853,8 +853,8 @@ def sepformer_scale_output(x,y,mode):
     peak=y.abs().amax(-1,keepdim=True).clamp_min(1e-8)
     if mode=="peak":
         return y*(.98/peak).clamp(max=1.)
-    xrms=x.square().mean(-1,keepdim=True).sqrt()
-    yrms=y.square().mean(-1,keepdim=True).sqrt().clamp_min(1e-8)
+    xrms=x.square().mean(-1,keepdim=True).clamp_min(1e-16).sqrt()
+    yrms=y.square().mean(-1,keepdim=True).clamp_min(1e-16).sqrt()
     if mode=="ls":
         gain=(x*y).mean(-1,keepdim=True)/(y.square().mean(-1,keepdim=True)+1e-8)
         gain=gain.clamp(min=0.,max=10.)
