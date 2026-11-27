@@ -170,17 +170,18 @@ def next_trial(records,ledger,sha,cache,epochs,remaining,job_limit,seed=42):
         return cfg
     return None
 
-def maybe_ensemble(root,records,output):
+def maybe_ensemble(root,records,output,preflight=None):
     """One local ensemble attempt per distinct checkpoint shortlist; no GPU jobs."""
     if root is None: return
     import v55_ensemble as ensemble
     import submit_v5 as submission
-    folders=ensemble.select_experts(records,3)
+    public_families=tuple(preflight["families"]) if preflight else ()
+    folders=ensemble.select_experts(records,3,public_families)
     if len(folders)<2: return
     key=signature([submission.sha256(p/"best_model.pt") for p in folders])
     dest=output/("ensemble_"+key[:16])
     if dest.exists(): return
-    args=argparse.Namespace(root=root,out=dest,run=folders,max_experts=3,gate_epochs=12,device="cpu",validation=True)
+    args=argparse.Namespace(root=root,out=dest,run=folders,max_experts=3,gate_epochs=12,device="cpu",validation=True,public_families=public_families,cmgan_root=Path(preflight["cmgan_root"]) if preflight else None)
     try:
         ensemble.run(args)
     except Exception as exc:
@@ -200,6 +201,8 @@ def run(args):
         return
     if (core.OUTPUT/"v57_audit_seal.json").exists(): raise RuntimeError("Independent audit sealed; no further V5.6 training/tuning")
     if not args.allow_public_assets: raise RuntimeError("Confirm instructor permission for licensed external corpora/pretrained models with --allow-public-assets")
+    from v571_preflight import require_report,REPORT
+    preflight=require_report(getattr(args,"preflight_report",None) or REPORT)
     if args.data_root:
         import v55_ensemble as ensemble
         from pesq import pesq  # fail before GPU if optional ensemble dependency missing
@@ -230,7 +233,7 @@ def run(args):
             remaining=min(remaining_quota-args.reserve_hours,budget-spent)
             if remaining<=0: print("STOP budget/quota reserve",flush=True);break
             if args.data_root and rounds>0:
-                maybe_ensemble(args.data_root,records,core.OUTPUT/"v56_ensembles")
+                maybe_ensemble(args.data_root,records,core.OUTPUT/"v56_ensembles",preflight)
                 spent=(time.monotonic()-started)/3600
                 remaining=min(quota_hours(kaggle)-args.reserve_hours,budget-spent)
                 if remaining<=0: print("STOP budget after ensemble",flush=True);break
@@ -279,7 +282,7 @@ def run(args):
                     core.json_write(run_dir/"v56_best_challenge.json",{"state":best[0],"result":best[1]})
                     print("V56 BEST DEVELOPMENT",best[1]["best_validation_pesq_wb"],flush=True)
             if args.data_root and kind=="v4_external":
-                maybe_ensemble(args.data_root,v4.history(),core.OUTPUT/"v56_ensembles")
+                maybe_ensemble(args.data_root,v4.history(),core.OUTPUT/"v56_ensembles",preflight)
         core.json_write(run_dir/"v56_session.json",{"gpu_submissions":rounds,"elapsed_wall_hours":(time.monotonic()-started)/3600,"initial_quota":initial_quota,"budget_hours":budget,"reserve_hours":args.reserve_hours})
     finally:
         lock.unlink(missing_ok=True)
@@ -294,6 +297,7 @@ def main():
     p.add_argument("--reserve-hours",type=float,default=2.)
     p.add_argument("--max-job-minutes",type=int,default=180,help="Local wait limit; timeout leaves remote unresolved, not cancelled")
     p.add_argument("--public-cache-ref")
+    p.add_argument("--preflight-report",type=Path,help="Successful V5.7.1 CPU report; defaults to runs/v57_public_preflight/report.json")
     p.add_argument("--data-root",type=Path,help="Optional local dataset for automatic CPU ensembles")
     args=p.parse_args()
     if args.max_rounds<0 or not math.isfinite(args.budget_hours) or args.budget_hours<0 or not math.isfinite(args.reserve_hours) or args.reserve_hours<2 or not 15<=args.max_job_minutes<=720: p.error("Invalid budget/round limits")
