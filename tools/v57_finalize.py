@@ -75,6 +75,9 @@ def package_ensemble(folder,out,train_sha):
     for m in cfg["models"]:
         for name in ("source","checkpoint"):
             paths[m[name]]=m[name+"_sha256"]
+        if m.get("public_assets"):
+            assets=m["public_assets"]
+            for name,digest in assets["files"].items(): paths[(Path(assets["root"])/name).as_posix()]=digest
     if cfg.get("gating"): paths[cfg["gating"]["checkpoint"]]=cfg["gating"]["checkpoint_sha256"]
     for name,sha in paths.items():
         src=s.safe_path(folder,name)
