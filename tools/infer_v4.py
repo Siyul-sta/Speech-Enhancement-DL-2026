@@ -47,7 +47,7 @@ def main():
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     family=module.EXPERIMENT_CONFIG.get("architecture","residual")
-    names={"residual":"ResidualPhaseUNet","residual_relaxed":"RelaxedPhaseUNet","complex_residual":"ComplexResidualUNet","dual_axis":"DualAxisEnhancer","cmgan_transfer":"CMGANTransfer","temporal":"TemporalEnhancer","metricgan":"MetricGANTransfer","sepformer_dns_transfer":"SepformerTransfer","sepformer_wham_transfer":"SepformerTransfer","moe":"AdaptiveMixture","composed":"ComposedEnhancer","generated":"GeneratedEnhancer"}
+    names={"residual":"ResidualPhaseUNet","residual_relaxed":"RelaxedPhaseUNet","complex_residual":"ComplexResidualUNet","cascade_native_two":"CascadeNativeTwo","cascade_native_three":"CascadeNativeThree","cascade_native":"CascadeEnhancer","cascade_cmgan_two":"CascadeCMGANTwo","cascade_cmgan_three":"CascadeCMGANThree","cascade_cmgan":"CascadeCMGANFour","dual_axis":"DualAxisEnhancer","cmgan_transfer":"CMGANTransfer","temporal":"TemporalEnhancer","metricgan":"MetricGANTransfer","sepformer_dns_transfer":"SepformerTransfer","sepformer_wham_transfer":"SepformerTransfer","moe":"AdaptiveMixture","composed":"ComposedEnhancer","generated":"GeneratedEnhancer"}
     if args.recipe:
         fn=module.public_recipe(args.recipe,torch.device(args.device))
         model=lambda x: torch.cat([fn(v) for v in x.split(1)])
