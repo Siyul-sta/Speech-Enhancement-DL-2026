@@ -390,6 +390,13 @@ def run(args):
                 best=max(eligible,key=lambda a:a[1]["best_validation_pesq_wb"])
                 core.json_write(core.OUTPUT/("run_"+tag)/"v6_best.json",{"state":best[0],"result":best[1]})
     finally: lock.unlink(missing_ok=True)
+    if args.execute and args.finalize_out:
+        core.no_uncertain_prior_jobs()
+        from v6_finalize import finalize
+        with lock.open("x",encoding="utf-8") as f: f.write(str(os.getpid()))
+        try:
+            finalize(argparse.Namespace(data_root=args.data_root,out=args.finalize_out,top=args.finalize_top,gate_epochs=12,mp_root=None,cmgan_root=None,allow_public_download=args.allow_public_assets))
+        finally: lock.unlink(missing_ok=True)
 
 def main():
     p=argparse.ArgumentParser(description=__doc__)
@@ -405,6 +412,8 @@ def main():
     p.add_argument("--max-job-minutes",type=int,default=360);p.add_argument("--budget-hours",type=float,default=0.)
     p.add_argument("--reserve-hours",type=float,default=2.);p.add_argument("--public-cache-ref")
     p.add_argument("--enable-critic",action="store_true");p.add_argument("--enable-cascade",action="store_true")
+    p.add_argument("--finalize-out",type=Path,help="Optional offline selection after GPU loop stops cleanly")
+    p.add_argument("--finalize-top",type=int,default=3,choices=range(1,6))
     args=p.parse_args()
     if args.execute and args.prepare_cache: p.error("Use separate CPU cache command")
     if not (1<=args.mix<=args.max_mix<=1000000 and 1<=args.public_mix<=32768 and 0<=args.korean_limit<=2000 and 0<=args.cache_korean<=2000 and
