@@ -1,0 +1,34 @@
+name: V6 advanced model acceptance
+on:
+  push:
+    branches: [feature/ralph-v5-pesq-diagnostics]
+    paths:
+      - 'src/v6_*.py'
+      - 'tools/ralph_v6.py'
+      - 'tools/v6_preflight.py'
+      - 'tests/test_v6_advanced.py'
+      - '.github/workflows/v6-advanced-check.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v6-advanced-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  advanced:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        family: [semamba, semambapp, rose_cd]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install numpy pandas scipy soundfile einops pyyaml 'huggingface_hub<1'
+      - run: python -m unittest discover -s tests -p test_v6_advanced.py -v
+        env:
+          V6_TEST_ADVANCED: ${{ matrix.family }}
