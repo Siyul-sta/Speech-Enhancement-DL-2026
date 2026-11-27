@@ -585,6 +585,64 @@ class SyntheticPairs(Dataset):
 
 
 
+def cmgan_assets():
+    """MIT upstream CMGAN, pinned commit and verified git blob hashes."""
+    import hashlib, urllib.request
+    revision="39946005d9b66fa1e824edf4bb6bc9a06088e443"
+    blobs={"LICENSE":"6750370caf9bdc4710c5c1c0da12450a7d1bf336",
+           "src/models/conformer.py":"4594f11803a988f2540a30830c28e51c88f25126",
+           "src/models/generator.py":"d0dfacc36128d8b51386c3bb7c0fc8edfad82074",
+           "src/best_ckpt/ckpt":"cbafab9a5fe739f3662c65cfe7be009dc475e0d1"}
+    base=Path("/tmp/ralph_cmgan_assets") if Path("/kaggle").exists() else WORK/"cmgan_assets"
+    base.mkdir(parents=True,exist_ok=True)
+    for path,expected in blobs.items():
+        dest=base/path
+        dest.parent.mkdir(parents=True,exist_ok=True)
+        def valid(data): return hashlib.sha1(b"blob "+str(len(data)).encode()+b"\0"+data).hexdigest()==expected
+        if not dest.exists() or not valid(dest.read_bytes()):
+            url=f"https://raw.githubusercontent.com/ruizhecao96/CMGAN/{revision}/{path}"
+            with urllib.request.urlopen(url,timeout=60) as response: data=response.read(10_000_001)
+            if len(data)>10_000_000 or not valid(data): raise RuntimeError("CMGAN asset hash mismatch")
+            dest.write_bytes(data)
+    pkg=base/"ralph_cmgan_pinned"
+    pkg.mkdir(exist_ok=True)
+    (pkg/"__init__.py").write_text("",encoding="utf-8")
+    (pkg/"conformer.py").write_bytes((base/"src/models/conformer.py").read_bytes())
+    source=(base/"src/models/generator.py").read_text(encoding="utf-8")
+    (pkg/"generator.py").write_text(source.replace("from models.conformer import","from .conformer import"),encoding="utf-8")
+    if str(base) not in sys.path: sys.path.insert(0,str(base))
+    try: import einops
+    except ImportError:
+        subprocess.check_call([sys.executable,"-m","pip","install","-q","einops==0.8.1"])
+    module=importlib.import_module("ralph_cmgan_pinned.generator")
+    return module,base/"src/best_ckpt/ckpt"
+
+
+class CMGANTransfer(torch.nn.Module):
+    """Official pretrained generator; frozen encoder/Conformer, trainable decoders."""
+    def __init__(self):
+        super().__init__()
+        module,checkpoint=cmgan_assets()
+        self.net=module.TSCNet(num_channel=64,num_features=201)
+        self.net.load_state_dict(torch.load(checkpoint,map_location="cpu",weights_only=True),strict=True)
+        self.net.requires_grad_(False)
+        self.net.mask_decoder.requires_grad_(True)
+        self.net.complex_decoder.requires_grad_(True)
+        self.register_buffer("window",torch.hamming_window(400))
+    def forward(self,x):
+        scale=x.square().mean(-1,keepdim=True).clamp_min(1e-8).rsqrt()
+        y=torch.stft(x*scale,400,100,window=self.window,return_complex=True)
+        mag=y.abs()
+        compressed=y*mag.clamp_min(1e-8).pow(-0.7)
+        spec=torch.stack((compressed.real,compressed.imag),1).transpose(-1,-2)
+        # Freeze upstream attention to limit training memory.
+        for m in (self.net.dense_encoder,self.net.TSCB_1,self.net.TSCB_2,self.net.TSCB_3,self.net.TSCB_4): m.eval()
+        re,im=self.net(spec)
+        z=torch.complex(re[:,0].transpose(-1,-2),im[:,0].transpose(-1,-2))
+        z=z*z.abs().clamp_min(1e-8).pow(1/0.3-1)
+        return torch.istft(z,400,100,window=self.window,length=x.shape[-1])/scale
+
+
 class MetricGANTransfer(nn.Module):
     """Fine-tune public generator weights through differentiable STFT masking."""
     def __init__(self):
@@ -1132,6 +1190,8 @@ def run():
         model=RecipeModel().to(device)
     elif cfg.get("architecture") in ("sepformer_dns_transfer","sepformer_wham_transfer"):
         model = SepformerTransfer().to(device)
+    elif cfg.get("architecture") == "cmgan_transfer":
+        model = CMGANTransfer().to(device)
     elif cfg.get("architecture") == "metricgan":
         model = MetricGANTransfer().to(device)
     elif cfg.get("architecture") == "composed":
