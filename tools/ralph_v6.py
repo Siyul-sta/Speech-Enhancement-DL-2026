@@ -303,6 +303,38 @@ def quota_retry(kaggle,wait_minutes=90):
             if time.monotonic()>=deadline: raise
             print("V6 QUOTA_NETWORK_WAIT",flush=True);time.sleep(60)
 
+def prepare_cache(kaggle,code,korean,dns,wait):
+    # Separate private CPU kernel, never attaches challenge dataset or models.
+    tag="v4"+datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
+    folder=core.OUTPUT/("run_"+tag)/"round_0000"/"v4_cache"
+    job=ROOT/"kaggle_run"/"ralph_v4"/tag/"public_cache"
+    folder.mkdir(parents=True);job.mkdir(parents=True)
+    ref=f"siyul1122/ralph-public-cache-{tag}"
+    cfg={"v6_cache_build":True,"v6_cache_korean":korean,"v6_cache_dns":dns}
+    code,n=re.subn(r"^EXPERIMENT_CONFIG = .+$",lambda _: "EXPERIMENT_CONFIG = "+repr(cfg),code,count=1,flags=re.M)
+    if n!=1: raise ValueError("Cache source contract")
+    (job/"run.py").write_text(code,encoding="utf-8")
+    core.json_write(job/"kernel-metadata.json",{"id":ref,"title":"Ralph Public Cache "+tag,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"false","enable_internet":"true","dataset_sources":[],"kernel_sources":[],"competition_sources":[]})
+    state={"ref":ref,"kind":"v4_cache","status":"SUBMIT_PENDING","v6_cache":True}
+    core.json_write(folder/"remote_state.json",state)
+    try:
+        p=command(kaggle,"kernels","push","-p",job,timeout=180)
+        print(p.stdout,p.stderr,flush=True)
+    except (OSError,subprocess.TimeoutExpired) as exc: print("V6 CACHE PUSH UNKNOWN",repr(exc),flush=True)
+    deadline=time.monotonic()+wait*60
+    while time.monotonic()<deadline:
+        try: worker,_=recovery.status(kaggle,ref)
+        except (OSError,subprocess.SubprocessError): worker=None
+        if worker=="COMPLETE":
+            state["status"]="COMPLETE";core.json_write(folder/"remote_state.json",state)
+            print("V6 CPU CACHE COMPLETE",ref,flush=True);return ref
+        if worker in TERMINAL:
+            state["status"]="ERROR_TERMINAL";core.json_write(folder/"remote_state.json",state)
+            raise legacy.KaggleTerminalFailure("CPU cache "+worker)
+        print("V6 CPU CACHE",worker or "NETWORK_WAIT",ref,flush=True)
+        time.sleep(60)
+    raise TimeoutError("CPU cache unresolved; use reconcile, no duplicate push")
+
 def run(args):
     code=source();code_sha=hashlib.sha256(code.encode()).hexdigest()
     if not args.execute and not args.prepare_cache:
@@ -320,8 +352,7 @@ def run(args):
         if args.resume: resume(kaggle,args.max_job_minutes)
         else: core.no_uncertain_prior_jobs()
         if args.prepare_cache:
-            tag="v4"+datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-            print("V6 PUBLIC CPU CACHE",v4.build_public_cache(kaggle,code,tag),flush=True)
+            prepare_cache(kaggle,code,args.cache_korean,args.cache_dns_noise,args.max_job_minutes)
             return
         from v571_preflight import require_report
         from v572_scale_audit import require_report as require_scale
@@ -364,6 +395,7 @@ def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--execute",action="store_true");p.add_argument("--prepare-cache",action="store_true")
     p.add_argument("--allow-public-assets",action="store_true");p.add_argument("--resume",action="store_true")
+    p.add_argument("--cache-korean",type=int,default=512);p.add_argument("--cache-dns-noise",action="store_true")
     p.add_argument("--data-root",type=Path,required=True)
     p.add_argument("--families",nargs="+",choices=FAMILIES,default=list(FAMILIES))
     p.add_argument("--mix",type=int,default=2048);p.add_argument("--public-mix",type=int,default=512);p.add_argument("--max-mix",type=int,default=32768)
@@ -375,7 +407,7 @@ def main():
     p.add_argument("--enable-critic",action="store_true");p.add_argument("--enable-cascade",action="store_true")
     args=p.parse_args()
     if args.execute and args.prepare_cache: p.error("Use separate CPU cache command")
-    if not (1<=args.mix<=args.max_mix<=1000000 and 1<=args.public_mix<=32768 and 0<=args.korean_limit<=2000 and
+    if not (1<=args.mix<=args.max_mix<=1000000 and 1<=args.public_mix<=32768 and 0<=args.korean_limit<=2000 and 0<=args.cache_korean<=2000 and
         1<=args.pilot_epochs<=args.max_epochs<=500 and 1<=args.chunk_epochs<=50 and 1<=args.min_pilots<=len(FAMILIES) and
         args.max_rounds>=0 and 15<=args.max_job_minutes<=720 and math.isfinite(args.reserve_hours) and args.reserve_hours>=2 and math.isfinite(args.budget_hours) and args.budget_hours>=0):
         p.error("Invalid V6 limits")
