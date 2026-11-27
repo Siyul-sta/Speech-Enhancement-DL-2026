@@ -90,13 +90,15 @@ def audit(root,out,with_pesq=False,model_scores=None):
         from pesq import pesq
     else: pesq=None
     if model_scores and not with_pesq: raise ValueError("--model-scores requires --pesq")
-    all_rows={}; fingerprints={}; identifiers={}
+    all_rows={}; fingerprints={}; identifiers={}; manifest_hashes={}; repeated_ids={}
     for split,count in EXPECTED.items():
         with (root/split/"samples.csv").open(encoding="utf-8-sig",newline="") as f:
             manifest=list(csv.DictReader(f))
         if len(manifest)!=count: raise ValueError(f"{split}: expected {count} rows, found {len(manifest)}")
         ids=[r["segment_id"] for r in manifest]
-        if len(set(ids))!=len(ids) or not all(ids): raise ValueError("Duplicate or missing segment IDs within "+split)
+        if not all(ids): raise ValueError("Missing segment IDs within "+split)
+        repeated_ids[split]=len(ids)-len(set(ids))
+        manifest_hashes[split]=hashlib.sha256((root/split/"samples.csv").read_bytes()).hexdigest()
         identifiers[split]=set(ids)
         hashes={"clean":set(),"noisy":set()}; rows=[]
         scores=score_rows(model_scores,count) if model_scores and split=="validation" else None
@@ -121,6 +123,8 @@ def audit(root,out,with_pesq=False,model_scores=None):
     a,b=({r["speaker_group"] for r in all_rows[s]}-{"unknown"} for s in EXPECTED)
     overlap["known_speaker_groups"]=len(a&b)
     summary={"diagnostic_only":True,"cross_split_exact_overlap":overlap,"splits":{},
+             "manifest_sha256":manifest_hashes,
+             "model_scores_sha256":hashlib.sha256(Path(model_scores).read_bytes()).hexdigest() if model_scores else None,
              "notes":["Exact waveform hash overlap is not a near-duplicate or alignment test.",
                       "Speaker IDs are metadata or segment-name heuristics; unknown is not a speaker.",
                       "Noise labels are read from manifest only, never inferred from spectrum.",
@@ -129,6 +133,7 @@ def audit(root,out,with_pesq=False,model_scores=None):
     for split,rows in all_rows.items():
         summary["splits"][split]={"count":len(rows),"unique_clean":len(fingerprints[split]["clean"]),
              "unique_noisy":len(fingerprints[split]["noisy"]),
+             "repeated_segment_ids":repeated_ids[split],
              "known_speaker_groups":len({r["speaker_group"] for r in rows}-{"unknown"}),
              "silence_count":sum(r["clean_silent"] for r in rows),
              "residual_corr_gt_0p15_count":sum(r["abs_residual_correlation"]>.15 for r in rows),
