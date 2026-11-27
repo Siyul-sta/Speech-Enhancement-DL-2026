@@ -257,7 +257,7 @@ def v6_run():
     print("FINAL_RESULT "+json.dumps(result,allow_nan=False),flush=True)
 
 if __name__=="__main__":
-    if "--prepare-v6-cache" in sys.argv:
+    if EXPERIMENT_CONFIG.get("v6_cache_build") or "--prepare-v6-cache" in sys.argv:
         root=public_assets(prepare_only=True)
         limit=int(EXPERIMENT_CONFIG.get("v6_cache_korean",0))
         if limit: subprocess.check_call([sys.executable,"-m","pip","install","-q","pyarrow==20.0.0","fsspec[http]"])
