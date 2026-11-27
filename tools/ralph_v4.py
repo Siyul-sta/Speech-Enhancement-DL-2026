@@ -353,7 +353,7 @@ def main():
                 discovery=catalog.discover()
                 core.json_write(core.OUTPUT/("run_"+tag)/"public_research.json",discovery)
             plan=propose_config(records,n,args.epochs,None if args.v5_suite and len({r.get("v5_stage") for st,r in records if r.get("v5_stage")})<8 else codex,discovery,args.allow_generated_code,failures[-8:])
-            stages=[("bounded-control","residual",0,False),("relaxed","residual_relaxed",0,False),("remix","residual_relaxed",1024,False),("metric-loss","residual_relaxed",1024,True),("metricgan-transfer","metricgan",1024,True),("cmgan-transfer","cmgan_transfer",1024,True),("dual-axis","dual_axis",1024,True),("sepformer-transfer","sepformer_dns_transfer",1024,True)]
+            stages=[("bounded-control","residual",0,False),("relaxed","residual_relaxed",0,False),("remix","residual_relaxed",1024,False),("metric-loss","residual_relaxed",1024,True),("metricgan-transfer","metricgan",1024,True),("cmgan-transfer","cmgan_transfer",1024,True),("dual-axis","dual_axis",1024,True),("sepformer-transfer","sepformer_dns_transfer",1024,True),("remix-scale","residual_relaxed",4096,True),("cmgan-remix-scale","cmgan_transfer",4096,True)]
             done={r.get("v5_stage") for st,r in records}
             stage=next((s for s in stages if s[0] not in done and s[0] not in {x["plan"].get("v5_stage") for x in failures}),None) if args.v5_suite else None
             if stage:
