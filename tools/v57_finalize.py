@@ -1,6 +1,7 @@
 """V5.7 select and freeze a portable champion using common PCM16 development scoring."""
 from __future__ import annotations
 import argparse
+import csv
 import json
 import math
 import shutil
@@ -124,8 +125,9 @@ def choose_best(results):
 
 def finalize(args):
     core.no_uncertain_prior_jobs()
+    if (core.OUTPUT/"v57_audit_seal.json").exists(): raise RuntimeError("Independent audit is sealed; do not reselect after audit")
     data=args.data_root.resolve();out=args.out.resolve()
-    if out.exists() or out.is_relative_to(data): raise ValueError("Use new output outside dataset")
+    if out.exists() or out.is_relative_to(data) or out.is_relative_to(core.OUTPUT.resolve()): raise ValueError("Use new output outside dataset and Ralph history")
     val=data/"validation/samples.csv";train=data/"train/samples.csv"
     offline.read_manifest(val,164);offline.read_manifest(train,1296)
     train_sha=s.sha256(train)
@@ -154,7 +156,21 @@ def finalize(args):
     winner=choose_best(results)
     shutil.copytree(Path(winner["package"]),out/"champion")
     offline.verify_package(out/"champion")
-    report={"protocol":"v57-final-selection-v1","selected":winner,"candidates":results,"validation_manifest_sha256":s.sha256(val),
+    def score_rows(entry):
+        path=Path(entry["package"]).parent/"evaluation/scores.csv"
+        with path.open(encoding="utf-8",newline="") as f: rows=list(csv.DictReader(f))
+        if len(rows)!=164 or [int(x["index"]) for x in rows]!=list(range(164)): raise ValueError("Invalid paired comparison order")
+        return rows
+    win_rows=score_rows(winner)
+    groups=[x["speaker"] for x in win_rows]
+    groups=groups if "unknown" not in groups else None
+    comparisons=[]
+    for other in results:
+        if other.get("status")!="COMPLETE" or other["rank"]==winner["rank"]: continue
+        rows=score_rows(other)
+        if [x["speaker"] for x in rows]!=[x["speaker"] for x in win_rows]: raise ValueError("Paired speaker identity mismatch")
+        comparisons.append({"other_rank":other["rank"],"gain":offline.paired_bootstrap([float(a["pesq_wb"])-float(b["pesq_wb"]) for a,b in zip(win_rows,rows)],groups)})
+    report={"protocol":"v57-final-selection-v1","selected":winner,"candidates":results,"paired_candidate_comparisons":comparisons,"validation_manifest_sha256":s.sha256(val),
         "train_manifest_sha256":train_sha,"champion_manifest_sha256":s.sha256(out/"champion/package_manifest.json"),
         "selection":"highest actual PCM16 WAV PESQ among successfully evaluated shortlisted candidates",
         "limitations":["Development validation is not independent test; candidate selection biases this score.",
