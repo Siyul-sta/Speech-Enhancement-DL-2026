@@ -216,8 +216,13 @@ def main():
     p.add_argument("--gate-epochs",type=int,default=12)
     p.add_argument("--device",default="cpu")
     p.add_argument("--validation",action="store_true",help="Evaluate only selected frozen bundle on challenge development validation")
+    p.add_argument("--public-preflight",type=Path,help="Admit public models only with current successful V5.7.1 report")
     args=p.parse_args()
     torch.set_num_threads(2)
+    if args.public_preflight:
+        from v571_preflight import require_report
+        report=require_report(args.public_preflight)
+        args.public_families=tuple(report["families"]);args.cmgan_root=Path(report["cmgan_root"])
     run(args)
 
 if __name__=="__main__": main()
