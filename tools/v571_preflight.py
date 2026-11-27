@@ -14,7 +14,7 @@ from importlib.metadata import version
 ROOT=Path(__file__).resolve().parents[1]
 REPORT=ROOT/"runs/v57_public_preflight/report.json"
 FAMILIES=("cmgan_transfer","cascade_cmgan_two","cascade_cmgan_three","cascade_cmgan","metricgan","sepformer_dns_transfer","sepformer_wham_transfer")
-FILES=("src/kaggle_v4_external.py","tools/v57_public_assets.py","tools/submit_v5.py","tools/v55_gating.py","tools/v55_ensemble.py","tools/v57_offline.py","tools/v57_finalize.py","tools/v571_preflight.py")
+FILES=("src/kaggle_v4_external.py","src/kaggle_v4_public.py","tools/ralph_v4.py","tools/ralph_v56.py","tools/v57_public_assets.py","tools/submit_v5.py","tools/v55_gating.py","tools/v55_ensemble.py","tools/v57_offline.py","tools/v57_finalize.py","tools/v571_preflight.py")
 DEPS=("torch","torchaudio","speechbrain","hyperpyyaml","huggingface_hub","numpy","pandas","scipy","soundfile","einops","pesq")
 
 def digest(p):
@@ -104,8 +104,9 @@ def single(family,work,cache,package):
         if original.shape!=z.shape or not torch.isfinite(original).all(): raise RuntimeError("Online output invalid")
         # Emulate altered fine-tuned state (not real training). This ensures
         # the offline path cannot accidentally return only original weights.
-        p=next(p for p in model.parameters() if p.requires_grad)
-        p.reshape(-1)[0].add_(.001)
+        if hasattr(model,"residual"): p=model.residual.out.bias
+        else: p=next(p for p in reversed(list(model.parameters())) if p.requires_grad)
+        p.reshape(-1)[0].add_(.01)
         expected=model(z).numpy()[0].copy()
     package.mkdir()
     source=package/"source.py"
@@ -119,6 +120,7 @@ def single(family,work,cache,package):
     r=checked_child(package,work/(family+".npy"),expected)
     r["checkpoint_sha256"]=digest(checkpoint)
     r["initial_fixture_max_change"]=float(np.max(np.abs(expected-original.numpy()[0])))
+    if r["initial_fixture_max_change"]<=1e-9: raise RuntimeError("Modified checkpoint did not change fixture output")
     return r
 
 def mixed(work,public_package):
@@ -196,6 +198,12 @@ def main():
     p.add_argument("--child",type=Path,nargs=2,help=argparse.SUPPRESS)
     args=p.parse_args()
     if args.child: child(*args.child)
-    else: run(args.out.resolve())
+    else:
+        import ralph_v2 as core
+        core.no_uncertain_prior_jobs()
+        lock=core.OUTPUT/"active.lock";lock.parent.mkdir(parents=True,exist_ok=True)
+        with lock.open("x",encoding="utf-8") as f: f.write(str(os.getpid()))
+        try: run(args.out.resolve())
+        finally: lock.unlink(missing_ok=True)
 
 if __name__=="__main__": main()
