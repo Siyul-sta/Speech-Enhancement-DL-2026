@@ -68,6 +68,11 @@ def verify(folder, kind="v4_public"):
             norm=r.get("metric_gradient_norm")
             if (r.get("epochs_completed")!=3 or not r.get("pesq_aware") or r.get("critic_updates",0)<1 or r.get("metric_generator_steps",0)<1 or not isinstance(norm,(int,float)) or not math.isfinite(norm) or norm<=0):
                 raise ValueError("Missing real metric-gradient smoke evidence")
+            calibration=r.get("critic_calibration")
+            if not isinstance(calibration,dict) or calibration.get("count")!=64 or any(not isinstance(calibration.get(k),(float,int)) or not math.isfinite(calibration[k]) or calibration[k]<0 for k in ("mae","rmse")):
+                raise ValueError("Missing finite critic calibration")
+            corr=calibration.get("pearson")
+            if corr is not None and (not isinstance(corr,(float,int)) or not math.isfinite(corr) or abs(corr)>1.000001): raise ValueError("Invalid critic correlation")
         elif r.get("epochs_completed")!=2: raise ValueError("Incomplete legacy smoke run")
     return r
 
@@ -287,6 +292,7 @@ def main():
     if args.amp and not (args.smoke or args.perf_benchmark or args.validated_perf_run): p.error("--amp requires smoke or the quality-gated performance mode")
     if (args.v5_suite or args.challenge_remix) and not args.loop: p.error("Suite/remix require --loop")
     if (args.focus_architecture or args.pesq_aware) and not (args.loop or args.smoke): p.error("Training focus options require --loop or --smoke")
+    if args.smoke and args.pesq_aware and args.amp: p.error("Metric smoke uses FP32")
     if args.smoke and args.focus_architecture not in (None,"residual","residual_relaxed","dual_axis","temporal"): p.error("Smoke must use a native model without public downloads")
     if args.v5_suite: args.challenge_focus=True
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
