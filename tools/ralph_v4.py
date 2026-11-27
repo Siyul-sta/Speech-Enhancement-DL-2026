@@ -277,7 +277,9 @@ def main():
     args=p.parse_args()
     if sum(map(bool,(args.smoke,args.loop,args.final_audit,args.perf_benchmark,args.validated_perf_run)))>1: p.error("Choose exactly one execution mode")
     if args.amp and not (args.smoke or args.perf_benchmark or args.validated_perf_run): p.error("--amp requires smoke or the quality-gated performance mode")
-    if (args.v5_suite or args.focus_architecture or args.challenge_remix or args.pesq_aware) and not args.loop: p.error("Training focus options require --loop")
+    if (args.v5_suite or args.challenge_remix) and not args.loop: p.error("Suite/remix require --loop")
+    if (args.focus_architecture or args.pesq_aware) and not (args.loop or args.smoke): p.error("Training focus options require --loop or --smoke")
+    if args.smoke and args.focus_architecture not in (None,"residual","residual_relaxed","dual_axis","temporal"): p.error("Smoke must use a native model without public downloads")
     if args.v5_suite: args.challenge_focus=True
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
@@ -320,7 +322,7 @@ def main():
         if args.smoke:
             print("SMOKE: no public cache or corpus download required",flush=True)
             legacy.require_quota(kaggle,2)
-            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":"temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":None,"amp":args.amp})
+            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":args.focus_architecture or "temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":None,"amp":args.amp,"pesq_aware":args.pesq_aware})
             return
         if args.final_audit:
             eligible=[(st,r) for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file()]
@@ -350,7 +352,7 @@ def main():
             if args.discover and (not discovery or n%5==0):
                 discovery=catalog.discover()
                 core.json_write(core.OUTPUT/("run_"+tag)/"public_research.json",discovery)
-            plan=propose_config(records,n,args.epochs,codex,discovery,args.allow_generated_code,failures[-8:])
+            plan=propose_config(records,n,args.epochs,None if args.v5_suite and len({r.get("v5_stage") for st,r in records if r.get("v5_stage")})<8 else codex,discovery,args.allow_generated_code,failures[-8:])
             stages=[("bounded-control","residual",0,False),("relaxed","residual_relaxed",0,False),("remix","residual_relaxed",1024,False),("metric-loss","residual_relaxed",1024,True),("metricgan-transfer","metricgan",1024,True),("cmgan-transfer","cmgan_transfer",1024,True),("dual-axis","dual_axis",1024,True),("sepformer-transfer","sepformer_dns_transfer",1024,True)]
             done={r.get("v5_stage") for st,r in records}
             stage=next((s for s in stages if s[0] not in done and s[0] not in {x["plan"].get("v5_stage") for x in failures}),None) if args.v5_suite else None
