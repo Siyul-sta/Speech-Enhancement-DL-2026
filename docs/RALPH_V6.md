@@ -10,7 +10,7 @@ submitted during development/CI.
 
 | Stage | Implementation | Evidence / limitations |
 |---|---|---|
-| V6.1 | MP-SENet DNS/VB official pinned checkpoints; existing CMGAN, MetricGAN+, SepFormer DNS/WHAM and three native families | Strict Git blob and weights-only load; CPU preflight required. SEMamba, SEMamba++, ROSE-CD not admitted yet (below). |
+| V6.1 | MP-SENet DNS/VB, SEMamba, SEMamba++, ROSE-CD CT; existing CMGAN, MetricGAN+, SepFormer DNS/WHAM and three native families (12 total) | All adapter code integrated. Actual advanced checkpoint and CPU/GPU acceptance must pass before admission. |
 | V6.2 | LibriSpeech/MUSAN, pinned Korean FLEURS and Zeroth training, optional DNS AudioSet noise shard, public-only CPU cache | No actual large corpus cache built in this development turn. Corpus terms and provenance must be respected. |
 | V6.3 | Real challenge residual cross-mixing, Korean balancing, train-speaker-isolated calibration, SNR curriculum, hard noise group weighting | Lazy indexing supports up to 1M samples; actual training limited by available budget. |
 | V6.4 | Multires waveform, log-mag and complex/phase losses; actual PESQ replay/rank critic with held-out calibration gate | Critic may stay disabled if calibration fails; no differentiable exact PESQ. |
@@ -28,23 +28,48 @@ training scripts executed. Full-length inference follows upstream RMS and STFT.
 The upstream attention axis convention is preserved; utterances are passed
 individually. Transfer groups cover decoder, late, early and encoder modules.
 
-SEMamba: https://github.com/roychao19477/semamba, pinned reviewed revision
+SEMamba: https://github.com/RoyChao19477/SEMamba, pinned revision
 750ff5d8f0e112557ca039c268cdcc51e267f342; official checkpoint
 ckpts/SEMamba_advanced.pth (Git blob c5806e24f83514cf99d2711a1a99c0414e2ac390).
-MIT with additional attribution of MP-SENet/CMGAN. The official inference
-explicitly rejects CPU; upstream torch 2.2.2 and bundled Mamba/CUDA build are
-not validated in the current torch 2.11 / Tesla T4 / Windows CPU workflow.
-Blocked from automatic jobs until a compatible isolated environment and
-offline inference have passed. SEMamba++ likewise needs source and weight
-identity and compatible kernels. Neither is claimed implemented.
+MIT with MP-SENet/CMGAN attribution. src/v6_semamba.py uses reviewed pinned
+architecture classes and a portable Mamba1 implementation with exact state
+layout, causal convolution, input-dependent SSM, associative affine scan,
+RMSNorm, and bidirectional recurrence. Native torch CPU/GPU, no mandatory
+compiled extensions. Portable scan may be significantly slower than fused
+Mamba. CI tests numerical/gradient parity against direct recurrence and
+the real public checkpoint on a synthetic 4096-sample fixture.
 
-ROSE-CD: https://github.com/LiangXu123/ROSE-CD, reviewed pinned revision
+SEMamba++: https://github.com/Eddieyjlee/SEMambapp (same original repository
+ID 1160517120, owner renamed from infected4098). Pinned revision
+cd369c89a8106072c077b468417b765b227afd74; upstream corrected checkpoint from
+August 2026: https://huggingface.co/yongjoonlee/semambapp .
+src/v6_semambapp.py preserves the official multi-resolution bottleneck,
+frequency/global/local FAN, peak normalization and direct magnitude
+prediction. The HF model card identifies GPL-2.0 terms; the GitHub source
+does not expose a separate LICENSE file. Source downloaded locally at a
+fixed commit, not checked into this project. Use locally for evaluation;
+do not redistribute upstream source/weights or portable bundle without
+reviewing permissions and GPL terms.
+
+ROSE-CD: https://github.com/LiangXu123/ROSE-CD, pinned revision
 8270abbf48b016a1a0be370d6c40e67ca8b85fab, MIT. Official CT checkpoint path
 logs/CT_pesq5e-4_L2/l6wdouw9/last.ckpt on https://huggingface.co/LIANGXU123/ROSE-CD .
-Upstream Lightning load_from_checkpoint(strict=False), EMA, SDE sampling and
-dependency stack need a safe strict adapter, deterministic inference and
-offline acceptance. No unsafe pickle fallback, no unverified dependency
-installation. Not admitted to scheduler.
+src/v6_rose_cd.py reconstructs the pinned NCSNpp_v2 and OUVE model, strictly
+loads dnn weights and folds EMA once. Native upfirdn avoids CUDA compilation.
+Uses only weights_only=True, with the inert known data-module class marker,
+never arbitrary pickle or Lightning training code. One-step stochastic
+prior uses a fixed seed for deterministic evaluation; no clean input.
+Supports differentiable head/progressive transfer and local offline config.
+Unknown checkpoint architecture, missing EMA or unsafe globals fail closed.
+
+For SEMamba++ and ROSE-CD the first local preflight resolves the exact
+official HF revision, filename, LFS SHA256, size and model card license.
+The controller propagates those immutable locks to remote jobs; remote
+or offline assets must match. No claimed downloaded checkpoint hashes
+before actual preflight. Per-family preflight results are persisted.
+All three added to the scheduler, transfer groups, cascade, local package
+and validation pipeline; actual CPU fixture/full-length and remote training
+remain separate acceptance gates. Do not call unverified adapters a PESQ win.
 
 Zeroth Korean: https://www.openslr.org/40/ (CC BY 4.0), pinned parquet mirror
 kresnik/zeroth_korean revision 1fe937899f828af822293d05e086200946088bdf.
@@ -74,7 +99,7 @@ $DataRoot = "C:\Users\LG\OneDrive\Desktop\deep_learning_noise_reduction_challeng
 
 Required local CPU acceptance with actual public MP checkpoints and the
 first real train clip (no GPU; downloads verified public assets only).
-Existing V5.7.1/V5.7.2 PASS reports must match the local environment.
+Existing V5.7.1/V5.7.2 PASS reports must match the local environment. The full 12-model preflight can be slow, especially portable SEMamba/SEMamba++. For individual model diagnostics use --families semamba semambapp rose_cd. Successful checks are retained across runs on identical source/data/environment. Failed families are never silently admitted; explicitly supply --families with accepted models if you want to continue without them.
 
 ```powershell
 & $Py -u tools/v6_preflight.py --data-root "$DataRoot" --allow-public-download
@@ -101,7 +126,8 @@ kaggle quota
 ```
 
 First job: new MP DNS zero-shot, not a training claim. Inspect COMPLETE
-and actual PESQ; next jobs benchmark MP VB and smoke selected architectures.
+and actual PESQ; next jobs benchmark MP VB, SEMamba, SEMamba++, ROSE-CD
+when admitted and affordable, then smoke and pilot selected architectures.
 Then continuous serial research with budget guard:
 
 ```powershell
