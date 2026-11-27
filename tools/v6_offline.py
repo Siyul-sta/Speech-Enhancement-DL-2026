@@ -46,6 +46,12 @@ def load_expert(root,meta,index):
         asset_root=(root/meta["asset_root"]).resolve()
         if not asset_root.is_relative_to(root.resolve()): raise ValueError("Asset path escapes")
         mod.v6_mp_assets(asset_root,mod.V6_MP_FAMILIES[base],False,include_weights=False)
+    elif base in ("semamba","semambapp","rose_cd"):
+        asset_root=(root/meta["asset_root"]).resolve()
+        if not asset_root.is_relative_to(root.resolve()) or not asset_root.is_dir(): raise ValueError("Advanced asset path escapes")
+        if base in ("semambapp","rose_cd"):
+            lock=json.loads((asset_root/"hf_lock.json").read_text(encoding="utf-8"))
+            if lock!=cfg.get("v6_hf_lock"): raise ValueError("Offline HF checkpoint provenance mismatch")
     elif base in mod.V6_PUBLIC:
         asset_root=(root/meta["asset_root"]).resolve()
         if not asset_root.is_relative_to(root.resolve()): raise ValueError("Asset path escapes")
