@@ -46,6 +46,7 @@ def load_bundle(config,device):
         mod=importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         family=mod.EXPERIMENT_CONFIG.get("architecture","residual")
+        if s.get("family",family)!=family: raise ValueError("Expert family mismatch")
         if family not in FAMILIES: raise ValueError("Offline adapter not admitted: "+family)
         model=getattr(mod,FAMILIES[family])().to(device).eval()
         model.load_state_dict(torch.load(checkpoint,map_location=device,weights_only=True),strict=True)
@@ -55,7 +56,7 @@ def load_bundle(config,device):
     if cfg.get("gating") is not None:
         from v55_gating import EnsembleGate,GatedEnsemble
         g=cfg["gating"]
-        if not isinstance(g,dict) or g.get("mode") not in ("clip","frequency") or g.get("experts")!=len(models):
+        if not isinstance(g,dict) or g.get("mode") not in ("clip","frequency") or g.get("experts")!=len(models) or any(not math.isclose(w,1/len(models),abs_tol=1e-6) for w,_ in models):
             raise ValueError("Invalid gating config")
         checkpoint=safe_path(config.parent,g["checkpoint"])
         if sha256(checkpoint)!=g["checkpoint_sha256"]: raise ValueError("Gate checkpoint hash mismatch")
