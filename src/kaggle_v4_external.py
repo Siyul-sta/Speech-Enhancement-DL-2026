@@ -118,6 +118,36 @@ class SpeechPairs(Dataset):
         return torch.from_numpy(self.noisy[i]), torch.from_numpy(self.clean[i])
 
 
+class ChallengeRemix(Dataset):
+    """Train-only empirical residual remix; reject suspicious correlated residuals."""
+    def __init__(self, train, size, seed=42):
+        if len(train)!=1296 or not isinstance(train,SpeechPairs):
+            raise ValueError("Challenge remix requires original training split")
+        self.clean=train.clean
+        self.noise=train.noisy-train.clean
+        rms=lambda a: np.sqrt(np.mean(a*a,axis=1,dtype=np.float64))
+        cr,nr=rms(self.clean),rms(self.noise)
+        cross=np.abs(np.mean(self.clean*self.noise,axis=1,dtype=np.float64))
+        corr=cross/np.maximum(cr*nr,1e-12)
+        self.pool=np.flatnonzero((cr>1e-4)&(nr>1e-5)&(corr<0.15)&np.isfinite(corr))
+        if len(self.pool)<32: raise RuntimeError("Insufficient additive-like train residuals")
+        self.snr=20*np.log10(cr[self.pool]/nr[self.pool])
+        self.snr_low,self.snr_high=np.clip(np.quantile(self.snr,[.05,.95]),-15,35)
+        self.size,self.seed,self.epoch=int(size),int(seed),0
+        print("CHALLENGE_REMIX",len(self.pool),float(self.snr_low),float(self.snr_high),flush=True)
+    def __len__(self): return self.size
+    def __getitem__(self,i):
+        rng=np.random.default_rng(self.seed+100003*self.epoch+i)
+        a,b=rng.choice(self.pool,2,replace=False)
+        s=self.clean[a].copy()
+        n=np.roll(self.noise[b],int(rng.integers(0,len(s))))
+        snr=rng.uniform(self.snr_low,self.snr_high)
+        n=n*(np.sqrt(np.mean(s*s)+1e-12)/np.sqrt(np.mean(n*n)+1e-12))*10**(-snr/20)
+        x=s+n
+        scale=max(1.,float(np.max(np.abs(x))),float(np.max(np.abs(s))))
+        return torch.from_numpy((x/scale).astype(np.float32)),torch.from_numpy((s/scale).astype(np.float32))
+
+
 class ConvBlock(nn.Module):
     def __init__(self, input_ch: int, output_ch: int):
         super().__init__()
@@ -198,6 +228,66 @@ class RelaxedPhaseUNet(ResidualPhaseUNet):
     """Experimental: gains up to 2 and full wrapped phase range."""
     max_gain = 2.0
     max_phase = 3.141592653589793
+
+
+class DualAxisEnhancer(nn.Module):
+    """Native dual-axis recurrent spectrogram network; not official CMGAN weights."""
+    def __init__(self):
+        super().__init__()
+        w=24
+        self.enc=nn.Sequential(nn.Conv2d(3,w,3,padding=1),nn.GroupNorm(4,w),nn.SiLU(),
+                               nn.Conv2d(w,w,3,stride=(2,2),padding=1),nn.SiLU())
+        self.time=nn.GRU(w,w,batch_first=True,bidirectional=True)
+        self.freq=nn.GRU(2*w,w,batch_first=True,bidirectional=True)
+        self.head=nn.Conv2d(2*w,2,1)
+        nn.init.zeros_(self.head.weight); nn.init.zeros_(self.head.bias)
+        self.register_buffer("window",torch.hann_window(N_FFT))
+    def forward(self,x):
+        y=torch.stft(x,N_FFT,HOP,window=self.window,return_complex=True)
+        mag=y.abs()
+        z=self.enc(torch.stack((mag.log1p(),y.real/(mag+1),y.imag/(mag+1)),1))
+        b,w,f,t=z.shape
+        z,_=self.time(z.permute(0,2,3,1).reshape(b*f,t,w))
+        z=z.reshape(b,f,t,2*w).permute(0,2,1,3).reshape(b*t,f,2*w)
+        z,_=self.freq(z)
+        z=z.reshape(b,t,f,2*w).permute(0,3,2,1)
+        h=F.interpolate(self.head(z),size=y.shape[-2:],mode="bilinear",align_corners=False)
+        gain=2*torch.sigmoid(h[:,0])
+        phase=math.pi*torch.tanh(h[:,1])
+        return torch.istft(y*torch.polar(gain,phase),N_FFT,HOP,window=self.window,length=x.shape[-1])
+
+
+class PESQCritic(nn.Module):
+    """Differentiable train-only regression of real PESQ scores."""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("window",torch.hann_window(512))
+        layers=[]
+        for a,b in ((3,16),(16,32),(32,48),(48,64)):
+            layers.extend((nn.Conv2d(a,b,3,stride=2,padding=1),nn.GroupNorm(4,b),nn.SiLU()))
+        self.net=nn.Sequential(*layers,nn.AdaptiveAvgPool2d(1),nn.Flatten(),nn.Linear(64,1),nn.Sigmoid())
+    def forward(self,pred,clean):
+        def spec(x): return torch.stft(x,512,128,window=self.window,return_complex=True).abs().log1p()
+        p,c=spec(pred),spec(clean)
+        return self.net(torch.stack((p,c,(p-c).abs()),1)).flatten()
+
+def critic_step(critic, optimizer, pred, noisy, clean, pesq_fn):
+    # Only training batches; score a small, bounded subset to control CPU cost.
+    n=min(2,len(clean))
+    with torch.no_grad():
+        target=clean[:n].detach().float()
+        candidates=torch.cat((pred[:n].detach().float(),noisy[:n].detach().float(),target))
+        reference=target.repeat(3,1)
+        vals=score_waveforms(reference.cpu().numpy(),candidates.cpu().numpy(),pesq_fn,workers=0)
+        labels=torch.tensor(vals,device=target.device,dtype=target.dtype).add(.5).div(5.2).clamp(0,1)
+    critic.train().requires_grad_(True)
+    optimizer.zero_grad(set_to_none=True)
+    loss=F.mse_loss(critic(candidates,reference),labels)
+    loss.backward()
+    torch.nn.utils.clip_grad_norm_(critic.parameters(),5.)
+    optimizer.step()
+    critic.eval().requires_grad_(False)
+    return float(loss.detach())
 
 
 def enhancement_loss(pred, clean, variant: str):
@@ -847,7 +937,7 @@ def update_ema(teacher,model):
         if t.is_floating_point(): t.lerp_(p,0.01)
         else: t.copy_(p)
 
-def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,scaler=None):
+def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,scaler=None,critic=None,critic_optimizer=None,pesq_fn=None,metric_weight=0.,update_critic=False):
     variant=cfg["id"]
     optimizer.zero_grad(set_to_none=True)
     # Only convolutional forward uses AMP; STFT, objectives and teachers stay FP32.
@@ -878,6 +968,11 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
         loss=loss-0.01*(10*torch.log10((proj.square().sum(-1)+1e-8)/((a-proj).square().sum(-1)+1e-8))).clamp(-30,30).mean()
     elif cfg.get("loss_mode") == "waveform":
         loss=loss+0.2*F.l1_loss(pred,clean)
+    if critic is not None:
+        if update_critic: critic_step(critic,critic_optimizer,pred,noisy,clean,pesq_fn)
+        if metric_weight>0:
+            critic.eval().requires_grad_(False)
+            loss=loss+metric_weight*(1-critic(pred.float().clamp(-1,1),clean.float().clamp(-1,1))).square().mean()
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite train loss")
     if scaler is not None:
@@ -944,7 +1039,7 @@ def make_loader(dataset,batch_size,shuffle,device,dynamic=False):
     return DataLoader(dataset,batch_size=batch_size,shuffle=shuffle,**opts)
 
 def set_data_epoch(dataset,epoch):
-    if isinstance(dataset,SyntheticPairs):
+    if isinstance(dataset,(SyntheticPairs,ChallengeRemix)):
         dataset.epoch=epoch
     elif isinstance(dataset,torch.utils.data.ConcatDataset):
         for child in dataset.datasets: set_data_epoch(child,epoch)
@@ -998,6 +1093,7 @@ def run():
         train_set = SpeechPairs(root, "train")
         if len(train_set) != 1296:
             raise RuntimeError("Unexpected train split size")
+        original_train=train_set
         if smoke:
             fixture_train,fixture_val=smoke_pairs(train_set)
             train_set=torch.utils.data.ConcatDataset([torch.utils.data.Subset(train_set,list(range(16))),fixture_train])
@@ -1011,6 +1107,8 @@ def run():
                 train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,n//2,42,True),SyntheticPairs(korean,tn,n-n//2,43,True)])
             else:
                 train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
+            if cfg.get("challenge_remix",0):
+                train_set=torch.utils.data.ConcatDataset([train_set,ChallengeRemix(original_train,int(cfg["challenge_remix"]),cfg["seed"])])
             external_data=torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)])
             external_val=make_loader(fixed_pairs(external_data),4,False,device)
         val_set = SpeechPairs(root, "validation")
@@ -1044,6 +1142,8 @@ def run():
         model = GeneratedEnhancer().to(device)
     elif cfg.get("architecture") == "temporal":
         model = TemporalEnhancer().to(device)
+    elif cfg.get("architecture") == "dual_axis":
+        model = DualAxisEnhancer().to(device)
     elif cfg.get("architecture") == "residual_relaxed":
         model = RelaxedPhaseUNet().to(device)
     else:
@@ -1101,6 +1201,8 @@ def run():
     if cfg.get("distill"):
         distill=MetricGANTransfer().to(device).eval().requires_grad_(False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
+    critic=PESQCritic().to(device) if cfg.get("pesq_aware") else None
+    critic_optimizer=torch.optim.AdamW(critic.parameters(),lr=0.0003) if critic is not None else None
     use_amp=bool(cfg.get("amp")) and device.type=="cuda" and cfg.get("architecture") in ("temporal","composed")
     scaler=torch.amp.GradScaler("cuda") if use_amp else None
     print(f"TRAIN_PRECISION={'amp_fp16_forward_fp32_loss' if use_amp else 'fp32'}",flush=True)
@@ -1124,12 +1226,12 @@ def run():
     epoch_times=[]
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
-        if perf: set_data_epoch(train_set,epoch)
+        if perf or cfg.get("challenge_remix"): set_data_epoch(train_set,epoch)
         losses = []
         epoch_started=time.monotonic()
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
             noisy, clean = noisy.to(device,non_blocking=True), clean.to(device,non_blocking=True)
-            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None,scaler=scaler))
+            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None,scaler=scaler,critic=critic,critic_optimizer=critic_optimizer,pesq_fn=pesq_function,metric_weight=(0.05 if epoch>=3 else 0.),update_critic=(batch_idx%8==1)))
             if batch_idx==1 or batch_idx%10==0 or batch_idx==len(train_loader):
                 telemetry={"event":"batch","epoch":epoch,"epochs":int(cfg["epochs"]),"batch":batch_idx,"batches":len(train_loader),"loss":float(losses[-1]),"elapsed_s":time.monotonic()-epoch_started}
                 if device.type=="cuda":
@@ -1211,6 +1313,8 @@ def run():
         "model": type(model).__name__,
         "model_family":cfg.get("architecture","residual"),
         "loss_mode":cfg.get("loss_mode","base"),
+        "pesq_aware":bool(cfg.get("pesq_aware")),
+        "challenge_remix":int(cfg.get("challenge_remix",0)),
         "loss_weights":cfg.get("loss_weights"),
         "data_profile":cfg.get("data_profile","base"),
         "augmentation":cfg.get("augmentation","base"),
