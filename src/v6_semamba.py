@@ -107,9 +107,9 @@ class V6Mamba1(nn.Module):
         return torch.cat(ys,0)
 
 class V6MambaBlock(nn.Module):
-    def __init__(self,dim,mixer_cls,norm_cls=nn.LayerNorm,fused_add_norm=False,residual_in_fp32=False):
+    def __init__(self,dim,mixer_cls,norm_cls=nn.LayerNorm,fused_add_norm=False,residual_in_fp32=False,mlp_cls=nn.Identity):
         super().__init__()
-        if fused_add_norm: raise ValueError("Fused add-norm unavailable")
+        if fused_add_norm or mlp_cls is not nn.Identity: raise ValueError("Only unfused Mamba1 identity-MLP blocks supported")
         self.mixer=mixer_cls(dim);self.norm=norm_cls(dim);self.residual_in_fp32=residual_in_fp32
     def forward(self,hidden_states,residual=None,inference_params=None):
         residual=hidden_states if residual is None else hidden_states+residual
