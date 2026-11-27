@@ -6,6 +6,7 @@ import shutil
 
 V6_NATIVE={"complex_residual":ComplexResidualUNet,"residual_relaxed":RelaxedPhaseUNet,"dual_axis":DualAxisEnhancer}
 V6_PUBLIC={"cmgan_transfer":CMGANTransfer,"metricgan":MetricGANTransfer,"sepformer_dns_transfer":SepformerTransfer,"sepformer_wham_transfer":SepformerTransfer}
+V6_ADVANCED=("semamba","semambapp","rose_cd")
 
 def v6_sha(p):
     with Path(p).open("rb") as f: return hashlib.file_digest(f,"sha256").hexdigest()
@@ -36,6 +37,22 @@ def v6_make_model(cfg,mp_root=None,pretrained=True,coarse=None):
             mp_root=Path(mp_root) if mp_root else WORK/"v6_mp_assets"
             # Only original verified public blobs; offline final load needs no original weights.
             coarse=V6MPNet(base,mp_root,allow_download=pretrained,pretrained=pretrained)
+        elif base in V6_ADVANCED:
+            root=Path(mp_root) if mp_root is not None else ((Path("/tmp/v6_advanced_assets") if Path("/kaggle").exists() else WORK/"v6_advanced_assets")/base)
+            expected=cfg.get("v6_hf_lock")
+            if pretrained and base in ("semambapp","rose_cd") and Path("/kaggle").exists() and not expected:
+                raise ValueError("Require locally accepted immutable HF weight lock")
+            if base=="semamba":
+                coarse=V6SEMamba(root,allow_download=pretrained,pretrained=pretrained)
+            elif base=="semambapp":
+                coarse=V6SEMambaPP(root,allow_download=pretrained,pretrained=pretrained,expected=expected)
+            else:
+                coarse=V6RoseCD(root,allow_download=pretrained,pretrained=pretrained,expected=expected)
+            if pretrained and mp_root is None:
+                if base in ("semambapp","rose_cd"):
+                    shutil.copy2(root/"hf_lock.json",WORK/"v6_hf_lock.json")
+                if base=="rose_cd":
+                    shutil.copy2(root/"rose_config.json",WORK/"rose_config.json")
         elif base in V6_NATIVE: coarse=V6_NATIVE[base]()
         elif base in V6_PUBLIC:
             if not pretrained: raise ValueError("Offline public adapter requires constructed coarse module")
@@ -254,7 +271,7 @@ def v6_run():
         "v6":{"protocol":"v6-max-pesq-v1","parent":parent,"attempted_epochs":attempted+len(history),"checkpoint_epoch":offset+best_epoch,
             "checkpoint_sha256":v6_sha(WORK/"best_model.pt"),"root_external_domains":root_domains,"start_pesq":base,"gain":score-base,
             "lr":opt.param_groups[0]["lr"] if opt else lr,"optimizer_restored":False,"critic_updates":updates,"metric_steps":metric_steps,
-            "critic_calibration":calibration,"coarse_score":coarse_score,"stage_scores":stage_scores,"fit_count":len(v6_split(train)[0]),
+            "critic_calibration":calibration,"coarse_score":coarse_score,"stage_scores":stage_scores,"hf_lock":cfg.get("v6_hf_lock"),"fit_count":len(v6_split(train)[0]),
             "training_pairs_per_epoch":len(loader.dataset),"mode":mode,"base_family":(cfg.get("v6_base_family") or cfg["architecture"])}}
     (WORK/"result.json").write_text(json.dumps(result,indent=2,allow_nan=False),encoding="utf-8")
     print("FINAL_RESULT "+json.dumps(result,allow_nan=False),flush=True)
