@@ -46,7 +46,7 @@ pretrained weights, evaluates one full 48000-sample fixture, modifies a
 parameter to emulate a changed checkpoint (not actual fine-tuning),
 exports the checkpoint, then reconstructs it in a separate Python
 process with the network/subprocess guard. Raw outputs must match within
-atol=2e-5 and rtol=2e-4; actual PCM16 PESQ difference must be <=0.01.
+atol=2e-5 and rtol=2e-4 normally; actual PCM16 PESQ difference must be <=0.01. For SepFormer only, if elementwise allclose fails, the revised preflight also allows bounded FP32 roundoff (peak-relative max <=2e-5, normalized RMS <=1e-5, PCM16 max <=4 LSB and RMS <=1 LSB). Every single-model state tensor must exactly match the checkpoint. Parent and child use deterministic CPU settings, one thread and disabled MHA fastpath. Raw output peak and clipping fraction are logged separately; equivalence does not establish enhancement quality.
 The mixed public/native smoke compares fixed, clip gate and frequency
 gate using CMGAN and a Native expert. No claim of performance improvement.
 The optional local train fixture uses only the first training pair;
