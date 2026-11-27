@@ -767,6 +767,25 @@ class CMGANTransfer(torch.nn.Module):
         return torch.istft(z,400,100,window=self.window,length=x.shape[-1])/scale
 
 
+def speechbrain_adapter_setup():
+    # SpeechBrain 1.0.3 calls a removed diagnostic API in torchaudio >=2.9.
+    # Our adapters process tensors; WAV I/O is soundfile, not torchaudio.
+    import torchaudio
+    if not hasattr(torchaudio,"list_audio_backends"):
+        torchaudio.list_audio_backends=lambda: []
+    from speechbrain.utils.fetching import LocalStrategy
+    return LocalStrategy.COPY
+
+
+def speechbrain_spec(family):
+    # Explicit known upstream revisions; verify actual model loads in CPU preflight.
+    return {
+        "metricgan":("speechbrain/metricgan-plus-voicebank","d53da1c9c485c2310d03e8ca410741bcf0c4db9a"),
+        "sepformer_dns_transfer":("speechbrain/sepformer-dns4-16k-enhancement","e8c258546300102a240fa2595854d473cbfee49a"),
+        "sepformer_wham_transfer":("speechbrain/sepformer-wham16k-enhancement","90b3c5c3ffe3e04387b566715ab5fff36ec7b9d9"),
+    }[family]
+
+
 def archive_speechbrain_config(savedir,family):
     """Capture exact local hparams for later offline reconstruction, no private audio."""
     if EXPERIMENT_CONFIG.get("smoke") or EXPERIMENT_CONFIG.get("final_audit"): return
@@ -779,7 +798,8 @@ def archive_speechbrain_config(savedir,family):
     data=path.read_bytes()
     target=WORK/"offline_hyperparams.yaml"
     target.write_bytes(data)
-    info={"family":family,"sha256":hashlib.sha256(data).hexdigest(),
+    source,revision=speechbrain_spec(family)
+    info={"family":family,"sha256":hashlib.sha256(data).hexdigest(),"source":source,"revision":revision,
           "speechbrain":version("speechbrain"),"hyperpyyaml":version("hyperpyyaml")}
     (WORK/"offline_hyperparams.json").write_text(json.dumps(info,indent=2),encoding="utf-8")
 
@@ -788,13 +808,13 @@ class MetricGANTransfer(nn.Module):
     """Fine-tune public generator weights through differentiable STFT masking."""
     def __init__(self):
         super().__init__()
-        try:
-            import speechbrain
-        except ImportError:
-            subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3","huggingface_hub<1"])
+        if importlib.util.find_spec("speechbrain") is None:
+            subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3","huggingface_hub<1","hyperpyyaml==1.2.2"])
+        strategy=speechbrain_adapter_setup()
         from speechbrain.inference.enhancement import SpectralMaskEnhancement
         savedir=Path("/tmp/ralph_v4_metricgan") if Path("/kaggle").exists() else WORK/"metricgan_weights"
-        engine=SpectralMaskEnhancement.from_hparams(source="speechbrain/metricgan-plus-voicebank",
+        source,revision=speechbrain_spec("metricgan")
+        engine=SpectralMaskEnhancement.from_hparams(source=source,revision=revision,local_strategy=strategy,
             savedir=str(savedir),run_opts={"device":"cpu"},freeze_params=False)
         archive_speechbrain_config(savedir,"metricgan")
         self.generator=engine.mods.enhance_model
@@ -814,15 +834,14 @@ class SepformerTransfer(nn.Module):
     """Registered SepFormer encoder/mask network, trainable decoder adaptation."""
     def __init__(self):
         super().__init__()
-        try:
-            import speechbrain
-        except ImportError:
-            subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3","huggingface_hub<1"])
+        if importlib.util.find_spec("speechbrain") is None:
+            subprocess.check_call([sys.executable,"-m","pip","install","-q","speechbrain==1.0.3","huggingface_hub<1","hyperpyyaml==1.2.2"])
+        strategy=speechbrain_adapter_setup()
         from speechbrain.inference.separation import SepformerSeparation
         family=EXPERIMENT_CONFIG.get("architecture","sepformer_dns_transfer")
-        source={"sepformer_dns_transfer":"speechbrain/sepformer-dns4-16k-enhancement","sepformer_wham_transfer":"speechbrain/sepformer-wham16k-enhancement"}[family]
+        source,revision=speechbrain_spec(family)
         savedir=Path("/tmp/ralph_v4_sepformer")/family if Path("/kaggle").exists() else WORK/family
-        engine=SepformerSeparation.from_hparams(source=source,savedir=str(savedir),run_opts={"device":"cpu"},freeze_params=False)
+        engine=SepformerSeparation.from_hparams(source=source,revision=revision,local_strategy=strategy,savedir=str(savedir),run_opts={"device":"cpu"},freeze_params=False)
         archive_speechbrain_config(savedir,family)
         if int(engine.hparams.num_spks)!=1: raise ValueError("Expected one enhanced source")
         self.encoder=engine.mods.encoder.requires_grad_(False)
