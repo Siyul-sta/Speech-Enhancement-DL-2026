@@ -127,4 +127,5 @@ def construct(mod,family,root,meta):
                 self.encoder=modules["encoder"]
                 self.masknet=modules["masknet"]
                 self.decoder=modules["decoder"]
+                if hasattr(mod,"sepformer_scale_policy"): self.scale_policy=mod.sepformer_scale_policy(family)
     return LocalSpeechBrain()
