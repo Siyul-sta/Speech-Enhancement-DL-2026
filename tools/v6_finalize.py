@@ -200,7 +200,7 @@ def finalize(args):
     for i,spec in enumerate(specs):
         single=out/f"single_{i:02d}";shutil.copytree(root,single)
         cp=single/"gate.pt";cp.unlink(missing_ok=True)
-        seal_package(single,{"protocol":"v6-offline-v1","experts":specs,"alignment":"none","weights":[float(k==i) for k in range(len(specs))]})
+        seal_package(single,{"protocol":"v6-offline-v1","experts":[spec],"alignment":"none","weights":[1.]})
         tests.append((f"single_{i:02d}",single))
     scores=[]
     for name,p in tests:
@@ -214,7 +214,7 @@ def finalize(args):
         except Exception as exc: scores.append({"name":name,"status":"REJECTED","reason":repr(exc)})
     success=[x for x in scores if x["status"]=="COMPLETE"]
     report={"protocol":"v6-finalize-v1","accepted":accepted,"rejected":rejected,"train_fit_count":len(fit_ids),"train_select_count":len(select_ids),
-            "train_manifest_sha256":train_sha,"gate_selection":best,"gate_candidates":candidates,"validation_results":scores,
+            "train_manifest_sha256":train_sha,"validation_manifest_sha256":ctl.sha(val),"gate_selection":best,"gate_candidates":candidates,"validation_results":scores,
             "caveat":"Legacy experts may have seen the gate training/selection speakers; independent audit is still necessary."}
     if not success:
         write(out/"final_report.json",report);raise RuntimeError("All offline development evaluations failed")
@@ -224,9 +224,40 @@ def finalize(args):
     write(out/"final_report.json",report)
     print("V6 CHAMPION",winner["pesq"],frozen,flush=True)
 
+def audit(args):
+    core.no_uncertain_prior_jobs()
+    final=args.final.resolve();package=final/"champion"
+    report=json.loads((final/"final_report.json").read_text(encoding="utf-8"))
+    offline.verify_package(package)
+    if ctl.sha(package/"package_manifest.json")!=report["champion"]["manifest_sha256"]: raise ValueError("Frozen champion changed")
+    data=args.data_root.resolve();audit_root=args.audit_root.resolve();manifest=args.manifest.resolve()
+    if data==audit_root or audit_root.is_relative_to(data) or data.is_relative_to(audit_root) or not manifest.is_relative_to(audit_root): raise ValueError("Audit root must be independent")
+    if ctl.sha(data/"train/samples.csv")!=report["train_manifest_sha256"] or ctl.sha(data/"validation/samples.csv")!=report["validation_manifest_sha256"]: raise ValueError("Challenge manifests changed")
+    if not args.confirm_heldout: raise ValueError("Confirm independent audit provenance before scoring")
+    overlap=old_final.audit_disjoint(data,audit_root,manifest)
+    marker=core.OUTPUT/"v57_audit_seal.json";marker.parent.mkdir(parents=True,exist_ok=True)
+    payload={"status":"STARTED","champion":report["champion"]["manifest_sha256"],"manifest":ctl.sha(manifest),"provenance":args.provenance,"overlap":overlap}
+    with marker.open("x",encoding="utf-8") as f: json.dump(payload,f,indent=2)
+    invoke(package,"--data-root",audit_root,"--manifest",manifest,"--count",overlap["audit_files"],"--output",final/"independent_audit")
+    payload["status"]="COMPLETE";write(marker,payload)
+    print("Independent audit recorded; no further training/tuning",flush=True)
+
 def main():
-    p=argparse.ArgumentParser(description=__doc__);p.add_argument("--data-root",type=Path,required=True);p.add_argument("--out",type=Path,required=True)
-    p.add_argument("--top",type=int,default=3,choices=range(1,6));p.add_argument("--gate-epochs",type=int,default=12,choices=range(1,51))
-    p.add_argument("--mp-root",type=Path);p.add_argument("--cmgan-root",type=Path);p.add_argument("--allow-public-download",action="store_true")
-    finalize(p.parse_args())
+    p=argparse.ArgumentParser(description=__doc__)
+    sub=p.add_subparsers(dest="command",required=True)
+    a=sub.add_parser("select");a.add_argument("--data-root",type=Path,required=True);a.add_argument("--out",type=Path,required=True)
+    a.add_argument("--top",type=int,default=3,choices=range(1,6));a.add_argument("--gate-epochs",type=int,default=12,choices=range(1,51))
+    a.add_argument("--mp-root",type=Path);a.add_argument("--cmgan-root",type=Path);a.add_argument("--allow-public-download",action="store_true")
+    b=sub.add_parser("audit");b.add_argument("--final",type=Path,required=True);b.add_argument("--data-root",type=Path,required=True)
+    b.add_argument("--audit-root",type=Path,required=True);b.add_argument("--manifest",type=Path,required=True)
+    b.add_argument("--confirm-heldout",action="store_true");b.add_argument("--provenance",required=True)
+    args=p.parse_args()
+    core.no_uncertain_prior_jobs()
+    import os
+    lock=core.OUTPUT/"active.lock";lock.parent.mkdir(parents=True,exist_ok=True)
+    with lock.open("x",encoding="utf-8") as f: f.write(str(os.getpid()))
+    try:
+        if args.command=="select": finalize(args)
+        else: audit(args)
+    finally: lock.unlink(missing_ok=True)
 if __name__=="__main__": main()
