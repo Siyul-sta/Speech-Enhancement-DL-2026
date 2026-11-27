@@ -250,7 +250,7 @@ def export_recipe_expert(name,model):
             shutil.copy2(WORK/filename,root/filename)
             files[filename]=hashlib.sha256((root/filename).read_bytes()).hexdigest()
         if json.loads((root/"offline_hyperparams.json").read_text())["family"]!=family: raise RuntimeError("Wrong archived public hparams")
-    return {"family":family,"files":files}
+    return {"family":family,"files":files,"scale_policy":getattr(model,"scale_policy","raw")}
 
 
 def run():
@@ -328,6 +328,7 @@ def run():
               "best_validation_pesq_wb":domains["challenge"], "winner":winner, "scores":scores,
               "errors":errors, "selection":"global validation blend, no per-file oracle",
               "v571_recipe":bool(EXPERIMENT_CONFIG.get("v571_recipe")),"recipe_experts":recipe_experts,
+              "sepformer_scale_policies":EXPERIMENT_CONFIG.get("sepformer_scale_policies",{}),
               "seed":42,"model_family":"public","v56_key":EXPERIMENT_CONFIG.get("v56_key"),
               "v56_source_sha":EXPERIMENT_CONFIG.get("v56_source_sha"),"v56_action":EXPERIMENT_CONFIG.get("v56_action"),
               "v56_requested_epochs":EXPERIMENT_CONFIG.get("epochs") if EXPERIMENT_CONFIG.get("v56_key") else None}
