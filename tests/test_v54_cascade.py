@@ -116,6 +116,23 @@ class V54Tests(unittest.TestCase):
             r["cascade_scores"]["residual"]["challenge"]=2.1
             with self.assertRaises(ValueError): v4.verify_cascade_result(p,r,"v4_external")
 
+    def test_controller_runs_only_bounded_suite(self):
+        import shutil
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d)
+            (root/"src").mkdir()
+            for path in (ROOT/"src").glob("kaggle_v4*.py"): shutil.copy(path,root/"src"/path.name)
+            calls=[]
+            def fake(kaggle,source,tag,i,kind,config=None):
+                calls.append((kind,config))
+                return {"kind":kind,"ref":"owner/job-"+str(i)},{"joint_score":2.4,"robust_score":2.3,"best_validation_pesq_wb":2.4,"external_validation_pesq_wb":2.4,"model_family":config["architecture"],"v54_stage":config["v54_stage"],"v54_requested_epochs":8}
+            with patch.object(v4,"ROOT",root),patch.object(v4.core,"OUTPUT",root/"runs"),patch.object(v4.shutil,"which",return_value="mock"),patch.object(v4.legacy,"require_quota"),patch.object(v4,"submit",fake),patch.object(v4,"propose_config",side_effect=AssertionError("Controlled suite must not call adaptive proposer")),patch.object(sys,"argv",["ralph_v4","--loop","--v54-suite","--epochs","8","--max-rounds","2","--execute"]):
+                v4.main()
+            self.assertEqual([k for k,c in calls],["v4_external","v4_external"])
+            self.assertEqual([c["v54_stage"] for k,c in calls],["native-two","native-three"])
+            self.assertTrue(all(c["warm_ref"] is None and c["selection_target"]=="challenge" and c["batch_size"]==1 for k,c in calls))
+            self.assertFalse((root/"runs"/"active.lock").exists())
+
     @unittest.skipUnless(os.environ.get("V5_TEST_PUBLIC_CMGAN")=="1","opt-in real CMGAN")
     def test_actual_cmgan_frozen_cascade(self):
         with tempfile.TemporaryDirectory() as d,patch.object(t,"WORK",Path(d)):
