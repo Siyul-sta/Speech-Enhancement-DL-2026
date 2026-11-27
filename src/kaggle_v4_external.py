@@ -997,7 +997,7 @@ def update_ema(teacher,model):
         if t.is_floating_point(): t.lerp_(p,0.01)
         else: t.copy_(p)
 
-def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,scaler=None,critic=None,critic_optimizer=None,pesq_fn=None,metric_weight=0.,update_critic=False):
+def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,scaler=None,critic=None,critic_optimizer=None,pesq_fn=None,metric_weight=0.,update_critic=False,metric_probe=None):
     variant=cfg["id"]
     optimizer.zero_grad(set_to_none=True)
     # Only convolutional forward uses AMP; STFT, objectives and teachers stay FP32.
@@ -1033,7 +1033,13 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
             critic_step(critic,critic_optimizer,pred,noisy,clean,pesq_fn)
         if metric_weight>0:
             critic.eval().requires_grad_(False)
-            loss=loss+metric_weight*(1-critic(pred.float().clamp(-1,1),clean.float().clamp(-1,1))).square().mean()
+            metric_loss=metric_weight*(1-critic(pred.float().clamp(-1,1),clean.float().clamp(-1,1))).square().mean()
+            if metric_probe is not None:
+                grad=torch.autograd.grad(metric_loss,pred,retain_graph=True)[0]
+                norm=float(grad.detach().norm())
+                if not math.isfinite(norm) or norm<=0: raise RuntimeError("PESQ surrogate gradient is zero or non-finite")
+                metric_probe["gradient_norm"]=norm
+            loss=loss+metric_loss
     if not torch.isfinite(loss):
         raise RuntimeError("Non-finite train loss")
     if scaler is not None:
@@ -1287,6 +1293,9 @@ def run():
     history = []
     started = time.monotonic()
     epoch_times=[]
+    metric_probe={}
+    critic_updates=0
+    metric_steps=0
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
         if perf or cfg.get("challenge_remix") or cfg.get("v5_stage"): set_data_epoch(train_set,epoch)
@@ -1294,7 +1303,12 @@ def run():
         epoch_started=time.monotonic()
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
             noisy, clean = noisy.to(device,non_blocking=True), clean.to(device,non_blocking=True)
-            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None,scaler=scaler,critic=critic,critic_optimizer=critic_optimizer,pesq_fn=pesq_function,metric_weight=(0.05 if epoch>=3 else 0.),update_critic=(batch_idx%8==1)))
+            metric_active=critic is not None and epoch>=3
+            update_metric=critic is not None and batch_idx%8==1
+            probe=metric_probe if smoke and metric_active and not metric_probe else None
+            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None,scaler=scaler,critic=critic,critic_optimizer=critic_optimizer,pesq_fn=pesq_function,metric_weight=(0.05 if metric_active else 0.),update_critic=update_metric,metric_probe=probe))
+            critic_updates+=int(update_metric)
+            metric_steps+=int(metric_active)
             if batch_idx==1 or batch_idx%10==0 or batch_idx==len(train_loader):
                 telemetry={"event":"batch","epoch":epoch,"epochs":int(cfg["epochs"]),"batch":batch_idx,"batches":len(train_loader),"loss":float(losses[-1]),"elapsed_s":time.monotonic()-epoch_started}
                 if device.type=="cuda":
@@ -1332,6 +1346,8 @@ def run():
         if not perf and epoch >= 5 and stale >= int(cfg["patience"]):
             break
 
+    if cfg.get("smoke_metric_protocol")=="v5.1-three-epoch" and (critic_updates<1 or metric_steps<1 or not metric_probe):
+        raise RuntimeError("Metric smoke did not exercise critic and generator gradients")
     model.load_state_dict(torch.load(WORK / "best_model.pt", map_location=device, weights_only=True))
     best_score, rows = evaluate(model, val_loader, device, pesq_function, save_rows=True)
     write_csv(WORK / "validation_per_file.csv", ["index", "pesq_wb"], rows)
@@ -1345,6 +1361,10 @@ def run():
         metrics={"error":repr(exc)}
     result = {
         "smoke":bool(cfg.get("smoke")),
+        "smoke_metric_protocol":cfg.get("smoke_metric_protocol"),
+        "critic_updates":critic_updates,
+        "metric_generator_steps":metric_steps,
+        "metric_gradient_norm":metric_probe.get("gradient_norm"),
         "precision":"amp_fp16_forward_fp32_loss" if use_amp else "fp32",
         "perf_reproducible":perf,
         "loader_workers":train_loader.num_workers,
