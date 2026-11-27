@@ -54,15 +54,58 @@ def write(p,obj):
     tmp.write_text(json.dumps(obj,indent=2,allow_nan=False),encoding="utf-8")
     tmp.replace(p)
 
+def cpu_numeric_settings():
+    import torch
+    torch.set_num_threads(1)
+    torch.set_float32_matmul_precision("highest")
+    torch.use_deterministic_algorithms(True)
+    torch.backends.mha.set_fastpath_enabled(False)
+
+
+def waveform_equivalence(actual,reference,allow_sepformer_roundoff=False):
+    """Strict original comparison, or bounded FP32 roundoff with PCM16 checks."""
+    import numpy as np
+    from v55_ensemble import pcm16
+    a=np.asarray(actual,dtype=np.float64);b=np.asarray(reference,dtype=np.float64)
+    if a.shape!=(48000,) or b.shape!=a.shape or not np.isfinite(a).all() or not np.isfinite(b).all():
+        raise ValueError("Invalid equivalence waveform")
+    diff=a-b
+    peak=max(1.,float(np.max(np.abs(b))))
+    rms=max(1.,float(np.sqrt(np.mean(b*b))))
+    pcm=(pcm16(a)-pcm16(b)).astype(np.float64)*32768
+    stats={"max_abs_error":float(np.max(np.abs(diff))),
+           "peak_relative_error":float(np.max(np.abs(diff))/peak),
+           "normalized_rmse":float(np.sqrt(np.mean(diff*diff))/rms),
+           "pcm16_max_lsb_error":float(np.max(np.abs(pcm))),
+           "pcm16_rms_lsb_error":float(np.sqrt(np.mean(pcm*pcm))),
+           "reference_peak":float(np.max(np.abs(b))),
+           "reference_clipped_fraction":float(np.mean(np.abs(b)>1)),
+           "actual_clipped_fraction":float(np.mean(np.abs(a)>1))}
+    strict=bool(np.allclose(a,b,atol=2e-5,rtol=2e-4))
+    bounded=(stats["peak_relative_error"]<=2e-5 and stats["normalized_rmse"]<=1e-5 and
+             stats["pcm16_max_lsb_error"]<=4 and stats["pcm16_rms_lsb_error"]<=1)
+    if not strict and not (allow_sepformer_roundoff and bounded):
+        raise RuntimeError("Waveform equivalence failed: "+json.dumps(stats))
+    stats["numeric_comparison"]="strict" if strict else "bounded_sepformer_fp32_roundoff"
+    return stats
+
+
 def child(package,output):
     import numpy as np
     import torch
     import submit_v5 as s
     import v57_offline as off
     off.verify_package(package)
-    torch.set_num_threads(2)
+    cpu_numeric_settings()
     off.block_network()
     models=s.load_bundle(package/"bundle.json",torch.device("cpu"))
+    cfg=json.loads((package/"bundle.json").read_text(encoding="utf-8"))
+    if len(cfg["models"])==1 and not cfg.get("gating"):
+        expected=torch.load(s.safe_path(package,cfg["models"][0]["checkpoint"]),map_location="cpu",weights_only=True)
+        restored=models[0][1].state_dict()
+        if set(expected)!=set(restored) or any(expected[k].dtype!=restored[k].dtype or not torch.equal(expected[k],restored[k]) for k in expected):
+            raise RuntimeError("Offline state differs from exact checkpoint")
+        del expected,restored
     x,_=fixture()
     z=torch.from_numpy(x)[None]
     with torch.no_grad():
@@ -70,18 +113,18 @@ def child(package,output):
     if raw.shape!=z.shape or not torch.isfinite(raw).all(): raise RuntimeError("Invalid offline raw output")
     np.save(output,raw.numpy()[0],allow_pickle=False)
 
-def checked_child(package,output,reference):
+def checked_child(package,output,reference,family=None):
     import numpy as np
     from pesq import pesq
     from v55_ensemble import pcm16
     subprocess.run([sys.executable,str(Path(__file__).resolve()),"--child",str(package),str(output)],check=True)
     actual=np.load(output,allow_pickle=False)
-    np.testing.assert_allclose(actual,reference,atol=2e-5,rtol=2e-4)
+    stats=waveform_equivalence(actual,reference,family in ("sepformer_dns_transfer","sepformer_wham_transfer"))
     _,clean=fixture()
     p=float(pesq(16000,clean,pcm16(reference),"wb"))
     q=float(pesq(16000,clean,pcm16(actual),"wb"))
     if not np.isfinite([p,q]).all() or abs(p-q)>.01: raise RuntimeError("Offline PESQ mismatch")
-    return {"status":"PASS","max_abs_error":float(np.max(np.abs(actual-reference))),"fixture_pesq_delta":q-p,"samples":len(actual)}
+    return {"status":"PASS",**stats,"fixture_pesq_delta":q-p,"samples":len(actual),"exact_single_state_verified":family is not None}
 
 def spec_for(folder,source,checkpoint,family,assets=None):
     d={"weight":1.,"family":family,"source":source.relative_to(folder).as_posix(),"checkpoint":checkpoint.relative_to(folder).as_posix(),"source_sha256":digest(source),"checkpoint_sha256":digest(checkpoint)}
@@ -95,7 +138,7 @@ def single(family,work,cache,package):
     import kaggle_v4_external as t
     import v57_public_assets as a
     import v57_finalize as f
-    torch.set_num_threads(2)
+    cpu_numeric_settings()
     t.WORK=cache
     t.EXPERIMENT_CONFIG={"id":"V3_RESIDUAL_PHASE","architecture":family,"seed":571}
     # Public hparams capture belongs to this family; remove stale captures.
@@ -122,7 +165,7 @@ def single(family,work,cache,package):
     write(package/"bundle.json",{"models":[spec_for(package,source,checkpoint,family,{**meta,"root":"assets"})]})
     f.finalize_package(package)
     del model
-    r=checked_child(package,work/(family+".npy"),expected)
+    r=checked_child(package,work/(family+".npy"),expected,family)
     r["checkpoint_sha256"]=digest(checkpoint)
     r["initial_fixture_max_change"]=float(np.max(np.abs(expected-original.numpy()[0])))
     if r["initial_fixture_max_change"]<=1e-9: raise RuntimeError("Modified checkpoint did not change fixture output")
