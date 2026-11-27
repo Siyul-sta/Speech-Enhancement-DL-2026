@@ -62,6 +62,13 @@ def verify(folder, kind="v4_public"):
             for name,value in zip(("challenge","external_normal","external_stress"),domains):
                 actual=float(r["domain_scores"][name])
                 if not math.isfinite(actual) or abs(actual-value)>1e-6: raise ValueError("Invalid domain score")
+    if r.get("v52_stage"):
+        if kind!="v4_external" or r.get("critic_reserved_train_files")!=32 or r.get("transductive_noisy") or r.get("self_supervised") or r.get("v52_requested_epochs",0)<5:
+            raise ValueError("Invalid V5.2 controlled training metadata")
+        if r.get("pesq_aware"):
+            cal=r.get("critic_last_calibration") or {}
+            if cal.get("count")!=32 or r.get("critic_optimizer_steps",0)<1 or not (folder/"critic_history.json").is_file():
+                raise ValueError("Missing V5.2 critic evidence")
     if kind=="v4_smoke":
         if not r.get("smoke"): raise ValueError("Incomplete isolated smoke run")
         if r.get("smoke_metric_protocol")=="v5.1-three-epoch":
@@ -91,7 +98,7 @@ def history():
     return records
 
 
-def v52_stage_plan(records,failures):
+def v52_stage_plan(records,failures,epochs=None):
     """Controlled cumulative ablations, same holdout, seed, size and external profile."""
     stages=[
         ("phase-control","residual_relaxed",False,False,False,False,False),
@@ -102,7 +109,7 @@ def v52_stage_plan(records,failures):
         ("fixed-critic","complex_residual",True,True,True,True,False),
         ("adaptive-critic","complex_residual",True,True,True,True,True),
     ]
-    done={r.get("v52_stage") for st,r in records}
+    done={r.get("v52_stage") for st,r in records if epochs is None or r.get("v52_requested_epochs")==epochs}
     failed={x["plan"].get("v52_stage") for x in failures}
     for name,arch,phase,empirical,balanced,metric,adaptive in stages:
         if name in done or name in failed: continue
@@ -392,7 +399,7 @@ def main():
                 discovery=catalog.discover()
                 core.json_write(core.OUTPUT/("run_"+tag)/"public_research.json",discovery)
             if args.v52_suite:
-                plan=v52_stage_plan(records,failures)
+                plan=v52_stage_plan(records,failures,args.epochs)
                 if plan is None:
                     print("V5.2 controlled suite exhausted; review reports before continuing",flush=True)
                     break
