@@ -287,7 +287,7 @@ def critic_step(critic, optimizer, pred, noisy, clean, pesq_fn):
     optimizer.zero_grad(set_to_none=True)
     loss=F.mse_loss(critic(candidates,reference),labels)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(critic.parameters(),5.)
+    torch.nn.utils.clip_grad_norm_(critic.parameters(),5.,error_if_nonfinite=True)
     optimizer.step()
     critic.eval().requires_grad_(False)
     return float(loss.detach())
@@ -1053,7 +1053,7 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
         if scaler.get_scale()>=scale_before: update_ema(teacher,model)
     else:
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(model.parameters(),5.0)
+        torch.nn.utils.clip_grad_norm_(model.parameters(),5.0,error_if_nonfinite=True)
         optimizer.step()
         update_ema(teacher,model)
     return float(loss.detach())
