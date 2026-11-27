@@ -327,6 +327,68 @@ def critic_step(critic, optimizer, pred, noisy, clean, pesq_fn):
     return float(loss.detach())
 
 
+class CriticReplay:
+    """Bounded CPU-only replay of train reference groups; no audio persisted."""
+    def __init__(self,capacity=64,seed=42):
+        from collections import deque
+        if capacity<2: raise ValueError("Replay capacity must be >=2")
+        self.items=deque(maxlen=capacity)
+        self.rng=random.Random(seed)
+    def add(self,candidates,reference,labels):
+        self.items.append(tuple(x.detach().cpu().clone() for x in (candidates,reference,labels)))
+    def sample(self,n,device):
+        items=self.rng.sample(list(self.items),min(n,len(self.items)))
+        return tuple(torch.stack([item[i] for item in items]).to(device) for i in range(3))
+
+
+def quality_group(pred,noisy,clean):
+    # Multiple quality levels on the same reference, for relative ranking.
+    return torch.stack((pred,noisy,.5*noisy+.5*clean,clean),dim=1).clamp(-1,1)
+
+
+def rank_regression_loss(pred,label):
+    reg=F.mse_loss(pred,label)
+    gap=label[:,:,None]-label[:,None,:]
+    pred_gap=pred[:,:,None]-pred[:,None,:]
+    valid=gap>.04
+    rank=F.relu(.5*gap-pred_gap)
+    return reg+.25*(rank*valid).sum()/valid.sum().clamp_min(1)
+
+
+def critic_replay_step(critic,optimizer,replay,pred,noisy,clean,pesq_fn):
+    with torch.no_grad():
+        ref=clean[:1].detach().float().clamp(-1,1)
+        cand=quality_group(pred[:1].detach().float(),noisy[:1].float(),ref)[0]
+        refs=ref.expand_as(cand)
+        scores=score_waveforms(refs.cpu().numpy(),cand.cpu().numpy(),pesq_fn,workers=0)
+        label=torch.tensor(scores,device=ref.device,dtype=ref.dtype).add(.5).div(5.2).clamp(0,1)
+        replay.add(cand,refs,label)
+    critic.train().requires_grad_(True)
+    loss=0.
+    # Fresh example plus replay; repeated updates on cached PESQ targets.
+    for k in range(2):
+        if k==0: x,r,y=cand[None],refs[None],label[None]
+        else: x,r,y=replay.sample(2,ref.device)
+        optimizer.zero_grad(set_to_none=True)
+        p=critic(x.flatten(0,1),r.flatten(0,1)).reshape_as(y)
+        objective=rank_regression_loss(p,y)
+        if not torch.isfinite(objective): raise RuntimeError("Non-finite critic loss")
+        objective.backward()
+        torch.nn.utils.clip_grad_norm_(critic.parameters(),5.,error_if_nonfinite=True)
+        optimizer.step()
+        loss+=float(objective.detach())
+    critic.eval().requires_grad_(False)
+    return loss/2
+
+
+def adaptive_metric_weight(calibration,epoch,updates):
+    # Pre-registered engineering gate; no challenge validation score used.
+    if epoch<3 or updates<16 or not calibration: return 0.
+    corr=calibration.get("pearson")
+    if corr is None or corr<.6 or calibration["mae"]>.5: return 0.
+    return .05*min(1.,max(0.,(epoch-2)/3))
+
+
 def phase_complex_loss(pred,clean):
     """Power-compressed complex loss and target-energy-weighted circular phase loss.
     Phase comparison uses normalized complex vectors, not discontinuous raw angles.
@@ -1055,7 +1117,7 @@ def update_ema(teacher,model):
         if t.is_floating_point(): t.lerp_(p,0.01)
         else: t.copy_(p)
 
-def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,scaler=None,critic=None,critic_optimizer=None,pesq_fn=None,metric_weight=0.,update_critic=False,metric_probe=None):
+def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,scaler=None,critic=None,critic_optimizer=None,pesq_fn=None,metric_weight=0.,update_critic=False,metric_probe=None,critic_replay=None):
     variant=cfg["id"]
     optimizer.zero_grad(set_to_none=True)
     # Only convolutional forward uses AMP; STFT, objectives and teachers stay FP32.
@@ -1089,7 +1151,8 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
         loss=loss+0.2*F.l1_loss(pred,clean)
     if critic is not None:
         if update_critic:
-            critic_step(critic,critic_optimizer,pred,noisy,clean,pesq_fn)
+            if critic_replay is None: critic_step(critic,critic_optimizer,pred,noisy,clean,pesq_fn)
+            else: critic_replay_step(critic,critic_optimizer,critic_replay,pred,noisy,clean,pesq_fn)
         if metric_weight>0:
             critic.eval().requires_grad_(False)
             metric_loss=metric_weight*(1-critic(pred.float().clamp(-1,1),clean.float().clamp(-1,1))).square().mean()
@@ -1228,6 +1291,8 @@ def run():
     data_fingerprint=None
     training_fingerprint=None
     root=None
+    critic_dev=None
+    heldout=[]
     if not smoke:
         tr, dv, tn, dn, ts, tnoise = public_assets(evaluation_only=is_audit,include_test=is_audit)
     if not is_audit:
@@ -1236,6 +1301,12 @@ def run():
         if len(train_set) != 1296:
             raise RuntimeError("Unexpected train split size")
         original_train=train_set
+        if cfg.get("v52_stage"):
+            # Same fixed, disjoint train-only holdout for every V5.2 ablation.
+            heldout=sorted(np.random.default_rng(52042).choice(len(original_train),32,replace=False).tolist())
+            heldout_set=set(heldout)
+            critic_dev=make_loader(torch.utils.data.Subset(original_train,heldout),4,False,device)
+            train_set=torch.utils.data.Subset(original_train,[i for i in range(len(original_train)) if i not in heldout_set])
         if smoke:
             fixture_train,fixture_val=smoke_pairs(train_set)
             train_set=torch.utils.data.ConcatDataset([torch.utils.data.Subset(train_set,list(range(16))),fixture_train])
@@ -1250,7 +1321,7 @@ def run():
             else:
                 train_set=torch.utils.data.ConcatDataset([train_set,SyntheticPairs(tr,tn,int(cfg.get("external_size",1024)),42,True)])
             if cfg.get("challenge_remix",0):
-                train_set=torch.utils.data.ConcatDataset([train_set,ChallengeRemix(original_train,int(cfg["challenge_remix"]),cfg["seed"])])
+                train_set=torch.utils.data.ConcatDataset([train_set,ChallengeRemix(original_train,int(cfg["challenge_remix"]),cfg["seed"],empirical=cfg.get("empirical_remix",False),balanced=cfg.get("balanced_remix",False),exclude=heldout)])
             external_data=torch.utils.data.ConcatDataset([SyntheticPairs(dv,dn,32,2026,False),SyntheticPairs(dv,dn,32,3026,False,stress=True)])
             external_val=make_loader(fixed_pairs(external_data),4,False,device)
         val_set = SpeechPairs(root, "validation")
@@ -1349,6 +1420,10 @@ def run():
     optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
     critic=PESQCritic().to(device) if cfg.get("pesq_aware") else None
     critic_optimizer=torch.optim.AdamW(critic.parameters(),lr=0.0003) if critic is not None else None
+    replay=CriticReplay(seed=cfg["seed"]) if critic is not None and cfg.get("adaptive_critic") else None
+    if replay is not None and critic_dev is None: raise ValueError("Adaptive critic requires disjoint train-only calibration")
+    critic_reports=[]
+    last_calibration=None
     use_amp=bool(cfg.get("amp")) and device.type=="cuda" and cfg.get("architecture") in ("temporal","composed")
     scaler=torch.amp.GradScaler("cuda") if use_amp else None
     print(f"TRAIN_PRECISION={'amp_fp16_forward_fp32_loss' if use_amp else 'fp32'}",flush=True)
@@ -1378,12 +1453,13 @@ def run():
         if perf or cfg.get("challenge_remix") or cfg.get("v5_stage"): set_data_epoch(train_set,epoch)
         losses = []
         epoch_started=time.monotonic()
+        weight=adaptive_metric_weight(last_calibration,epoch,critic_updates*2) if replay is not None else (.05 if critic is not None and epoch>=3 else 0.)
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
             noisy, clean = noisy.to(device,non_blocking=True), clean.to(device,non_blocking=True)
-            metric_active=critic is not None and epoch>=3
-            update_metric=critic is not None and batch_idx%8==1
+            metric_active=critic is not None and weight>0
+            update_metric=critic is not None and (batch_idx-1)%(4 if replay is not None else 8)==0
             probe=metric_probe if smoke and metric_active and not metric_probe else None
-            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None,scaler=scaler,critic=critic,critic_optimizer=critic_optimizer,pesq_fn=pesq_function,metric_weight=(0.05 if metric_active else 0.),update_critic=update_metric,metric_probe=probe))
+            losses.append(supervised_step(model,optimizer,noisy,clean,cfg,distill,teacher if unlabeled_loader is not None else None,scaler=scaler,critic=critic,critic_optimizer=critic_optimizer,pesq_fn=pesq_function,metric_weight=weight,update_critic=update_metric,metric_probe=probe,critic_replay=replay))
             critic_updates+=int(update_metric)
             metric_steps+=int(metric_active)
             if batch_idx==1 or batch_idx%10==0 or batch_idx==len(train_loader):
@@ -1398,6 +1474,14 @@ def run():
             for k,x in enumerate(unlabeled_loader):
                 if k>=64: break
                 consistency_step(model,optimizer,teacher,x.to(device),cfg.get("self_mode","consistency"))
+        if critic is not None and critic_dev is not None:
+            last_calibration=critic_calibration(model,critic,critic_dev,device,pesq_function)
+            last_calibration["split"]="reserved train-only pairs (32)"
+            last_calibration["final_epoch_model"]=False
+            report={"epoch":epoch,"metric_weight":weight,"critic_label_groups":critic_updates,"critic_optimizer_steps":critic_updates*(2 if replay is not None else 1),**last_calibration}
+            critic_reports.append(report)
+            print("V52_CRITIC "+json.dumps(report,allow_nan=False),flush=True)
+            (WORK/"critic_history.json").write_text(json.dumps(critic_reports,indent=2,allow_nan=False),encoding="utf-8")
         scheduler.step()
         val_pesq, _ = evaluate(model, val_loader, device, pesq_function)
         external_pesq, domain_rows = evaluate(model, external_val, device, pesq_function, save_rows=True)
@@ -1479,6 +1563,14 @@ def run():
         "loss_mode":cfg.get("loss_mode","base"),
         "pesq_aware":bool(cfg.get("pesq_aware")),
         "v5_stage":cfg.get("v5_stage"),
+        "v52_stage":cfg.get("v52_stage"),
+        "phase_loss":bool(cfg.get("phase_loss")),
+        "empirical_remix":bool(cfg.get("empirical_remix")),
+        "balanced_remix":bool(cfg.get("balanced_remix")),
+        "adaptive_critic":bool(cfg.get("adaptive_critic")),
+        "critic_reserved_train_files":len(heldout),
+        "critic_optimizer_steps":critic_updates*(2 if replay is not None else 1),
+        "critic_last_calibration":last_calibration,
         "challenge_remix":int(cfg.get("challenge_remix",0)),
         "loss_weights":cfg.get("loss_weights"),
         "data_profile":cfg.get("data_profile","base"),
