@@ -133,13 +133,9 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
     limit=min(remaining,job_limit)
     def affordable(c): return c["v56_key"] not in entries and estimate(c,entries)<=limit
     def with_smoke(c):
-        # Same base/depth/critic/crop and mode for smoke; no actual parent required.
-        if c["v6_parent_coarse"] or c.get("v6_depth"):
-            # Cascade smoke must use its actual parent to exercise exact reconstruction.
-            # For that case use pilot itself only after a verified offline cascade probe.
-            if not args.enable_cascade: return None
-            return c if affordable(c) else None
-        s=config(c["architecture"],"train",code_sha,policies,epochs=2,mix=16,public_mix=16,critic=False,smoke=True)
+        # Same architecture/depth/critic/crop; synthetic smoke does not claim parent reproduction.
+        s=config(c["architecture"],c["v6_mode"],code_sha,policies,epochs=2,mix=16,public_mix=16,
+            critic=c["v6_critic"],base=c.get("v6_base_family"),depth=c.get("v6_depth"),smoke=True)
         if s["v56_key"] in entries:
             st,r,_,_=entries[s["v56_key"]]
             return c if r and st["status"]=="COMPLETE" and affordable(c) else None
@@ -162,7 +158,16 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
         c=config(family,"train",code_sha,policies,cache,epochs=args.pilot_epochs,mix=args.mix,public_mix=args.public_mix,parent=parent)
         trial=with_smoke(c)
         if trial: pilots.append(trial)
-    # Eligible continuations, one branch per parent for each distinct hypothesis.
+    # One continuation per exact parent/recipe, including terminal failures.
+    tried=set()
+    for st,r,c,folder in entries.values():
+        if st.get("v56_source_sha")!=code_sha: continue
+        if c is None: c=config_of(folder)
+        p=c.get("v6_parent")
+        if p and not c["smoke"]:
+            tried.add((p["ref"],c["architecture"],c.get("v6_base_family"),c.get("v6_depth"),c["v6_mix"],c["v6_public_mix"],c["v6_korean"],c["v6_hard"],c["v6_critic"]))
+    def identity(c):
+        return (c["v6_parent"]["ref"],c["architecture"],c.get("v6_base_family"),c.get("v6_depth"),c["v6_mix"],c["v6_public_mix"],c["v6_korean"],c["v6_hard"],c["v6_critic"])
     extensions=[]
     for st,r,c in sorted(trained,key=lambda a:-a[1]["best_validation_pesq_wb"]):
         m=r["v6"];p=parent_info(st,r)
@@ -177,8 +182,10 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
             nxt=config(c["architecture"],c["v6_mode"],code_sha,policies,cache,epochs=n,mix=c["v6_mix"],public_mix=c["v6_public_mix"],
                 korean=c["v6_korean"],critic=c["v6_critic"],hard=c["v6_hard"],parent=p,base=c.get("v6_base_family"),depth=c.get("v6_depth"),
                 lr=max(1e-8,min(float(c["lr"])*.5,float(m["lr"]))))
-            if affordable(nxt):
-                extensions.append((r["best_validation_pesq_wb"]+.05*min(1.,m["gain"]/max(.01,estimate(nxt,entries))),nxt));break
+            if identity(nxt) in tried: break
+            trial=with_smoke(nxt)
+            if trial:
+                extensions.append((r["best_validation_pesq_wb"]+.05*min(1.,m["gain"]/max(.01,estimate(nxt,entries))),trial));break
     # New hypotheses: more data, Korean, hard mining and calibrated critic. Explicit separate candidates.
     variants=[]
     if trained:
@@ -189,20 +196,30 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
             common=dict(epochs=cap,mix=c["v6_mix"],public_mix=c["v6_public_mix"],parent=p,lr=max(1e-8,float(c["lr"])*.5))
             if c["v6_mix"]<args.max_mix:
                 q=config(c["architecture"],"train",code_sha,policies,cache,**{**common,"mix":min(args.max_mix,c["v6_mix"]*2)},korean=c["v6_korean"],hard=c["v6_hard"],critic=c["v6_critic"])
-                if affordable(q): variants.append(q)
+                if identity(q) not in tried:
+                    trial=with_smoke(q)
+                    if trial: variants.append(trial)
             if args.korean_limit and not c["v6_korean"]:
                 q=config(c["architecture"],"train",code_sha,policies,cache,**common,korean=args.korean_limit,hard=c["v6_hard"],critic=c["v6_critic"])
-                if affordable(q): variants.append(q)
+                if identity(q) not in tried:
+                    trial=with_smoke(q)
+                    if trial: variants.append(trial)
             if not c["v6_hard"]:
                 q=config(c["architecture"],"train",code_sha,policies,cache,**common,korean=c["v6_korean"],hard=True,critic=c["v6_critic"])
-                if affordable(q): variants.append(q)
+                if identity(q) not in tried:
+                    trial=with_smoke(q)
+                    if trial: variants.append(trial)
             if not c["v6_critic"] and args.enable_critic:
                 q=config(c["architecture"],"train",code_sha,policies,cache,**common,korean=c["v6_korean"],hard=c["v6_hard"],critic=True)
-                if affordable(q): variants.append(q)
+                if identity(q) not in tried:
+                    trial=with_smoke(q)
+                    if trial: variants.append(trial)
             if args.enable_cascade:
                 for depth in (1,2,3):
                     q=config("v6_cascade", "cascade",code_sha,policies,cache,**common,base=c["architecture"],depth=depth,coarse=True)
-                    if affordable(q): variants.append(q)
+                    if identity(q) not in tried:
+                        trial=with_smoke(q)
+                        if trial: variants.append(trial)
     extensions.sort(key=lambda a:-a[0])
     if pilots and len(trained_families)<args.min_pilots: return pilots[0]
     # Alternate focused extensions with controlled experiments instead of exhausting all variants first.
@@ -278,6 +295,14 @@ def resume(kaggle,wait):
         except legacy.KaggleTerminalFailure: pass
     core.no_uncertain_prior_jobs()
 
+def quota_retry(kaggle,wait_minutes=90):
+    deadline=time.monotonic()+wait_minutes*60
+    while True:
+        try: return v56.quota_hours(kaggle)
+        except (OSError,RuntimeError,subprocess.SubprocessError):
+            if time.monotonic()>=deadline: raise
+            print("V6 QUOTA_NETWORK_WAIT",flush=True);time.sleep(60)
+
 def run(args):
     code=source();code_sha=hashlib.sha256(code.encode()).hexdigest()
     if not args.execute and not args.prepare_cache:
@@ -306,18 +331,18 @@ def run(args):
         require(code_sha,args.data_root,args.families)
         cache=args.public_cache_ref or v4.find_public_cache()
         tag="v4"+datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
-        started=time.monotonic();rounds=0;failures=0;quota=v56.quota_hours(kaggle)
+        started=time.monotonic();rounds=0;failures=0;quota=quota_retry(kaggle)
         budget=args.budget_hours or max(0.,quota-args.reserve_hours)
         while not args.max_rounds or rounds<args.max_rounds:
             core.no_uncertain_prior_jobs()
             if (core.OUTPUT/"v57_audit_seal.json").exists(): raise RuntimeError("Final independent audit sealed")
-            remaining=min(v56.quota_hours(kaggle)-args.reserve_hours,budget-(time.monotonic()-started)/3600)
+            remaining=min(quota_retry(kaggle)-args.reserve_hours,budget-(time.monotonic()-started)/3600)
             if remaining<=0: break
             entries=ledger()
             cfg=choose(entries,code_sha,policies,cache,remaining,args.max_job_minutes/60,args)
             if cfg is None: print("V6 STOP no affordable candidate",flush=True);break
             cost=estimate(cfg,entries)
-            if cost>min(v56.quota_hours(kaggle)-args.reserve_hours,budget-(time.monotonic()-started)/3600): break
+            if cost>min(quota_retry(kaggle)-args.reserve_hours,budget-(time.monotonic()-started)/3600): break
             rounds+=1
             print("V6 PLAN "+json.dumps({"round":rounds,"estimated_hours":cost,"remaining":remaining,"config":cfg}),flush=True)
             try:
