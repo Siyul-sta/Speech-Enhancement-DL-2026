@@ -142,6 +142,9 @@ class ResidualPhaseUNet(nn.Module):
     Both heads operate on shared log-magnitude plus normalized phase features.
     """
 
+    max_gain = 1.0
+    max_phase = 0.5
+
     def __init__(self):
         super().__init__()
         self.enc1 = ConvBlock(3, 16)
@@ -182,14 +185,20 @@ class ResidualPhaseUNet(nn.Module):
         d = self.dec3(self.upcat(d, c))
         d = self.dec2(self.upcat(d, b))
         d = self.dec1(self.upcat(d, a))
-        gain = torch.sigmoid(self.mask_head(d)).squeeze(1)
-        phase_delta = 0.5 * torch.tanh(self.phase_head(d)).squeeze(1)
+        gain = self.max_gain * torch.sigmoid(self.mask_head(d)).squeeze(1)
+        phase_delta = self.max_phase * torch.tanh(self.phase_head(d)).squeeze(1)
         phase_factor = torch.polar(torch.ones_like(phase_delta), phase_delta)
         enhanced_spec = spec * gain * phase_factor
         return torch.istft(
             enhanced_spec, n_fft=N_FFT, hop_length=HOP,
             window=self.window, length=noisy.shape[-1],
         )
+
+class RelaxedPhaseUNet(ResidualPhaseUNet):
+    """Experimental: gains up to 2 and full wrapped phase range."""
+    max_gain = 2.0
+    max_phase = 3.141592653589793
+
 
 def enhancement_loss(pred, clean, variant: str):
     """Phase-aware complex STFT + multi-resolution magnitude + waveform losses."""
@@ -1035,6 +1044,8 @@ def run():
         model = GeneratedEnhancer().to(device)
     elif cfg.get("architecture") == "temporal":
         model = TemporalEnhancer().to(device)
+    elif cfg.get("architecture") == "residual_relaxed":
+        model = RelaxedPhaseUNet().to(device)
     else:
         model = ResidualPhaseUNet().to(device)
     warm_ref = cfg.get("warm_ref")
@@ -1137,8 +1148,9 @@ def run():
         domain_scores=[val_pesq,float(np.mean([r[1] for r in domain_rows[:32]])),float(np.mean([r[1] for r in domain_rows[32:]]))]
         joint = 0.5*float(np.mean(domain_scores))+0.5*min(domain_scores)
         print(f"external_pesq={external_pesq:.4f} joint={joint:.4f}",flush=True)
-        if joint > best_joint + 0.001:
-            best_joint = joint
+        selection_score = val_pesq if cfg.get("selection_target") == "challenge" else joint
+        if selection_score > best_joint + 0.001:
+            best_joint = selection_score
             best_score, best_epoch, stale = val_pesq, epoch, 0
             torch.save(model.state_dict(), WORK / "best_model.pt")
         else:
@@ -1181,6 +1193,7 @@ def run():
         "robust_score":0.5*float(np.mean([best_score,float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))]))+0.5*min(best_score,float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))),
         "distill":bool(cfg.get("distill")),
         "experiment": variant,
+        "selection_target": cfg.get("selection_target","robust"),
         "best_epoch": best_epoch,
         "epochs_completed": len(history),
         "best_validation_pesq_wb": best_score,
