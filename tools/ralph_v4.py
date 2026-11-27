@@ -62,7 +62,13 @@ def verify(folder, kind="v4_public"):
             for name,value in zip(("challenge","external_normal","external_stress"),domains):
                 actual=float(r["domain_scores"][name])
                 if not math.isfinite(actual) or abs(actual-value)>1e-6: raise ValueError("Invalid domain score")
-    if kind=="v4_smoke" and (not r.get("smoke") or r.get("epochs_completed")!=2): raise ValueError("Incomplete isolated smoke run")
+    if kind=="v4_smoke":
+        if not r.get("smoke"): raise ValueError("Incomplete isolated smoke run")
+        if r.get("smoke_metric_protocol")=="v5.1-three-epoch":
+            norm=r.get("metric_gradient_norm")
+            if (r.get("epochs_completed")!=3 or not r.get("pesq_aware") or r.get("critic_updates",0)<1 or r.get("metric_generator_steps",0)<1 or not isinstance(norm,(int,float)) or not math.isfinite(norm) or norm<=0):
+                raise ValueError("Missing real metric-gradient smoke evidence")
+        elif r.get("epochs_completed")!=2: raise ValueError("Incomplete legacy smoke run")
     return r
 
 def history():
@@ -191,6 +197,8 @@ def submit(kaggle, source, tag, i, kind, config=None):
         core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":kind})
         raise
     r=verify(folder,kind)
+    if kind=="v4_smoke" and config and config.get("smoke_metric_protocol") and r.get("smoke_metric_protocol")!=config["smoke_metric_protocol"]:
+        raise ValueError("Remote smoke protocol mismatch")
     core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind})
     if kind=="v4_perf":
         print("PERFORMANCE TRIAL (not ranked)",json.dumps(r),flush=True)
@@ -255,7 +263,7 @@ def main():
     p.add_argument("--perf-benchmark",action="store_true",help="Three paired seeds on full fixed development data; no ranking")
     p.add_argument("--validated-perf-run",action="store_true",help="Run only the exact temporal profile approved by the performance gate")
     p.add_argument("--amp",action="store_true",help="Experimental CUDA mixed precision for temporal/composed convolution models only")
-    p.add_argument("--smoke",action="store_true",help="One isolated two-epoch training smoke; no leaderboard promotion")
+    p.add_argument("--smoke",action="store_true",help="Two epochs, or three with --pesq-aware; no leaderboard promotion")
     p.add_argument("--final-audit",action="store_true",help="Evaluate frozen best non-transductive built-in checkpoint once")
     p.add_argument("--allow-generated-code",action="store_true",help="Opt in to experimental generated Python; AST validation is not a security sandbox")
     p.add_argument("--discover",action="store_true",help="Fetch public dataset/model/paper metadata for strategy selection")
@@ -322,7 +330,7 @@ def main():
         if args.smoke:
             print("SMOKE: no public cache or corpus download required",flush=True)
             legacy.require_quota(kaggle,2)
-            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":2,"batch_size":4,"patience":2,"seed":42,"architecture":args.focus_architecture or "temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":None,"amp":args.amp,"pesq_aware":args.pesq_aware})
+            submit(kaggle,sources["v4_external"],tag,1,"v4_smoke",{"id":"V3_RESIDUAL_PHASE","epochs":3 if args.pesq_aware else 2,"batch_size":4,"patience":2,"seed":42,"architecture":args.focus_architecture or "temporal","external_size":16,"data_profile":"base","smoke":True,"public_cache":None,"amp":args.amp,"pesq_aware":args.pesq_aware,"smoke_metric_protocol":"v5.1-three-epoch" if args.pesq_aware else None})
             return
         if args.final_audit:
             eligible=[(st,r) for st,r in records if st["kind"] in ("v4_external","v4_public") and not r.get("transductive_noisy") and st.get("source_path") and Path(st["source_path"]).is_file()]
