@@ -47,8 +47,17 @@ def load_bundle(config,device):
         spec.loader.exec_module(mod)
         family=mod.EXPERIMENT_CONFIG.get("architecture","residual")
         if s.get("family",family)!=family: raise ValueError("Expert family mismatch")
-        if family not in FAMILIES: raise ValueError("Offline adapter not admitted: "+family)
-        model=getattr(mod,FAMILIES[family])().to(device).eval()
+        if family in FAMILIES:
+            model=getattr(mod,FAMILIES[family])()
+        elif s.get("public_assets"):
+            from v57_public_assets import construct
+            meta=s["public_assets"]
+            asset_root=(config.parent/meta["root"]).resolve()
+            if not asset_root.is_relative_to(config.parent.resolve()) or not asset_root.is_dir():
+                raise ValueError("Public asset path escapes bundle")
+            model=construct(mod,family,asset_root,meta)
+        else: raise ValueError("Offline adapter not admitted: "+family)
+        model=model.to(device).eval()
         model.load_state_dict(torch.load(checkpoint,map_location=device,weights_only=True),strict=True)
         models.append((w,model))
     if not math.isclose(sum(w for w,m in models),1.,abs_tol=1e-6):
@@ -84,7 +93,7 @@ def predict(models,x,device):
     return out.cpu().numpy()[0].clip(-1,1)
 
 def run_directory(models,inp,out,device):
-    if inp.resolve()==out.resolve(): raise ValueError("Input and output must differ")
+    if inp.resolve()==out.resolve() or out.resolve().is_relative_to(inp.resolve()): raise ValueError("Output must be outside input directory")
     files=sorted(p for p in inp.iterdir() if p.is_file() and p.suffix.lower()==".wav")
     if not files: raise ValueError("No WAV input")
     out.mkdir(parents=True,exist_ok=True)
