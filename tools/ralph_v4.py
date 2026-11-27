@@ -162,6 +162,7 @@ def verify_v56_metadata(result,state):
     if result.get("model_family")!=state.get("architecture") or result.get("v56_requested_epochs")!=state.get("epochs"):
         raise ValueError("V5.6 architecture/epoch mismatch")
     if bool(result.get("smoke"))!=(state["v56_action"]=="smoke"): raise ValueError("V5.6 smoke identity mismatch")
+    if "sepformer_scale_policies" in state and result.get("sepformer_scale_policies")!=state["sepformer_scale_policies"]: raise ValueError("SepFormer scale policy mismatch")
 
 
 def history():
@@ -358,7 +359,7 @@ def submit(kaggle, source, tag, i, kind, config=None):
     (folder/"source.py").write_text(source,encoding="utf-8")
     core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"true","enable_internet":"true","dataset_sources":[] if kind=="v4_audit" else [DATASET],"competition_sources":[],"kernel_sources":list(dict.fromkeys(config[k] for k in ("warm_ref","public_cache") if config and config.get(k)))})
     state=folder/"remote_state.json"
-    metadata={k:config[k] for k in ("v56_key","v56_source_sha","v56_action","architecture","epochs") if config and config.get("v56_key") and k in config}
+    metadata={k:config[k] for k in ("v56_key","v56_source_sha","v56_action","architecture","epochs","sepformer_scale_policies") if config and config.get("v56_key") and k in config}
     core.json_write(state,{"ref":ref,"status":"SUBMIT_PENDING","kind":kind,**metadata})
     core.dashboard_event(folder.parents[1],"training",message="V4 "+kind,ref=ref,round=i,remote_status="SUBMIT_PENDING")
     try:
