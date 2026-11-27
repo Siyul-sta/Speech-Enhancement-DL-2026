@@ -15,7 +15,7 @@ import numpy as np
 import soundfile as sf
 import torch
 
-FAMILIES={"residual":"ResidualPhaseUNet","residual_relaxed":"RelaxedPhaseUNet","complex_residual":"ComplexResidualUNet",
+FAMILIES={"residual":"ResidualPhaseUNet","residual_relaxed":"RelaxedPhaseUNet","complex_residual":"ComplexResidualUNet","cascade_native_two":"CascadeNativeTwo","cascade_native_three":"CascadeNativeThree","cascade_native":"CascadeEnhancer",
           "dual_axis":"DualAxisEnhancer","temporal":"TemporalEnhancer","composed":"ComposedEnhancer"}
 SR,LENGTH=16000,48000
 
