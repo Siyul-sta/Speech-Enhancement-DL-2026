@@ -36,6 +36,7 @@ jobs:
       - run: python -m unittest discover -s tests -p test_v52_phase_critic.py -v
       - run: python -m unittest discover -s tests -p test_v55_ensemble.py -v
       - run: python -m unittest discover -s tests -p test_v571_preflight.py -v
+      - run: python -m unittest discover -s tests -p test_v572_scale.py -v
       - run: python -m unittest discover -s tests -p test_v57_final.py -v
         env:
           V5_TEST_PUBLIC_CMGAN: '1'
