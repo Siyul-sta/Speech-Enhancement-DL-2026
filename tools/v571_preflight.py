@@ -39,6 +39,9 @@ def require_report(path=REPORT):
 
 def fixture():
     import numpy as np
+    local=os.environ.get("V571_LOCAL_FIXTURE")
+    if local:
+        with np.load(local,allow_pickle=False) as data: return data["noisy"],data["clean"]
     rng=np.random.default_rng(571)
     t=np.arange(48000,dtype=np.float32)/16000
     env=(.3+.7*np.sin(2*np.pi*2*t)**2)
@@ -162,7 +165,7 @@ def mixed(work,public_package):
         results[mode]=checked_child(pkg,work/(mode+".npy"),expected)
     return {"status":"PASS","modes":results}
 
-def run(out):
+def run(out,data_root=None):
     import torch
     import torchaudio
     if torch.cuda.is_available(): print("CUDA available but CPU preflight uses CPU only",flush=True)
@@ -173,6 +176,19 @@ def run(out):
     path=out/"report.json";write(path,report)
     with tempfile.TemporaryDirectory(dir=out) as d:
         work=Path(d);keep=None
+        if data_root:
+            import numpy as np
+            import submit_v5 as s
+            import v57_offline as off
+            data_root=data_root.resolve();manifest=data_root/"train/samples.csv"
+            rows=off.read_manifest(manifest,1296);row=rows[0]
+            x=s.read_wav(s.safe_path(data_root,row["noisy_path"]));y=s.read_wav(s.safe_path(data_root,row["clean_path"]))
+            fixture_path=work/"fixture.npz";np.savez(fixture_path,noisy=x,clean=y)
+            os.environ["V571_LOCAL_FIXTURE"]=str(fixture_path)
+            report["fixture"]={"kind":"local train pair","index":0,"manifest_sha256":digest(manifest)}
+        else:
+            os.environ.pop("V571_LOCAL_FIXTURE",None)
+            report["fixture"]={"kind":"synthetic engineering fixture"}
         for family in FAMILIES:
             pkg=work/family
             print("V571 CHECK",family,flush=True)
@@ -188,6 +204,7 @@ def run(out):
             if keep is None: raise RuntimeError("CMGAN preflight failed")
             report["mixed_ensemble"]=mixed(work,keep)
         except Exception as exc: report["mixed_ensemble"]={"status":"FAIL","error":repr(exc)}
+    os.environ.pop("V571_LOCAL_FIXTURE",None)
     passed=all(r["status"]=="PASS" for r in report["families"].values()) and report["mixed_ensemble"]["status"]=="PASS"
     report["status"]="PASS" if passed else "FAIL"
     write(path,report)
@@ -197,6 +214,7 @@ def run(out):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--out",type=Path,default=REPORT.parent)
+    p.add_argument("--data-root",type=Path,help="Optional real local train-only PCM16/PESQ equivalence fixture")
     p.add_argument("--child",type=Path,nargs=2,help=argparse.SUPPRESS)
     args=p.parse_args()
     if args.child: child(*args.child)
@@ -205,7 +223,7 @@ def main():
         core.no_uncertain_prior_jobs()
         lock=core.OUTPUT/"active.lock";lock.parent.mkdir(parents=True,exist_ok=True)
         with lock.open("x",encoding="utf-8") as f: f.write(str(os.getpid()))
-        try: run(args.out.resolve())
+        try: run(args.out.resolve(),args.data_root)
         finally: lock.unlink(missing_ok=True)
 
 if __name__=="__main__": main()
