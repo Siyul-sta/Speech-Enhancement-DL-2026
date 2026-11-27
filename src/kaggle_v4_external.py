@@ -654,7 +654,7 @@ class SyntheticPairs(Dataset):
         self.stress=stress
         self.rirs=tuple(TRAIN_RIRS) if dynamic else ()
         self.augmentation=EXPERIMENT_CONFIG.get("augmentation","base")
-        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v5_stage") or EXPERIMENT_CONFIG.get("v52_stage")) else None
+        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v5_stage") or EXPERIMENT_CONFIG.get("v52_stage") or EXPERIMENT_CONFIG.get("v53_stage")) else None
         self.epoch=0
     def __len__(self):
         return self.size
@@ -759,7 +759,8 @@ class CMGANTransfer(torch.nn.Module):
         compressed=y*mag.clamp_min(1e-8).pow(-0.7)
         spec=torch.stack((compressed.real,compressed.imag),1).transpose(-1,-2)
         # Freeze upstream attention to limit training memory.
-        for m in (self.net.dense_encoder,self.net.TSCB_1,self.net.TSCB_2,self.net.TSCB_3,self.net.TSCB_4): m.eval()
+        for m in (self.net.dense_encoder,self.net.TSCB_1,self.net.TSCB_2,self.net.TSCB_3,self.net.TSCB_4):
+            if not any(p.requires_grad for p in m.parameters()): m.eval()
         re,im=self.net(spec)
         z=torch.complex(re[:,0].transpose(-1,-2),im[:,0].transpose(-1,-2))
         z=z*z.abs().clamp_min(1e-8).pow(1/0.3-1)
@@ -807,15 +808,127 @@ class SepformerTransfer(nn.Module):
         self.masknet=engine.mods.masknet.requires_grad_(False)
         self.decoder=engine.mods.decoder.requires_grad_(True)
     def forward(self,x):
-        self.encoder.eval(); self.masknet.eval()
-        with torch.no_grad():
+        encoder_active=any(p.requires_grad for p in self.encoder.parameters())
+        mask_active=any(p.requires_grad for p in self.masknet.parameters())
+        if not encoder_active: self.encoder.eval()
+        if not mask_active: self.masknet.eval()
+        # Frozen mask weights may still need to propagate gradient to a trainable encoder.
+        with torch.set_grad_enabled(torch.is_grad_enabled() and encoder_active):
             z=self.encoder(x)
+        with torch.set_grad_enabled(torch.is_grad_enabled() and (encoder_active or mask_active)):
             mask=self.masknet(z)
             z=z*mask[0]
         y=self.decoder(z)
         if y.ndim==3 and y.shape[1]==1: y=y[:,0]
         if y.ndim!=2: raise RuntimeError("SepFormer decoder shape")
         return F.pad(y,(0,max(0,x.shape[-1]-y.shape[-1])))[:,:x.shape[-1]]
+
+
+class LowRankLinearWeight(nn.Module):
+    """Zero-initialized low-rank update for an existing Linear weight."""
+    def __init__(self,weight,rank=4,alpha=8.):
+        super().__init__()
+        if rank<1 or rank>min(weight.shape): raise ValueError("Invalid adapter rank")
+        self.a=nn.Parameter(torch.empty(rank,weight.shape[1],device=weight.device,dtype=weight.dtype))
+        self.b=nn.Parameter(torch.zeros(weight.shape[0],rank,device=weight.device,dtype=weight.dtype))
+        nn.init.kaiming_uniform_(self.a,a=math.sqrt(5))
+        self.scale=alpha/rank
+    def forward(self,weight):
+        return weight+self.scale*(self.b@self.a)
+
+
+def transfer_groups(model):
+    """Explicit CMGAN groups; partition other adapters by actual module types."""
+    if isinstance(model,CMGANTransfer):
+        n=model.net
+        return [("decoder",[n.mask_decoder,n.complex_decoder]),("late",[n.TSCB_3,n.TSCB_4]),
+                ("early",[n.TSCB_1,n.TSCB_2]),("encoder",[n.dense_encoder])]
+    if isinstance(model,MetricGANTransfer):
+        g=model.generator
+        # Head consists of affine and learnable activation leaves, not LSTM weights.
+        head=[m for m in g.modules() if isinstance(m,nn.Linear) or
+              (not list(m.children()) and not isinstance(m,(nn.RNNBase,nn.RNNCellBase)) and
+               any(True for _ in m.parameters(recurse=False)))]
+        if not head: raise RuntimeError("No MetricGAN affine/activation head found")
+        return [("head",head),("backbone",[g])]
+    if isinstance(model,SepformerTransfer):
+        children=[m for m in model.masknet.children() if any(True for _ in m.parameters())]
+        if not children: raise RuntimeError("No parameterized SepFormer mask child")
+        return [("decoder",[model.decoder]),("mask_tail",[children[-1]]),
+                ("mask",[model.masknet]),("encoder",[model.encoder])]
+    raise ValueError("V5.3 requires a supported pretrained adapter")
+
+
+def install_cmgan_lora(model,rank=4):
+    from torch.nn.utils import parametrize
+    if not isinstance(model,CMGANTransfer): raise ValueError("LoRA supported only for CMGAN")
+    adapters=[]
+    for m in list(model.net.TSCB_4.modules()):
+        if isinstance(m,nn.Linear) and min(m.weight.shape)>=rank:
+            m.weight.requires_grad_(False)
+            parametrize.register_parametrization(m,"weight",LowRankLinearWeight(m.weight,rank))
+            adapters.append(m)
+    if not adapters: raise RuntimeError("No compatible CMGAN linear layers")
+    return adapters
+
+
+def merge_transfer_lora(adapters):
+    from torch.nn.utils import parametrize
+    for m in adapters:
+        parametrize.remove_parametrizations(m,"weight",leave_parametrized=True)
+
+
+class TransferSchedule:
+    """Optimizer contains disjoint groups from the start; frozen groups get no grads."""
+    def __init__(self,model,mode,base_lr):
+        if mode not in ("head","progressive","full","lora"): raise ValueError("Invalid transfer mode")
+        self.model,self.mode=model,mode
+        model.requires_grad_(False)
+        modules=transfer_groups(model)
+        self.adapters=install_cmgan_lora(model) if mode=="lora" else []
+        self.groups=[]
+        assigned=set()
+        for i,(name,mods) in enumerate(modules):
+            params=[]
+            for m in mods:
+                for p in m.parameters():
+                    if id(p) not in assigned:
+                        params.append(p);assigned.add(id(p))
+            if params: self.groups.append((name,params,base_lr*(.3**i)))
+        # LoRA originals stay frozen, only adapter matrices plus decoder train.
+        if self.adapters:
+            adapter_ids={id(p) for m in self.adapters for p in m.parametrizations.weight[0].parameters()}
+            self.groups=[(n,[p for p in ps if id(p) not in adapter_ids],lr) for n,ps,lr in self.groups]
+            self.groups.append(("lora",[p for m in self.adapters for p in m.parametrizations.weight[0].parameters()],base_lr*.3))
+        # Detect upstream structure drift rather than silently dropping parameters.
+        actual={id(p) for p in model.parameters()}
+        covered={id(p) for _,ps,_ in self.groups for p in ps}
+        if actual!=covered: raise RuntimeError("Unassigned transfer parameters")
+        self.groups=[g for g in self.groups if g[1]]
+        self.apply(1)
+    def optimizer(self):
+        return torch.optim.AdamW([{"params":ps,"lr":lr,"group_name":n} for n,ps,lr in self.groups],weight_decay=1e-4)
+    def apply(self,epoch):
+        self.model.requires_grad_(False)
+        names=[]
+        for i,(name,ps,lr) in enumerate(self.groups):
+            enabled=(i==0 or self.mode=="full" or
+                     (self.mode=="progressive" and epoch>=1+3*i) or
+                     (self.mode=="lora" and name=="lora"))
+            if enabled:
+                names.append(name)
+                for p in ps: p.requires_grad_(True)
+        return {"epoch":epoch,"active_groups":names,
+                "trainable_parameters":sum(p.numel() for p in self.model.parameters() if p.requires_grad),
+                "total_parameters":sum(p.numel() for p in self.model.parameters())}
+    def merge(self):
+        if self.adapters: merge_transfer_lora(self.adapters)
+
+
+def transfer_candidate_allowed(challenge,external,baseline,margin=.15):
+    # Keep pretrained capability on both fixed external development domains.
+    return all(math.isfinite(float(v)) for v in [challenge,*external]) and all(
+        a>=b-margin for a,b in zip(external,baseline))
 
 
 class GeneratedEnhancer(nn.Module):
@@ -1132,7 +1245,12 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
     if cfg.get("phase_loss"): loss=loss+0.15*phase_complex_loss(pred.float(),clean.float())
     if distill is not None:
         with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
-        loss=loss+0.1*F.l1_loss(pred,pseudo)
+        if cfg.get("v53_anchor"):
+            # Train-only target-aware teacher gate; no clean input at inference.
+            with torch.no_grad():
+                reliable=(pseudo-clean).abs().mean(-1)<(noisy-clean).abs().mean(-1)
+            loss=loss+.05*((pred-pseudo).abs().mean(-1)*reliable).mean()
+        else: loss=loss+0.1*F.l1_loss(pred,pseudo)
     if cfg.get("loss_mode") == "composed":
         weights=cfg["loss_weights"]
         a=pred-pred.mean(-1,keepdim=True)
@@ -1240,7 +1358,7 @@ def make_loader(dataset,batch_size,shuffle,device,dynamic=False):
     workers=min(int(EXPERIMENT_CONFIG.get("loader_workers",0)),2,max(0,(os.cpu_count() or 1)-1)) if device.type=="cuda" and dynamic else 0
     opts={"num_workers":workers,"pin_memory":device.type=="cuda"}
     if workers: opts.update(persistent_workers=False,prefetch_factor=2,multiprocessing_context="spawn")
-    if shuffle and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v52_stage")):
+    if shuffle and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v52_stage") or EXPERIMENT_CONFIG.get("v53_stage")):
         opts["generator"]=torch.Generator().manual_seed(int(EXPERIMENT_CONFIG["seed"]))
     return DataLoader(dataset,batch_size=batch_size,shuffle=shuffle,**opts)
 
@@ -1416,9 +1534,16 @@ def run():
         (WORK/"result.json").write_text(json.dumps(audit,indent=2))
         return
     distill = None
-    if cfg.get("distill"):
+    transfer=None
+    if cfg.get("v53_stage"):
+        if cfg.get("v53_anchor"):
+            if not isinstance(model,CMGANTransfer): raise ValueError("Anchor currently CMGAN only")
+            import copy
+            distill=copy.deepcopy(model).eval().requires_grad_(False)
+        transfer=TransferSchedule(model,cfg["transfer_mode"],float(cfg["lr"]))
+    elif cfg.get("distill"):
         distill=MetricGANTransfer().to(device).eval().requires_grad_(False)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
+    optimizer=transfer.optimizer() if transfer else torch.optim.AdamW(model.parameters(), lr=float(cfg.get("lr", 0.00035)), weight_decay=0.0001)
     critic=PESQCritic().to(device) if cfg.get("pesq_aware") else None
     critic_optimizer=torch.optim.AdamW(critic.parameters(),lr=0.0003) if critic is not None else None
     replay=CriticReplay(seed=cfg["seed"]) if critic is not None and cfg.get("adaptive_critic") else None
@@ -1429,7 +1554,7 @@ def run():
     scaler=torch.amp.GradScaler("cuda") if use_amp else None
     print(f"TRAIN_PRECISION={'amp_fp16_forward_fp32_loss' if use_amp else 'fp32'}",flush=True)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0.000025
+        optimizer, T_max=max(int(cfg["epochs"]), 1), eta_min=0. if transfer else 0.000025
     )
     if cfg.get("architecture")=="generated" and sum(p.numel() for p in model.parameters())>5000000:
         raise RuntimeError("Generated model exceeds parameter budget")
@@ -1449,9 +1574,30 @@ def run():
     metric_probe={}
     critic_updates=0
     metric_steps=0
+    transfer_history=[]
+    zero_shot=None
+    if transfer:
+        initial_score,initial_rows=evaluate(model,val_loader,device,pesq_function,save_rows=True)
+        _,external_initial=evaluate(model,external_val,device,pesq_function,save_rows=True)
+        initial_domains=[float(np.mean([r[1] for r in external_initial[:32]])),float(np.mean([r[1] for r in external_initial[32:]]))]
+        zero_shot={"challenge":initial_score,"external_domains":initial_domains}
+        write_csv(WORK/"zero_shot_validation.csv",["index","pesq_wb"],initial_rows)
+        write_csv(WORK/"zero_shot_external.csv",["index","pesq_wb"],external_initial)
+        # Preserve the pretrained baseline if every candidate regresses.
+        best_joint=best_score=initial_score
+        torch.save(model.state_dict(),WORK/"best_model.pt")
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
-        if perf or cfg.get("challenge_remix") or cfg.get("v5_stage") or cfg.get("v52_stage"): set_data_epoch(train_set,epoch)
+        if transfer:
+            event=transfer.apply(epoch)
+            # Frozen leaf modules must not update running statistics/dropout state.
+            for m in model.modules():
+                ps=list(m.parameters())
+                if ps and not any(p.requires_grad for p in ps): m.eval()
+            event["learning_rates"]={g["group_name"]:g["lr"] for g in optimizer.param_groups}
+            transfer_history.append(event)
+            print("V53_TRANSFER "+json.dumps(event,allow_nan=False),flush=True)
+        if perf or cfg.get("challenge_remix") or cfg.get("v5_stage") or cfg.get("v52_stage") or cfg.get("v53_stage"): set_data_epoch(train_set,epoch)
         losses = []
         epoch_started=time.monotonic()
         weight=adaptive_metric_weight(last_calibration,epoch,critic_updates*2) if replay is not None else (.05 if critic is not None and epoch>=3 else 0.)
@@ -1490,7 +1636,11 @@ def run():
         joint = 0.5*float(np.mean(domain_scores))+0.5*min(domain_scores)
         print(f"external_pesq={external_pesq:.4f} joint={joint:.4f}",flush=True)
         selection_score = val_pesq if cfg.get("selection_target") == "challenge" else joint
-        if selection_score > best_joint + 0.001:
+        eligible=not transfer or transfer_candidate_allowed(val_pesq,domain_scores[1:],zero_shot["external_domains"])
+        if transfer:
+            transfer_history[-1].update(challenge=val_pesq,external_domains=domain_scores[1:],eligible=eligible)
+            (WORK/"transfer_history.json").write_text(json.dumps(transfer_history,indent=2,allow_nan=False),encoding="utf-8")
+        if eligible and selection_score > best_joint + 0.001:
             best_joint = selection_score
             best_score, best_epoch, stale = val_pesq, epoch, 0
             torch.save(model.state_dict(), WORK / "best_model.pt")
@@ -1514,6 +1664,9 @@ def run():
         calibration=critic_calibration(model,critic,external_val,device,pesq_function)
         print("CRITIC_CALIBRATION",json.dumps(calibration,allow_nan=False),flush=True)
     model.load_state_dict(torch.load(WORK / "best_model.pt", map_location=device, weights_only=True))
+    if transfer and transfer.adapters:
+        transfer.merge()
+        torch.save(model.state_dict(),WORK/"best_model.pt")
     best_score, rows = evaluate(model, val_loader, device, pesq_function, save_rows=True)
     write_csv(WORK / "validation_per_file.csv", ["index", "pesq_wb"], rows)
     external_score, external_rows = evaluate(model, external_val, device, pesq_function, save_rows=True)
@@ -1564,6 +1717,13 @@ def run():
         "loss_mode":cfg.get("loss_mode","base"),
         "pesq_aware":bool(cfg.get("pesq_aware")),
         "v5_stage":cfg.get("v5_stage"),
+        "v53_stage":cfg.get("v53_stage"),
+        "v53_requested_epochs":int(cfg["epochs"]) if transfer else None,
+        "transfer_mode":cfg.get("transfer_mode"),
+        "v53_anchor":bool(cfg.get("v53_anchor")),
+        "zero_shot":zero_shot,
+        "transfer_guard_margin":.15 if transfer else None,
+        "lora_merged":bool(transfer and transfer.adapters),
         "v52_stage":cfg.get("v52_stage"),
         "v52_requested_epochs":int(cfg["epochs"]) if cfg.get("v52_stage") else None,
         "phase_loss":bool(cfg.get("phase_loss")),
