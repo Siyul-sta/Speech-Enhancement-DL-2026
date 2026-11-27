@@ -56,21 +56,30 @@ def v6_hf_lock(family,root,allow_download=False,expected=None):
         license=(getattr(info.card_data,"license",None) or "").lower()
         if license not in licenses: raise ValueError("Unknown or incompatible checkpoint license: "+license)
         files=[s for s in info.siblings if s.rfilename==name]
+        if len(files)!=1 and family=="rose_cd":
+            # HF release directories may omit the experiment run ID used in the
+            # original eval script. Only the named CT loss variant, not teacher/other datasets.
+            files=[s for s in info.siblings if "CT_pesq5e-4_L2" in s.rfilename.split("/") and s.rfilename.endswith(".ckpt")]
         if len(files)!=1:
-            # Only exact unique filename under the official checkpoint subdirectory.
-            prefix=name.rsplit("/",1)[0]+"/" if "/" in name else ""
-            files=[s for s in info.siblings if s.rfilename.startswith(prefix) and s.rfilename.rsplit("/",1)[-1]==name.rsplit("/",1)[-1]]
-        if len(files)!=1 or not files[0].lfs: raise ValueError("Official checkpoint path/metadata unavailable: "+name)
+            raise ValueError("Official checkpoint path unavailable/ambiguous: "+name+" candidates="+str([s.rfilename for s in info.siblings if s.rfilename.lower().endswith((".ckpt",".pth",".pt",".safetensors"))])[:5000])
         s=files[0];lfs=s.lfs
-        lock={"repo":repo,"revision":info.sha,"path":s.rfilename,"sha256":lfs.sha256,"size":int(lfs.size),"license":license}
+        if lfs:
+            digest,size=lfs.sha256,int(lfs.size)
+        else:
+            from huggingface_hub import hf_hub_url,get_hf_file_metadata
+            md=get_hf_file_metadata(hf_hub_url(repo,s.rfilename,revision=info.sha),token=False)
+            digest,size=md.etag.strip('"'),int(md.size or 0)
+        lock={"repo":repo,"revision":info.sha,"path":s.rfilename,"sha256":digest,"size":size,"license":license}
     if expected is not None and lock!=expected: raise ValueError("HF lock differs from accepted preflight")
     if (lock.get("repo")!=repo or lock.get("license") not in licenses or
         not re.fullmatch(r"[a-f0-9]{40}",lock.get("revision","")) or
         not re.fullmatch(r"[a-f0-9]{64}",lock.get("sha256","")) or not 0<int(lock.get("size",0))<=2*1024**3):
         raise ValueError("Invalid model artifact lock")
     path=lock.get("path","")
-    if Path(path).is_absolute() or ".." in Path(path).parts or path.rsplit("/",1)[-1]!=name.rsplit("/",1)[-1]: raise ValueError("Invalid locked checkpoint path")
-    if "/" in name and not path.startswith(name.rsplit("/",1)[0]+"/"): raise ValueError("Wrong CT checkpoint variant")
+    if Path(path).is_absolute() or ".." in Path(path).parts or "\\" in path: raise ValueError("Invalid locked checkpoint path")
+    if family=="rose_cd":
+        if "CT_pesq5e-4_L2" not in path.split("/") or not path.endswith(".ckpt"): raise ValueError("Wrong CT checkpoint variant")
+    elif path!=name: raise ValueError("Wrong official model filename")
     root.mkdir(parents=True,exist_ok=True)
     if not p.exists(): p.write_text(json.dumps(lock,indent=2,sort_keys=True),encoding="utf-8")
     return lock
