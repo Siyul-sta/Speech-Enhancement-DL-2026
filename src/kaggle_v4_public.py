@@ -161,6 +161,8 @@ def write_csv(path: Path, fields, records):
 # Public weights are downloaded locally in the private Kaggle kernel.
 # Only noisy tensors are passed to enhancement models.
 def load_model(name, device):
+    if name == "cmgan":
+        return CMGANTransfer().to(device).eval()
     if name == "metricgan":
         subprocess.check_call([sys.executable, "-m", "pip", "install", "-q", "speechbrain==1.0.3","huggingface_hub<1"])
         from speechbrain.inference.enhancement import SpectralMaskEnhancement
@@ -213,6 +215,9 @@ def public_recipe(recipe,device):
         if not 0<=alpha<=1: raise ValueError("Invalid blend")
         fa,fb=load_model(a,device),load_model(b,device)
         return lambda x: alpha*checked_output(fa,x)+(1-alpha)*checked_output(fb,x)
+    if len(parts)==4 and parts[0]=="mean3":
+        fs=[load_model(name,device) for name in parts[1:]]
+        return lambda x: sum(checked_output(fn,x) for fn in fs)/3
     raise ValueError("Invalid public recipe")
 
 def checked_output(fn, noisy):
@@ -232,6 +237,7 @@ def run():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     pesq_fn = ensure_pesq()
     names = ("metricgan", "deepfilter", "sepformer_dns", "sepformer_wham")
+    if EXPERIMENT_CONFIG.get("v5_public"): names=names+("cmgan",)
     predictions, errors = {}, {}
     noisy = torch.from_numpy(data.noisy)
     clean = torch.from_numpy(data.clean)
@@ -256,33 +262,38 @@ def run():
         raise RuntimeError("No public model succeeded: " + str(errors))
     (WORK/"public_models_status.json").write_text(json.dumps({"succeeded":list(predictions),"errors":errors},indent=2),encoding="utf-8")
     # Fixed global blend grid; no per-file clean-informed oracle.
-    candidates = {}
-    for name, pred in predictions.items():
-        for alpha in (0.7, 0.85, 1.0):
-            candidates[f"{name}:{alpha}"] = alpha * pred + (1-alpha) * noisy
     import itertools
-    for a,b in itertools.combinations(predictions,2):
-        for alpha in (0.25,0.5,0.75):
-            candidates[f"blend:{a}:{b}:{alpha}"]=alpha*predictions[a]+(1-alpha)*predictions[b]
+    def candidates():
+        for name, pred in predictions.items():
+            for alpha in (0.7,0.85,1.0):
+                yield f"{name}:{alpha}",alpha*pred+(1-alpha)*noisy
+        for a,b in itertools.combinations(predictions,2):
+            for alpha in (0.25,0.5,0.75):
+                yield f"blend:{a}:{b}:{alpha}",alpha*predictions[a]+(1-alpha)*predictions[b]
+        if EXPERIMENT_CONFIG.get("v5_public"):
+            for a,b,c in itertools.combinations(predictions,3):
+                yield f"mean3:{a}:{b}:{c}",(predictions[a]+predictions[b]+predictions[c])/3
     scores = {}
     best_rows = None
     best = -float("inf")
     winner = None
-    for name, pred in candidates.items():
+    for name, pred in candidates():
         rows=[[i,score] for i,score in enumerate(score_waveforms(clean.numpy(),pred.numpy(),pesq_fn))]
         ds=[float(np.mean([row[1] for row in chunk])) for chunk in (rows[:challenge_count],rows[challenge_count:challenge_count+32],rows[challenge_count+32:])]
         robust=0.5*float(np.mean(ds))+0.5*min(ds)
         scores[name] = {"challenge":ds[0],"external_normal":ds[1],"external_stress":ds[2],"robust":robust}
         print("PESQ", name, scores[name], flush=True)
-        if robust > best:
-            best, winner, best_rows = robust, name, rows
+        objective=ds[0] if EXPERIMENT_CONFIG.get("selection_target")=="challenge" else robust
+        if objective > best:
+            best, winner, best_rows = objective, name, rows
     write_csv(WORK / "validation_per_file.csv", ["index","pesq_wb"], best_rows[:164])
     write_csv(WORK / "external_validation.csv", ["index","pesq_wb"], [[i,row[1]] for i,row in enumerate(best_rows[164:])])
     domains={k:scores[winner][k] for k in ("challenge","external_normal","external_stress")}
     external_mean=(domains["external_normal"]+domains["external_stress"])/2
     result = {"experiment":"V4_PUBLIC_ZERO_SHOT", "validation_files":164,
               "evaluation_protocol":"v4.2-fixed-dev-v2","domain_scores":domains,"external_validation_files":64,
-              "external_validation_pesq_wb":external_mean,"joint_score":(domains["challenge"]+external_mean)/2,"robust_score":best,
+              "external_validation_pesq_wb":external_mean,"joint_score":(domains["challenge"]+external_mean)/2,"robust_score":scores[winner]["robust"],
+              "selection_target":EXPERIMENT_CONFIG.get("selection_target","robust"),"v5_public":bool(EXPERIMENT_CONFIG.get("v5_public")),
               "best_validation_pesq_wb":domains["challenge"], "winner":winner, "scores":scores,
               "errors":errors, "selection":"global validation blend, no per-file oracle",
               "seed":42}
