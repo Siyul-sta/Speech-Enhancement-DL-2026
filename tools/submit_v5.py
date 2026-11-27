@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import csv
 import hashlib
+import io
 import importlib.util
 import json
 import math
@@ -99,7 +100,11 @@ def evaluate(models,root,device,out):
         c=read_wav(safe_path(root,r["clean_path"]))
         y=predict(models,x,device)
         # Score the quantized PCM-16 output, identical to submission representation.
-        y=np.floor(y.astype(np.float64)*32768).clip(-32768,32767).astype(np.float32)/32768
+        buffer=io.BytesIO()
+        sf.write(buffer,y,SR,format="WAV",subtype="PCM_16")
+        buffer.seek(0)
+        y,sr=sf.read(buffer,dtype="float32")
+        if sr!=SR or y.shape!=(LENGTH,): raise ValueError("Invalid PCM round-trip")
         p=float(pesq(SR,c,y,"wb"))
         snr=float(10*np.log10((np.sum(c.astype(np.float64)**2)+1e-12)/(np.sum((c.astype(np.float64)-y)**2)+1e-12)))
         if not np.isfinite([p,snr]).all(): raise ValueError("Invalid metric")
