@@ -39,7 +39,10 @@ def v6_make_model(cfg,mp_root=None,pretrained=True,coarse=None):
         elif base in V6_NATIVE: coarse=V6_NATIVE[base]()
         elif base in V6_PUBLIC:
             if not pretrained: raise ValueError("Offline public adapter requires constructed coarse module")
-            coarse=V6_PUBLIC[base]()
+            original=EXPERIMENT_CONFIG["architecture"]
+            EXPERIMENT_CONFIG["architecture"]=base
+            try: coarse=V6_PUBLIC[base]()
+            finally: EXPERIMENT_CONFIG["architecture"]=original
         else: raise ValueError("Unsupported V6 architecture: "+base)
     return V6Refiner(coarse,int(cfg["v6_depth"])) if cfg.get("v6_depth") else coarse
 
@@ -152,7 +155,7 @@ def v6_run():
     write_csv(WORK/"zero_shot_validation.csv",["index","pesq_wb"],br)
     write_csv(WORK/"zero_shot_external.csv",["index","pesq_wb"],ber)
     torch.save(model.state_dict(),WORK/"best_model.pt")
-    best=base;best_epoch=0;stale=0;history=[];epoch_times=[];calibration=None;updates=0;metric_steps=0
+    best=base;best_epoch=0;stale=0;history=[];epoch_times=[];train_times=[];calibration=None;updates=0;metric_steps=0
     opt=None;co=None;critic=None;replay=None;lr=float(cfg["lr"])
     transfer=None
     if mode=="train" and cfg.get("v6_transfer") and not isinstance(model,V6Refiner):
@@ -189,6 +192,7 @@ def v6_run():
                 updates+=int(update);metric_steps+=int(weight>0);losses.append(loss)
                 if j==1 or j%25==0 or j==len(loader):
                     print("V4_TELEMETRY "+json.dumps({"event":"batch","epoch":epoch,"epochs":cfg["epochs"],"batch":j,"batches":len(loader),"loss":loss,"elapsed_s":time.monotonic()-start}),flush=True)
+            train_times.append(time.monotonic()-start)
             if critic is not None:
                 calibration=critic_calibration(model,critic,cal,device,pesq_fn)
                 print("V6_CRITIC "+json.dumps(calibration),flush=True)
@@ -227,7 +231,7 @@ def v6_run():
         "joint_score":(score+es)/2,"domain_scores":{"challenge":score,"external_normal":dom[0],"external_stress":dom[1]},
         "robust_score":.5*float(np.mean([score,*dom]))+.5*min([score,*dom]),"model_family":cfg["architecture"],
         "architecture":cfg["architecture"],"seed":cfg["seed"],"smoke":smoke,"epochs_completed":len(history),"best_epoch":best_epoch,
-        "epoch_seconds":epoch_times,"zero_shot":{"challenge":base,"external_domains":bd},"transductive_noisy":False,"self_supervised":False,
+        "epoch_seconds":epoch_times,"v6_train_seconds":train_times,"zero_shot":{"challenge":base,"external_domains":bd},"transductive_noisy":False,"self_supervised":False,
         "selection_target":"challenge","v56_key":cfg["v56_key"],"v56_action":cfg["v56_action"],"v56_source_sha":cfg["v56_source_sha"],
         "v56_requested_epochs":cfg["epochs"],"sepformer_scale_policies":cfg.get("sepformer_scale_policies",{}),
         "v6":{"protocol":"v6-max-pesq-v1","parent":parent,"attempted_epochs":attempted+len(history),"checkpoint_epoch":offset+best_epoch,
