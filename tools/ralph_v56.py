@@ -36,6 +36,10 @@ def states():
         state=json.loads(path.read_text(encoding="utf-8"))
         if not state.get("v56_key"): continue
         if state["v56_key"] in out: raise RuntimeError("Duplicate V5.6 experiment identity")
+        if state.get("status")=="COMPLETE":
+            result=v4.verify(path.parent,state["kind"])
+            v4.verify_v56_metadata(result,state)
+            if not (path.parent/"source.py").is_file(): raise RuntimeError("Completed V5.6 archived source missing")
         out[state["v56_key"]]=state
     return out
 
@@ -133,25 +137,28 @@ def next_trial(records,ledger,sha,cache,epochs,remaining,job_limit,seed=42):
     by_stage={}
     for st,r in current:
         field=next((k for k in ("v52_stage","v53_stage","v54_stage") if r.get(k)),None)
-        if field and r["v56_action"]=="pilot": by_stage[field+":"+r[field]]=(st,r)
-    pilots=[];promotions=[]
+        if field and r["v56_action"]=="pilot" and st.get("ref"):
+            by_stage.setdefault(field+":"+r[field],[]).append((st,r))
+    pilots=[];promotions=[];matched={}
     for name,p,low,high in catalog:
         cfg=trial_cfg(p,name,low,seed,cache,sha,"pilot")
+        exact=next(((st,r) for st,r in by_stage.get(name,[]) if r.get("v56_key")==cfg["v56_key"]),None)
+        if exact: matched[name]=exact
         if cfg["v56_key"] not in ledger:
             pilots.append((name,cfg))
-        elif name in by_stage and high>low:
-            st,r=by_stage[name]
+        elif exact and high>low:
+            st,r=exact
             cfg=trial_cfg(p,name,high,seed,cache,sha,"promote",st)
             if cfg["v56_key"] not in ledger:
                 promotions.append((promotion_value(r,records,cfg),name,cfg))
     # Promote only the upper half of successful pilots. Once a pilot has been
     # promoted, it still counts in the threshold, rather than promoting losers.
-    rank=sorted(by_stage,key=lambda n:float(by_stage[n][1]["best_validation_pesq_wb"]),reverse=True)
+    rank=sorted(matched,key=lambda n:float(matched[n][1]["best_validation_pesq_wb"]),reverse=True)
     top=set(rank[:max(1,(len(rank)+1)//2)])
     promotions.sort(key=lambda a:(-a[0],a[1]))
     promotions=[(name,cfg) for _,name,cfg in promotions if name in top]
     completed_promotions=sum(r.get("v56_action")=="promote" for _,r in current)
-    prefer_promotion=len(by_stage)>=4 and completed_promotions<len(by_stage)//2
+    prefer_promotion=len(matched)>=4 and completed_promotions<len(matched)//2
     order=(promotions+pilots if prefer_promotion else pilots+promotions)
     for name,cfg in order:
         s=smoke_cfg(cfg["architecture"],sha)
@@ -192,6 +199,12 @@ def run(args):
         print("Initial stage catalog:",json.dumps([n for n,_,_,_ in stage_catalog(v4.history(),args.epochs)]))
         return
     if not args.allow_public_assets: raise RuntimeError("Confirm instructor permission for licensed external corpora/pretrained models with --allow-public-assets")
+    if args.data_root:
+        import v55_ensemble as ensemble
+        from pesq import pesq  # fail before GPU if optional ensemble dependency missing
+        _,rows=ensemble.load_train(args.data_root.resolve())
+        ensemble.split_train(rows)
+        if not (args.data_root/"validation"/"samples.csv").is_file(): raise ValueError("Missing local validation manifest")
     kaggle=shutil.which("kaggle")
     if not kaggle: raise RuntimeError("Kaggle CLI missing")
     lock=core.OUTPUT/"active.lock";lock.parent.mkdir(parents=True,exist_ok=True)
@@ -243,7 +256,13 @@ def run(args):
             rounds+=1
             print("V56 PLAN",json.dumps({"round":rounds,"estimated_gpu_hours":estimate,"remaining_quota":current,"config":cfg}),flush=True)
             try:
+                start=time.monotonic()
                 st,r=v4.submit(kaggle,source,tag,rounds,kind,cfg)
+                elapsed=(time.monotonic()-start)/3600
+                after=quota_hours(kaggle)
+                baseline=float((r.get("zero_shot") or {}).get("challenge",1.6961209534144983))
+                gain=float(r["best_validation_pesq_wb"])-baseline if kind!="v4_smoke" else None
+                core.append_history(run_dir/"v56_efficiency.jsonl",{"ref":st["ref"],"key":cfg["v56_key"],"action":cfg["v56_action"],"estimated_hours":estimate,"observed_wall_hours":elapsed,"quota_delta_hours":current-after,"development_gain":gain,"gain_per_wall_hour":gain/max(elapsed,1e-9) if gain is not None else None})
             except legacy.KaggleTerminalFailure as exc:
                 failures+=1
                 print("V56 terminal error",str(exc),flush=True)
