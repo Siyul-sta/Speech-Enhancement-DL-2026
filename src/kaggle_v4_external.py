@@ -925,6 +925,16 @@ class TransferSchedule:
         if self.adapters: merge_transfer_lora(self.adapters)
 
 
+def transfer_state_hash(model):
+    import hashlib
+    h=hashlib.sha256()
+    for name,tensor in sorted(model.state_dict().items()):
+        x=tensor.detach().cpu().contiguous()
+        h.update(name.encode()+b"\0"+str(x.dtype).encode()+b"\0"+str(tuple(x.shape)).encode()+b"\0")
+        h.update(x.reshape(-1).view(torch.uint8).numpy().tobytes())
+    return h.hexdigest()
+
+
 def transfer_candidate_allowed(challenge,external,baseline,margin=.15):
     # Keep pretrained capability on both fixed external development domains.
     return len(external)==len(baseline)==2 and all(math.isfinite(float(v)) for v in [challenge,*external,*baseline]) and all(
@@ -1535,7 +1545,11 @@ def run():
         return
     distill = None
     transfer=None
+    initial_hash=None
     if cfg.get("v53_stage"):
+        initial_hash=transfer_state_hash(model)
+        expected_hash=cfg.get("v53_expected_initial_hash")
+        if expected_hash and initial_hash!=expected_hash: raise RuntimeError("Pretrained state changed between controlled stages")
         if cfg.get("v53_anchor"):
             if not isinstance(model,CMGANTransfer): raise ValueError("Anchor currently CMGAN only")
             import copy
@@ -1559,6 +1573,7 @@ def run():
     if cfg.get("architecture")=="generated" and sum(p.numel() for p in model.parameters())>5000000:
         raise RuntimeError("Generated model exceeds parameter budget")
     probe=torch.randn(1,48000,device=device)*0.05
+    if transfer: model.eval()
     out=model(probe)
     if out.shape!=probe.shape or not torch.isfinite(out).all():
         raise RuntimeError("Model contract failed")
@@ -1721,6 +1736,7 @@ def run():
         "v5_stage":cfg.get("v5_stage"),
         "v53_stage":cfg.get("v53_stage"),
         "v53_requested_epochs":int(cfg["epochs"]) if transfer else None,
+        "v53_initial_hash":initial_hash,
         "transfer_mode":cfg.get("transfer_mode"),
         "v53_anchor":bool(cfg.get("v53_anchor")),
         "zero_shot":zero_shot,
