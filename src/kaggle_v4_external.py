@@ -385,7 +385,8 @@ def adaptive_metric_weight(calibration,epoch,updates):
     # Pre-registered engineering gate; no challenge validation score used.
     if epoch<3 or updates<16 or not calibration: return 0.
     corr=calibration.get("pearson")
-    if corr is None or corr<.6 or calibration["mae"]>.5: return 0.
+    mae=calibration.get("mae")
+    if corr is None or mae is None or not math.isfinite(corr) or not math.isfinite(mae) or corr<.6 or mae>.5: return 0.
     return .05*min(1.,max(0.,(epoch-2)/3))
 
 
@@ -1564,6 +1565,7 @@ def run():
         "pesq_aware":bool(cfg.get("pesq_aware")),
         "v5_stage":cfg.get("v5_stage"),
         "v52_stage":cfg.get("v52_stage"),
+        "v52_requested_epochs":int(cfg["epochs"]) if cfg.get("v52_stage") else None,
         "phase_loss":bool(cfg.get("phase_loss")),
         "empirical_remix":bool(cfg.get("empirical_remix")),
         "balanced_remix":bool(cfg.get("balanced_remix")),
