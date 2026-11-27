@@ -654,7 +654,7 @@ class SyntheticPairs(Dataset):
         self.stress=stress
         self.rirs=tuple(TRAIN_RIRS) if dynamic else ()
         self.augmentation=EXPERIMENT_CONFIG.get("augmentation","base")
-        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v5_stage") or EXPERIMENT_CONFIG.get("v52_stage") or EXPERIMENT_CONFIG.get("v53_stage")) else None
+        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v5_stage") or EXPERIMENT_CONFIG.get("v52_stage") or EXPERIMENT_CONFIG.get("v53_stage") or EXPERIMENT_CONFIG.get("v54_stage")) else None
         self.epoch=0
     def __len__(self):
         return self.size
@@ -961,6 +961,126 @@ class TemporalEnhancer(nn.Module):
         return x+self.out(z).squeeze(1)
 
 
+class ConditionedWaveRefiner(nn.Module):
+    """Residual correction conditioned on original input, previous output and difference."""
+    def __init__(self,width=24,dilations=(1,2,4,8,16,32),limit=.5):
+        super().__init__()
+        self.limit=limit
+        self.inp=nn.Conv1d(3,width,9,padding=4)
+        self.blocks=nn.ModuleList(nn.Sequential(nn.Conv1d(width,width,7,padding=3*d,dilation=d,groups=width),
+            nn.Conv1d(width,width,1),nn.GroupNorm(4,width),nn.SiLU()) for d in dilations)
+        self.out=nn.Conv1d(width,1,9,padding=4)
+        nn.init.zeros_(self.out.weight);nn.init.zeros_(self.out.bias)
+    def forward(self,noisy,previous):
+        scale=noisy.square().mean(-1,keepdim=True).sqrt().detach().clamp_min(1e-4)
+        z=self.inp(torch.stack((noisy,previous,noisy-previous),1)/scale[:,None])
+        for block in self.blocks: z=z+block(z)
+        return previous+self.limit*scale*torch.tanh(self.out(z).squeeze(1))
+
+
+class ConditionedComplexRefiner(nn.Module):
+    """Direct complex residual with original spectrum access, including near-zero bins."""
+    def __init__(self):
+        super().__init__()
+        self.register_buffer("window",torch.hann_window(N_FFT))
+        self.enc1=ConvBlock(6,16);self.enc2=ConvBlock(16,32)
+        self.middle=ConvBlock(32,48)
+        self.dec2=ConvBlock(48+32,32);self.dec1=ConvBlock(32+16,16)
+        self.head=nn.Conv2d(16,2,1)
+        nn.init.zeros_(self.head.weight);nn.init.zeros_(self.head.bias)
+    def forward(self,noisy,previous):
+        x=torch.stft(noisy,N_FFT,HOP,window=self.window,return_complex=True)
+        y=torch.stft(previous,N_FFT,HOP,window=self.window,return_complex=True)
+        scale=x.abs().mean((-2,-1),keepdim=True).detach().clamp_min(.01)
+        def feat(z):
+            m=z.abs()
+            return [torch.log1p(m/scale),z.real/(m+scale),z.imag/(m+scale)]
+        a=self.enc1(torch.stack(feat(x)+feat(y),1))
+        b=self.enc2(F.avg_pool2d(a,2,ceil_mode=True))
+        z=self.middle(F.avg_pool2d(b,2,ceil_mode=True))
+        z=self.dec2(ResidualPhaseUNet.upcat(z,b));z=self.dec1(ResidualPhaseUNet.upcat(z,a))
+        h=self.head(z)
+        delta=torch.complex(h[:,0],h[:,1])*scale
+        return torch.istft(y+delta,N_FFT,HOP,window=self.window,length=noisy.shape[-1])
+
+
+class CascadeEnhancer(nn.Module):
+    """Native noisy-only cascade. Identity-initialized later stages avoid initial damage."""
+    depth=4
+    pretrained=False
+    def __init__(self):
+        super().__init__()
+        self.coarse=CMGANTransfer() if self.pretrained else ComplexResidualUNet()
+        self.residual=ConditionedWaveRefiner()
+        if self.depth>=3: self.complex=ConditionedComplexRefiner()
+        if self.depth>=4: self.refine=ConditionedWaveRefiner(width=16,dilations=(1,2,4,8),limit=.2)
+        if self.pretrained: self.coarse.eval().requires_grad_(False)
+    def set_epoch(self,epoch):
+        self.coarse.requires_grad_(not self.pretrained)
+        self.residual.requires_grad_(True)
+        if self.depth>=3: self.complex.requires_grad_(epoch>=3)
+        if self.depth>=4: self.refine.requires_grad_(epoch>=5)
+        return [name for name,m in self.named_children() if any(p.requires_grad for p in m.parameters())]
+    def forward_stages(self,noisy):
+        if self.pretrained:
+            self.coarse.eval()
+            with torch.no_grad(): a=self.coarse(noisy)
+        else: a=self.coarse(noisy)
+        outputs={"coarse":a,"residual":self.residual(noisy,a)}
+        if self.depth>=3: outputs["complex"]=self.complex(noisy,outputs["residual"])
+        if self.depth>=4: outputs["refine"]=self.refine(noisy,outputs["complex"])
+        return outputs
+    def forward(self,noisy):
+        return list(self.forward_stages(noisy).values())[-1]
+
+
+class CascadeNativeTwo(CascadeEnhancer): depth=2
+class CascadeNativeThree(CascadeEnhancer): depth=3
+class CascadeCMGANTwo(CascadeNativeTwo): pretrained=True
+class CascadeCMGANThree(CascadeNativeThree): pretrained=True
+class CascadeCMGANFour(CascadeEnhancer): pretrained=True
+
+
+def cascade_training_loss(outputs,clean,cfg):
+    """Final supervised loss plus lightweight supervision of active intermediate stages."""
+    pred=list(outputs.values())[-1]
+    total=enhancement_loss(pred,clean,cfg["id"])
+    if cfg.get("phase_loss"): total=total+.15*phase_complex_loss(pred.float(),clean.float())
+    if cfg.get("cascade_aux",True):
+        earlier=[v for v in list(outputs.values())[:-1] if v.requires_grad]
+        if earlier:
+            total=total+.1*sum(F.l1_loss(v,clean) for v in earlier)/len(earlier)
+    return total
+
+
+@torch.no_grad()
+def evaluate_cascade(model,loader,device,pesq_fn):
+    """One noisy-only pass per batch, then exact PESQ per stage in manifest order."""
+    model.eval()
+    refs=[]; outputs={}
+    for noisy,clean in loader:
+        stages=model.forward_stages(noisy.to(device))
+        refs.append(clean.cpu().float().numpy())
+        for name,y in stages.items():
+            if y.shape!=noisy.shape or not torch.isfinite(y).all(): raise RuntimeError("Invalid cascade stage output")
+            outputs.setdefault(name,[]).append(y.cpu().float().numpy())
+    reference=np.concatenate(refs)
+    if len(reference)!=len(loader.dataset): raise RuntimeError("Incomplete cascade evaluation")
+    return {name:score_waveforms(reference,np.concatenate(parts),pesq_fn) for name,parts in outputs.items()}
+
+
+def cascade_report(model,loader,external,device,pesq_fn,work):
+    a=evaluate_cascade(model,loader,device,pesq_fn)
+    b=evaluate_cascade(model,external,device,pesq_fn)
+    if list(a)!=list(b): raise RuntimeError("Cascade evaluation stage mismatch")
+    report={}
+    for name in a:
+        write_csv(work/("cascade_"+name+"_validation.csv"),["index","pesq_wb"],list(enumerate(a[name])))
+        write_csv(work/("cascade_"+name+"_external.csv"),["index","pesq_wb"],list(enumerate(b[name])))
+        report[name]={"challenge":float(np.mean(a[name])),"external_domains":[float(np.mean(b[name][:32])),float(np.mean(b[name][32:]))]}
+    return report
+
+
 class ComposedEnhancer(nn.Module):
     """A new topology assembled from validated JSON, no generated Python execution."""
     def __init__(self):
@@ -1249,10 +1369,17 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
         with torch.autocast(device_type="cuda",dtype=torch.float16):
             pred=model(noisy)
         pred=pred.float()
+    elif isinstance(model,CascadeEnhancer):
+        outputs=model.forward_stages(noisy)
+        pred=list(outputs.values())[-1]
     else:
         pred=model(noisy)
-    loss = enhancement_loss(pred, clean, variant)
-    if cfg.get("phase_loss"): loss=loss+0.15*phase_complex_loss(pred.float(),clean.float())
+    if isinstance(model,CascadeEnhancer):
+        if scaler is not None: raise ValueError("Cascade AMP not validated")
+        loss=cascade_training_loss(outputs,clean,cfg)
+    else:
+        loss = enhancement_loss(pred, clean, variant)
+        if cfg.get("phase_loss"): loss=loss+0.15*phase_complex_loss(pred.float(),clean.float())
     if distill is not None:
         with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
         if cfg.get("v53_anchor"):
@@ -1368,7 +1495,7 @@ def make_loader(dataset,batch_size,shuffle,device,dynamic=False):
     workers=min(int(EXPERIMENT_CONFIG.get("loader_workers",0)),2,max(0,(os.cpu_count() or 1)-1)) if device.type=="cuda" and dynamic else 0
     opts={"num_workers":workers,"pin_memory":device.type=="cuda"}
     if workers: opts.update(persistent_workers=False,prefetch_factor=2,multiprocessing_context="spawn")
-    if shuffle and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v52_stage") or EXPERIMENT_CONFIG.get("v53_stage")):
+    if shuffle and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v52_stage") or EXPERIMENT_CONFIG.get("v53_stage") or EXPERIMENT_CONFIG.get("v54_stage")):
         opts["generator"]=torch.Generator().manual_seed(int(EXPERIMENT_CONFIG["seed"]))
     return DataLoader(dataset,batch_size=batch_size,shuffle=shuffle,**opts)
 
@@ -1430,8 +1557,8 @@ def run():
         if len(train_set) != 1296:
             raise RuntimeError("Unexpected train split size")
         original_train=train_set
-        if cfg.get("v52_stage"):
-            # Same fixed, disjoint train-only holdout for every V5.2 ablation.
+        if cfg.get("v52_stage") or cfg.get("v54_stage"):
+            # Same fixed, disjoint train-only holdout for controlled ablations.
             heldout=sorted(np.random.default_rng(52042).choice(len(original_train),32,replace=False).tolist())
             heldout_set=set(heldout)
             critic_dev=make_loader(torch.utils.data.Subset(original_train,heldout),4,False,device)
@@ -1492,6 +1619,9 @@ def run():
         model = RelaxedPhaseUNet().to(device)
     elif cfg.get("architecture") == "complex_residual":
         model = ComplexResidualUNet().to(device)
+    elif cfg.get("architecture") in ("cascade_native_two","cascade_native_three","cascade_native","cascade_cmgan_two","cascade_cmgan_three","cascade_cmgan"):
+        classes={"cascade_native_two":CascadeNativeTwo,"cascade_native_three":CascadeNativeThree,"cascade_native":CascadeEnhancer,"cascade_cmgan_two":CascadeCMGANTwo,"cascade_cmgan_three":CascadeCMGANThree,"cascade_cmgan":CascadeCMGANFour}
+        model=classes[cfg["architecture"]]().to(device)
     else:
         model = ResidualPhaseUNet().to(device)
     warm_ref = cfg.get("warm_ref")
@@ -1573,7 +1703,9 @@ def run():
     if cfg.get("architecture")=="generated" and sum(p.numel() for p in model.parameters())>5000000:
         raise RuntimeError("Generated model exceeds parameter budget")
     probe=torch.randn(1,48000,device=device)*0.05
-    if transfer: model.eval()
+    cascade=isinstance(model,CascadeEnhancer)
+    if cascade: model.set_epoch(1)
+    if transfer or cascade: model.eval()
     out=model(probe)
     if out.shape!=probe.shape or not torch.isfinite(out).all():
         raise RuntimeError("Model contract failed")
@@ -1591,7 +1723,9 @@ def run():
     metric_steps=0
     transfer_history=[]
     zero_shot=None
-    if transfer:
+    cascade_history=[]
+    cascade_scores=None
+    if transfer or cascade:
         initial_score,initial_rows=evaluate(model,val_loader,device,pesq_function,save_rows=True)
         _,external_initial=evaluate(model,external_val,device,pesq_function,save_rows=True)
         initial_domains=[float(np.mean([r[1] for r in external_initial[:32]])),float(np.mean([r[1] for r in external_initial[32:]]))]
@@ -1612,10 +1746,15 @@ def run():
             event["learning_rates"]={g["group_name"]:g["lr"] for g in optimizer.param_groups}
             transfer_history.append(event)
             print("V53_TRANSFER "+json.dumps(event,allow_nan=False),flush=True)
-        if perf or cfg.get("challenge_remix") or cfg.get("v5_stage") or cfg.get("v52_stage") or cfg.get("v53_stage"): set_data_epoch(train_set,epoch)
+        if cascade:
+            active=model.set_epoch(epoch)
+            cascade_history.append({"epoch":epoch,"active_stages":active,"trainable_parameters":sum(p.numel() for p in model.parameters() if p.requires_grad)})
+            print("V54_CASCADE "+json.dumps(cascade_history[-1]),flush=True)
+        if perf or cfg.get("challenge_remix") or cfg.get("v5_stage") or cfg.get("v52_stage") or cfg.get("v53_stage") or cfg.get("v54_stage"): set_data_epoch(train_set,epoch)
         losses = []
         epoch_started=time.monotonic()
         weight=adaptive_metric_weight(last_calibration,epoch,critic_updates*2) if replay is not None else (.05 if critic is not None and epoch>=3 else 0.)
+        if cascade and (model.depth<4 or epoch<5): weight=0.
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
             noisy, clean = noisy.to(device,non_blocking=True), clean.to(device,non_blocking=True)
             metric_active=critic is not None and weight>0
@@ -1651,7 +1790,10 @@ def run():
         joint = 0.5*float(np.mean(domain_scores))+0.5*min(domain_scores)
         print(f"external_pesq={external_pesq:.4f} joint={joint:.4f}",flush=True)
         selection_score = val_pesq if cfg.get("selection_target") == "challenge" else joint
-        eligible=not transfer or transfer_candidate_allowed(val_pesq,domain_scores[1:],zero_shot["external_domains"])
+        eligible=not (transfer or cascade) or transfer_candidate_allowed(val_pesq,domain_scores[1:],zero_shot["external_domains"])
+        if cascade:
+            cascade_history[-1].update(challenge=val_pesq,external_domains=domain_scores[1:],eligible=eligible,metric_weight=weight)
+            (WORK/"cascade_history.json").write_text(json.dumps(cascade_history,indent=2,allow_nan=False),encoding="utf-8")
         if transfer:
             transfer_history[-1].update(challenge=val_pesq,external_domains=domain_scores[1:],eligible=eligible)
             (WORK/"transfer_history.json").write_text(json.dumps(transfer_history,indent=2,allow_nan=False),encoding="utf-8")
@@ -1670,7 +1812,7 @@ def run():
         if all(math.isfinite(v) for v in telemetry.values() if isinstance(v,(float,int))):
             print("V4_TELEMETRY "+json.dumps(telemetry,allow_nan=False),flush=True)
         epoch_times.append(time.monotonic()-epoch_started)
-        if not perf and not transfer and epoch >= 5 and stale >= int(cfg["patience"]):
+        if not perf and not transfer and not cascade and epoch >= 5 and stale >= int(cfg["patience"]):
             break
 
     calibration=None
@@ -1683,11 +1825,15 @@ def run():
         transfer.merge()
         torch.save(model.state_dict(),WORK/"best_model.pt")
     best_score, rows = evaluate(model, val_loader, device, pesq_function, save_rows=True)
-    if transfer and best_score<zero_shot["challenge"]-1e-5: raise RuntimeError("Selected checkpoint regressed below zero-shot")
+    if (transfer or cascade) and best_score<zero_shot["challenge"]-1e-5: raise RuntimeError("Selected checkpoint regressed below zero-shot")
     write_csv(WORK / "validation_per_file.csv", ["index", "pesq_wb"], rows)
     external_score, external_rows = evaluate(model, external_val, device, pesq_function, save_rows=True)
-    if transfer and not transfer_candidate_allowed(best_score,[float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))],zero_shot["external_domains"],margin=.15001): raise RuntimeError("Selected checkpoint failed external preservation gate")
+    if (transfer or cascade) and not transfer_candidate_allowed(best_score,[float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))],zero_shot["external_domains"],margin=.15001): raise RuntimeError("Selected checkpoint failed external preservation gate")
     write_csv(WORK / "external_validation.csv", ["index","pesq_wb"], external_rows)
+    if cascade:
+        cascade_scores=cascade_report(model,val_loader,external_val,device,pesq_function,WORK)
+        final=list(cascade_scores.values())[-1]
+        if abs(final["challenge"]-best_score)>1e-6 or abs(sum(final["external_domains"])/2-external_score)>1e-6: raise RuntimeError("Cascade final stage scoring mismatch")
     metrics={}
     try:
         subprocess.check_call([sys.executable,"-m","pip","install","-q","pystoi==0.4.1"])
@@ -1734,6 +1880,12 @@ def run():
         "loss_mode":cfg.get("loss_mode","base"),
         "pesq_aware":bool(cfg.get("pesq_aware")),
         "v5_stage":cfg.get("v5_stage"),
+        "v54_stage":cfg.get("v54_stage"),
+        "v54_requested_epochs":int(cfg["epochs"]) if cascade else None,
+        "cascade_depth":model.depth if cascade else None,
+        "cascade_pretrained":bool(cascade and model.pretrained),
+        "cascade_scores":cascade_scores,
+        "cascade_aux":bool(cfg.get("cascade_aux",True)) if cascade else None,
         "v53_stage":cfg.get("v53_stage"),
         "v53_requested_epochs":int(cfg["epochs"]) if transfer else None,
         "v53_initial_hash":initial_hash,
