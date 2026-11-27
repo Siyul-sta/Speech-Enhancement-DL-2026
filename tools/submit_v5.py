@@ -47,7 +47,9 @@ def load_bundle(config,device):
         spec.loader.exec_module(mod)
         family=mod.EXPERIMENT_CONFIG.get("architecture","residual")
         if s.get("family",family)!=family: raise ValueError("Expert family mismatch")
-        if family in FAMILIES:
+        if family=="noisy_identity" and cfg.get("public_recipe"):
+            model=torch.nn.Identity()
+        elif family in FAMILIES:
             model=getattr(mod,FAMILIES[family])()
         elif s.get("public_assets"):
             from v57_public_assets import construct
@@ -59,6 +61,8 @@ def load_bundle(config,device):
         else: raise ValueError("Offline adapter not admitted: "+family)
         model=model.to(device).eval()
         model.load_state_dict(torch.load(checkpoint,map_location=device,weights_only=True),strict=True)
+        if cfg.get("public_recipe") and family!="noisy_identity":
+            model=torch.nn.Sequential(model,torch.nn.Hardtanh(-1.,1.))
         models.append((w,model))
     if not math.isclose(sum(w for w,m in models),1.,abs_tol=1e-6):
         raise ValueError("Fixed weights must sum to one")
