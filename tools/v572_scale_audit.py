@@ -40,7 +40,7 @@ def split(rows,n=12):
     return sample(names[:cut]),sample(names[cut:])
 
 def summarize(values):
-    return {mode:{"pesq":float(np.mean([x["pesq"] for x in rows])),
+    return {mode:{"pesq":float(np.mean([x["pesq"] for x in rows])) if all(x["pesq"] is not None for x in rows) else None,
                   "mean_clipping":float(np.mean([x["clipping"] for x in rows])),
                   "max_peak":max(x["peak"] for x in rows),
                   "mean_rms_ratio":float(np.mean([x["rms_ratio"] for x in rows])),
@@ -48,15 +48,16 @@ def summarize(values):
 
 def choose(selection,holdout):
     # Select strictly on fit group; holdout may veto but never choose another mode.
-    safe=[m for m in MODES if m!="raw" and selection[m]["mean_clipping"]==0. and selection[m]["max_peak"]<=.98001]
+    if any(v["raw"]["pesq"] is None for v in (selection,holdout)): raise ValueError("Raw baseline PESQ failed; inspect audit")
+    safe=[m for m in MODES if m!="raw" and selection[m]["pesq"] is not None and selection[m]["mean_clipping"]==0. and selection[m]["max_peak"]<=.98001]
     if not safe: raise ValueError("No bounded mode on selection split")
     mode=max(safe,key=lambda m:selection[m]["pesq"])
     a,b=selection[mode],holdout[mode]
-    approved=(b["mean_clipping"]==0. and b["max_peak"]<=.98001 and
+    approved=(b["pesq"] is not None and b["mean_clipping"]==0. and b["max_peak"]<=.98001 and
               a["pesq"]>=selection["raw"]["pesq"]-GUARD and b["pesq"]>=holdout["raw"]["pesq"]-GUARD)
     return {"mode":mode,"status":"PASS" if approved else "FAIL",
             "selection_gain":a["pesq"]-selection["raw"]["pesq"],
-            "holdout_gain":b["pesq"]-holdout["raw"]["pesq"]}
+            "holdout_gain":b["pesq"]-holdout["raw"]["pesq"] if b["pesq"] is not None else None}
 
 def require_report(path=REPORT,data_root=None):
     if not path.is_file(): raise RuntimeError("Run tools/v572_scale_audit.py before GPU execution")
@@ -90,14 +91,21 @@ def inspect_model(family,root,rows,ids,cache):
             if raw.shape!=z.shape or not torch.isfinite(raw).all(): raise RuntimeError("Invalid raw SepFormer output")
             for mode in MODES:
                 y=trainer.sepformer_scale_output(z,raw,mode).numpy()[0]
-                p=float(pesq(16000,c,pcm16(y),"wb"))
+                if not np.isfinite(y).all(): raise RuntimeError("Nonfinite scaled output")
+                error=None
+                try:
+                    p=float(pesq(16000,c,pcm16(y),"wb"))
+                    if not math.isfinite(p): raise ValueError("Nonfinite PESQ")
+                except Exception as exc:
+                    p=None;error=repr(exc)
                 rms=float(np.sqrt(np.mean(y.astype(np.float64)**2))/max(1e-8,np.sqrt(np.mean(x.astype(np.float64)**2))))
-                if not np.isfinite([p,rms]).all(): raise RuntimeError("Nonfinite scale score")
-                values[mode].append({"index":i,"pesq":p,"clipping":float(np.mean(np.abs(y)>1)),"peak":float(np.max(np.abs(y))),"rms_ratio":rms})
+                if not math.isfinite(rms): raise RuntimeError("Nonfinite RMS ratio")
+                values[mode].append({"index":i,"pesq":p,"error":error,"clipping":float(np.mean(np.abs(y)>1)),"peak":float(np.max(np.abs(y))),"rms_ratio":rms})
             print("V572",family,split_name,i,"raw peak",float(raw.abs().max()),flush=True)
         result[split_name]=summarize(values)
         result[split_name+"_rows"]=values
-    result["selected"]=choose(result["selection"],result["holdout"])
+    try: result["selected"]=choose(result["selection"],result["holdout"])
+    except ValueError as exc: result["selected"]={"status":"FAIL","error":str(exc)}
     return result
 
 def run(args):
