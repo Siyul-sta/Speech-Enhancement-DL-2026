@@ -84,6 +84,48 @@ class V6CPU(unittest.TestCase):
             p=Path(d)/"models/model.py";p.parent.mkdir();p.write_text("tampered")
             with self.assertRaises(ValueError): mod.v6_mp_assets(Path(d),"dns",False)
 
+    def test_crossmix_deterministic_and_train_only(self):
+        import soundfile as sf
+        mod=self.mod;rng=np.random.default_rng(44)
+        class Train:
+            split="train"
+            manifest=pd.DataFrame({"noise_type":["a","b"]*32})
+            clean=rng.normal(0,.025,(64,48000)).astype("float32")
+            noisy=clean+rng.normal(0,.01,clean.shape).astype("float32")
+            def __len__(self): return 64
+        t=Train()
+        with tempfile.TemporaryDirectory() as d:
+            p=Path(d)/"speech.wav";sf.write(p,t.clean[0],16000)
+            mix=mod.V6CrossMix(t,range(64),[p],[],1000000,seed=42,hard=True,korean=[p])
+            self.assertEqual(len(mix),1000000)
+            a,b=mix[0];c,e=mix[0]
+            self.assertTrue(torch.equal(a,c) and torch.equal(b,e))
+            mix.epoch=1;f,_=mix[0]
+            self.assertFalse(torch.equal(a,f))
+            mix.update_hard({"a":1.2,"b":3.2})
+            self.assertGreater(mix.probs[0],mix.probs[1])
+            t.split="validation"
+            with self.assertRaises(ValueError): mod.V6CrossMix(t,range(64),[p],[],32)
+
+    def test_native_offline_bundle_roundtrip(self):
+        import json,re
+        import v6_offline as offline_runner
+        import v57_offline as old_offline
+        mod=self.mod;cfg={"architecture":"complex_residual","v6_base_family":None}
+        x=torch.randn(1,4096)*.03
+        model=mod.v6_make_model(cfg).eval()
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);source=root/"source.py";cp=root/"best_model.pt"
+            source.write_text(re.sub(r"^EXPERIMENT_CONFIG = .+$",lambda _: "EXPERIMENT_CONFIG = "+repr(cfg),ctl.source(),count=1,flags=re.M),encoding="utf-8")
+            torch.save(model.state_dict(),cp)
+            spec={"kind":"v6","family":"complex_residual","source":"source.py","source_sha256":ctl.sha(source),"checkpoint":"best_model.pt","checkpoint_sha256":ctl.sha(cp)}
+            (root/"v6_bundle.json").write_text(json.dumps({"protocol":"v6-offline-v1","experts":[spec],"alignment":"none","weights":[1.]}))
+            (root/"package_manifest.json").write_text(json.dumps(old_offline.package_manifest(root)))
+            restored=offline_runner.load_package(root)
+            with torch.no_grad(): self.assertTrue(torch.allclose(model(x),restored(x),atol=2e-6))
+            cp.write_bytes(b"tampered")
+            with self.assertRaises(ValueError): offline_runner.load_package(root)
+
     def test_actual_pinned_mp_if_enabled(self):
         import os
         if os.environ.get("V6_TEST_MP")!="1": self.skipTest("Optional real upstream assets")
