@@ -12,6 +12,7 @@ from pathlib import Path
 from importlib.metadata import version
 
 ROOT=Path(__file__).resolve().parents[1]
+sys.path.insert(0,str(ROOT/"src"))
 REPORT=ROOT/"runs/v57_public_preflight/report.json"
 FAMILIES=("cmgan_transfer","cascade_cmgan_two","cascade_cmgan_three","cascade_cmgan","metricgan","sepformer_dns_transfer","sepformer_wham_transfer")
 FILES=("src/kaggle_v4_external.py","src/kaggle_v4_public.py","tools/ralph_v4.py","tools/ralph_v56.py","tools/v57_public_assets.py","tools/submit_v5.py","tools/v55_gating.py","tools/v55_ensemble.py","tools/v57_offline.py","tools/v57_finalize.py","tools/v571_preflight.py")
@@ -24,6 +25,7 @@ def identity():
     return {"files":{p:digest(ROOT/p) for p in FILES},"dependencies":{p:version(p) for p in DEPS},"python":sys.version.split()[0]}
 
 def require_report(path=REPORT):
+    if not path.is_file(): raise RuntimeError("Run py -u tools/v571_preflight.py before GPU execution")
     r=json.loads(path.read_text(encoding="utf-8"))
     if r.get("protocol")!="v571-public-cpu-v1" or r.get("identity")!=identity() or r.get("status")!="PASS" or set(r.get("families",{}))!=set(FAMILIES):
         raise RuntimeError("Public CPU preflight missing, stale or incomplete")
