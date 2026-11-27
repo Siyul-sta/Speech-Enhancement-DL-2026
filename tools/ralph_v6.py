@@ -21,7 +21,8 @@ import ralph_loop as legacy
 import reconcile_ralph_v2 as recovery
 
 ROOT=v4.ROOT
-FAMILIES=("mp_dns","mp_vb","sepformer_dns_transfer","cmgan_transfer","complex_residual","metricgan","sepformer_wham_transfer","dual_axis","residual_relaxed")
+ADVANCED=("semamba","semambapp","rose_cd")
+FAMILIES=("mp_dns","mp_vb",*ADVANCED,"sepformer_dns_transfer","cmgan_transfer","complex_residual","metricgan","sepformer_wham_transfer","dual_axis","residual_relaxed")
 PRETRAINED=set(FAMILIES)-{"complex_residual","dual_axis","residual_relaxed"}
 MILESTONES=(25,50,100,200)
 TERMINAL={"ERROR","CANCELLED","CANCELED","CANCEL_ACKNOWLEDGED"}
@@ -34,8 +35,8 @@ def source():
     base=base.split(marker)[0]
     marker='    if isinstance(model,CMGANTransfer):\n        n=model.net'
     if base.count(marker)!=1: raise ValueError("Transfer group contract changed")
-    base=base.replace(marker,'    if isinstance(model,V6MPNet): return v6_mp_groups(model)\n'+marker,1)
-    code=base+"\n"+"\n".join((ROOT/"src"/p).read_text(encoding="utf-8") for p in ("v6_mpsenet.py","v6_data.py","v6_training.py"))
+    base=base.replace(marker,'    if isinstance(model,V6MPNet): return v6_mp_groups(model)\n    if isinstance(model,(V6SEMamba,V6SEMambaPP)): return v6_sem_groups(model)\n    if isinstance(model,V6RoseCD): return v6_rose_groups(model)\n'+marker,1)
+    code=base+"\n"+"\n".join((ROOT/"src"/p).read_text(encoding="utf-8") for p in ("v6_mpsenet.py","v6_semamba.py","v6_semambapp.py","v6_rose_cd.py","v6_data.py","v6_training.py"))
     compile(code,"v6_runner.py","exec")
     return code
 
@@ -53,6 +54,12 @@ def verify(folder,state):
     if m.get("protocol")!="v6-max-pesq-v1" or m.get("mode")!=cfg.get("v6_mode") or m.get("parent")!=cfg.get("v6_parent"):
         raise ValueError("V6 identity mismatch")
     if m.get("checkpoint_sha256")!=sha(folder/"best_model.pt"): raise ValueError("V6 checkpoint corrupt")
+    if m.get("hf_lock")!=cfg.get("v6_hf_lock"): raise ValueError("V6 public checkpoint lock mismatch")
+    family=cfg.get("v6_base_family") or cfg["architecture"]
+    if family in ("semambapp","rose_cd"):
+        if not cfg.get("v6_hf_lock") or json.loads((folder/"v6_hf_lock.json").read_text(encoding="utf-8"))!=cfg["v6_hf_lock"]:
+            raise ValueError("Missing immutable HF asset identity")
+    if family=="rose_cd" and not (folder/"rose_config.json").is_file(): raise ValueError("Missing ROSE offline transform config")
     n=int(r["epochs_completed"]);b=int(r["best_epoch"]);p=m.get("parent")
     if not 0<=b<=n<=int(cfg["epochs"]) or (cfg["v6_mode"]!="zero" and n<1): raise ValueError("V6 epoch count")
     if m["attempted_epochs"]!=(p["attempted_epochs"] if p else 0)+n or m["checkpoint_epoch"]!=(p["checkpoint_epoch"] if p else 0)+b: raise ValueError("V6 lineage count")
@@ -98,7 +105,7 @@ def ledger():
         elif pc["architecture"]!=cfg["architecture"] or pc.get("v6_base_family")!=cfg.get("v6_base_family") or pc.get("v6_depth")!=cfg.get("v6_depth"): raise ValueError("Wrong continuation family")
     return out
 
-def config(family,mode,code_sha,policies,cache=None,epochs=0,mix=2048,public_mix=512,korean=0,critic=False,hard=False,parent=None,base=None,depth=None,coarse=False,smoke=False,lr=None):
+def config(family,mode,code_sha,policies,cache=None,epochs=0,mix=2048,public_mix=512,korean=0,critic=False,hard=False,parent=None,base=None,depth=None,coarse=False,smoke=False,lr=None,asset_locks=None):
     base_family=base or family
     cfg={"id":"V3_RESIDUAL_PHASE","architecture":family,"epochs":epochs,"seed":42,"batch_size":4 if base_family in ("complex_residual","residual_relaxed","dual_axis") else 1,
          "patience":5,"selection_target":"challenge","public_cache":cache,"warm_ref":parent["ref"] if parent else None,
@@ -107,15 +114,16 @@ def config(family,mode,code_sha,policies,cache=None,epochs=0,mix=2048,public_mix
          "v6_crop":48000 if critic else 16000,"v6_external_margin":.15,"v6_transfer":"progressive" if mode=="train" and family in PRETRAINED else None,
          "lr":lr if lr is not None else (3e-5 if base_family in PRETRAINED else 1e-4),"smoke":smoke}
     cfg["sepformer_scale_policies"]={base_family:policies[base_family]} if base_family in policies else {}
+    if base_family in ("semambapp","rose_cd"): cfg["v6_hf_lock"]=(asset_locks or {}).get(base_family)
     action="smoke" if smoke else "v6_"+mode
     cfg.update(v56_source_sha=code_sha,v56_action=action,v56_key=v56.signature([code_sha,action,cfg]))
     return cfg
 
 def estimate(cfg,entries):
-    if cfg["v6_mode"]=="zero": return .65 if cfg["architecture"].startswith("mp_") else .4
-    if cfg["smoke"]: return .35
     arch=cfg["architecture"];pairs=1100+cfg["v6_mix"]+cfg["v6_public_mix"]
     base=cfg.get("v6_base_family") or arch
+    if cfg["v6_mode"]=="zero": return {"semamba":1.5,"semambapp":1.2,"rose_cd":1.1}.get(base,.65 if arch.startswith("mp_") else .4)
+    if cfg["smoke"]: return 1.8 if base in ADVANCED else .35
     rates=[];evals=[]
     for st,r,c,_ in entries.values():
         if not r or c["architecture"]!=arch or c.get("v6_base_family")!=cfg.get("v6_base_family") or c.get("v6_crop")!=cfg.get("v6_crop") or c.get("v6_critic")!=cfg.get("v6_critic"): continue
@@ -123,8 +131,8 @@ def estimate(cfg,entries):
         if n and ts:
             rates.extend(t/n for t in ts if t>0)
             evals.extend(max(0.,a-b) for a,b in zip(total,ts))
-    seconds=statistics.median(rates) if rates else (1.2 if base.startswith(("mp_","sepformer_")) else .7 if base in PRETRAINED else .12)
-    val=statistics.median(evals) if evals else (100 if base in PRETRAINED else 40)
+    seconds=statistics.median(rates) if rates else (3.0 if base in ADVANCED else 1.2 if base.startswith(("mp_","sepformer_")) else .7 if base in PRETRAINED else .12)
+    val=statistics.median(evals) if evals else (480 if base in ADVANCED else 100 if base in PRETRAINED else 40)
     return (.25 if cfg.get("public_cache") else .6)+1.4*(2*val+cfg["epochs"]*(seconds*pairs+val))/3600
 
 def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
@@ -132,18 +140,19 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
     by_ref={st["ref"]:(st,r,c) for st,r,c in current}
     limit=min(remaining,job_limit)
     def affordable(c): return c["v56_key"] not in entries and estimate(c,entries)<=limit
+    def make(*a,**kw): return config(*a,**kw,asset_locks=getattr(args,"asset_locks",{}))
     def with_smoke(c):
         # Same architecture/depth/critic/crop; synthetic smoke does not claim parent reproduction.
-        s=config(c["architecture"],c["v6_mode"],code_sha,policies,epochs=2,mix=16,public_mix=16,
+        s=make(c["architecture"],c["v6_mode"],code_sha,policies,epochs=2,mix=16,public_mix=16,
             critic=c["v6_critic"],base=c.get("v6_base_family"),depth=c.get("v6_depth"),smoke=True)
         if s["v56_key"] in entries:
             st,r,_,_=entries[s["v56_key"]]
             return c if r and st["status"]=="COMPLETE" and affordable(c) else None
         return s if affordable(s) and affordable(c) and estimate(s,entries)+estimate(c,entries)<=remaining else None
     # Always benchmark the new pretrained MP models first. Actual score, not literature score.
-    for family in ("mp_dns","mp_vb"):
+    for family in ("mp_dns","mp_vb",*ADVANCED):
         if family not in args.families: continue
-        c=config(family,"zero",code_sha,policies,cache)
+        c=make(family,"zero",code_sha,policies,cache)
         if affordable(c): return c
     zeros={c["architecture"]:(st,r,c) for st,r,c in current if c["v6_mode"]=="zero"}
     trained=[(st,r,c) for st,r,c in current if c["v6_mode"] in ("train","cascade")]
@@ -153,11 +162,12 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
     if len(trained_families)>=1 and "complex_residual" not in trained_families and "complex_residual" in ranked: ranked.remove("complex_residual");ranked.insert(0,"complex_residual")
     pilots=[]
     for family in ranked:
-        if family in trained_families: continue
+        if family in trained_families or (family in ADVANCED and family not in zeros): continue
         parent=parent_info(*zeros[family][:2]) if family in zeros else None
-        c=config(family,"train",code_sha,policies,cache,epochs=args.pilot_epochs,mix=args.mix,public_mix=args.public_mix,parent=parent)
-        trial=with_smoke(c)
-        if trial: pilots.append(trial)
+        for epochs in range(args.pilot_epochs,0,-1):
+            c=make(family,"train",code_sha,policies,cache,epochs=epochs,mix=args.mix,public_mix=args.public_mix,parent=parent)
+            trial=with_smoke(c)
+            if trial: pilots.append(trial);break
     # One continuation per exact parent/recipe, including terminal failures.
     tried=set()
     for st,r,c,folder in entries.values():
@@ -179,7 +189,7 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
         target=next((n for n in MILESTONES if n>m["attempted_epochs"]),args.max_epochs)
         cap=min(cap,target-m["attempted_epochs"])
         for n in range(cap,max(0,min(2,cap)-1),-1):
-            nxt=config(c["architecture"],c["v6_mode"],code_sha,policies,cache,epochs=n,mix=c["v6_mix"],public_mix=c["v6_public_mix"],
+            nxt=make(c["architecture"],c["v6_mode"],code_sha,policies,cache,epochs=n,mix=c["v6_mix"],public_mix=c["v6_public_mix"],
                 korean=c["v6_korean"],critic=c["v6_critic"],hard=c["v6_hard"],parent=p,base=c.get("v6_base_family"),depth=c.get("v6_depth"),
                 lr=max(1e-8,min(float(c["lr"])*.5,float(m["lr"]))))
             if identity(nxt) in tried: break
@@ -195,28 +205,28 @@ def choose(entries,code_sha,policies,cache,remaining,job_limit,args):
             if cap<1: continue
             common=dict(epochs=cap,mix=c["v6_mix"],public_mix=c["v6_public_mix"],parent=p,lr=max(1e-8,float(c["lr"])*.5))
             if c["v6_mix"]<args.max_mix:
-                q=config(c["architecture"],"train",code_sha,policies,cache,**{**common,"mix":min(args.max_mix,c["v6_mix"]*2)},korean=c["v6_korean"],hard=c["v6_hard"],critic=c["v6_critic"])
+                q=make(c["architecture"],"train",code_sha,policies,cache,**{**common,"mix":min(args.max_mix,c["v6_mix"]*2)},korean=c["v6_korean"],hard=c["v6_hard"],critic=c["v6_critic"])
                 if identity(q) not in tried:
                     trial=with_smoke(q)
                     if trial: variants.append(trial)
             if args.korean_limit and not c["v6_korean"]:
-                q=config(c["architecture"],"train",code_sha,policies,cache,**common,korean=args.korean_limit,hard=c["v6_hard"],critic=c["v6_critic"])
+                q=make(c["architecture"],"train",code_sha,policies,cache,**common,korean=args.korean_limit,hard=c["v6_hard"],critic=c["v6_critic"])
                 if identity(q) not in tried:
                     trial=with_smoke(q)
                     if trial: variants.append(trial)
             if not c["v6_hard"]:
-                q=config(c["architecture"],"train",code_sha,policies,cache,**common,korean=c["v6_korean"],hard=True,critic=c["v6_critic"])
+                q=make(c["architecture"],"train",code_sha,policies,cache,**common,korean=c["v6_korean"],hard=True,critic=c["v6_critic"])
                 if identity(q) not in tried:
                     trial=with_smoke(q)
                     if trial: variants.append(trial)
             if not c["v6_critic"] and args.enable_critic:
-                q=config(c["architecture"],"train",code_sha,policies,cache,**common,korean=c["v6_korean"],hard=c["v6_hard"],critic=True)
+                q=make(c["architecture"],"train",code_sha,policies,cache,**common,korean=c["v6_korean"],hard=c["v6_hard"],critic=True)
                 if identity(q) not in tried:
                     trial=with_smoke(q)
                     if trial: variants.append(trial)
             if args.enable_cascade:
                 for depth in (1,2,3):
-                    q=config("v6_cascade", "cascade",code_sha,policies,cache,**common,base=c["architecture"],depth=depth,coarse=True)
+                    q=make("v6_cascade", "cascade",code_sha,policies,cache,**common,base=c["architecture"],depth=depth,coarse=True)
                     if identity(q) not in tried:
                         trial=with_smoke(q)
                         if trial: variants.append(trial)
@@ -359,7 +369,8 @@ def run(args):
         policies=require_scale(data_root=args.data_root)
         if require_report().get("sepformer_scale_policies")!=policies: raise ValueError("Stale public preflight")
         from v6_preflight import require
-        require(code_sha,args.data_root,args.families)
+        accepted=require(code_sha,args.data_root,args.families)
+        args.asset_locks=accepted.get("hf_locks",{})
         cache=args.public_cache_ref or v4.find_public_cache()
         tag="v4"+datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S%f")
         started=time.monotonic();rounds=0;failures=0;quota=quota_retry(kaggle)
