@@ -132,6 +132,7 @@ def main():
     p.add_argument("--manifest",type=Path)
     p.add_argument("--count",type=int)
     p.add_argument("--probe",action="store_true")
+    p.add_argument("--zip",action="store_true",help="Optional flat WAV-only ZIP after verification")
     args=p.parse_args()
     root=args.package.resolve()
     verify_package(root)
@@ -156,6 +157,13 @@ def main():
         files=verify_outputs(args.input.resolve(),out)
         # Manifest outside WAV directory, suitable for a WAV-only submission ZIP.
         (out.parent/(out.name+".sha256.json")).write_text(json.dumps(files,indent=2),encoding="utf-8")
+        if args.zip:
+            import zipfile
+            target=out.parent/(out.name+".zip")
+            with zipfile.ZipFile(target,"x",compression=zipfile.ZIP_DEFLATED) as z:
+                for name in sorted(files): z.write(out/name,arcname=name)
+            with zipfile.ZipFile(target) as z:
+                if z.testzip() is not None or set(z.namelist())!=set(files) or any(hashlib.sha256(z.read(name)).hexdigest()!=digest for name,digest in files.items()): raise RuntimeError("ZIP verification failed")
         print("V57 verified submission",len(files),flush=True)
 
 if __name__=="__main__": main()
