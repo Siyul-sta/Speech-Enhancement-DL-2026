@@ -16,17 +16,18 @@ import submit_v5 as submission
 from v51_data_audit import speaker
 from v55_gating import fit_gate,mix_outputs
 
-def select_experts(records,limit=3):
+def select_experts(records,limit=3,public_families=()):
     """Shortlist verified native runs, diversify by architecture first.
     Prior validation scores are development shortlist evidence, not gate targets.
     """
     if not 2<=limit<=5: raise ValueError("Expert limit 2–5")
     pool=[]
     for st,r in records:
-        if st.get("kind")!="v4_external" or st.get("status")!="COMPLETE" or r.get("evaluation_protocol")!="v4.2-fixed-dev-v2" or r.get("smoke") or r.get("transductive_noisy") or r.get("model_family") not in submission.FAMILIES: continue
+        if st.get("kind")!="v4_external" or st.get("status")!="COMPLETE" or r.get("evaluation_protocol")!="v4.2-fixed-dev-v2" or r.get("smoke") or r.get("transductive_noisy") or r.get("model_family") not in set(submission.FAMILIES)|set(public_families): continue
         if not st.get("source_path"): continue
         folder=Path(st["source_path"]).parent
         if not all((folder/f).is_file() for f in ("source.py","best_model.pt","result.json")): continue
+        if r.get("model_family") in public_families and not r["model_family"].startswith(("cmgan","cascade_cmgan")) and not all((folder/f).is_file() for f in ("offline_hyperparams.yaml","offline_hyperparams.json")): continue
         score=float(r["best_validation_pesq_wb"])
         if not math.isfinite(score): continue
         pool.append((score,r["model_family"],folder))
@@ -110,12 +111,13 @@ def choose_candidate(candidates,margin=.02):
     best=max(candidates,key=lambda r:r["pesq"])
     return best if best["pesq"]>baseline["pesq"]+margin else baseline
 
-def bundle_experts(folders,out):
+def bundle_experts(folders,out,public_families=(),cmgan_root=None):
     entries=[];hashes=set()
     for i,folder in enumerate(folders):
         r=controller.verify(folder,"v4_external")
         state=json.loads((folder/"remote_state.json").read_text(encoding="utf-8"))
-        if state.get("status")!="COMPLETE" or state.get("kind")!="v4_external" or r.get("evaluation_protocol")!="v4.2-fixed-dev-v2" or r.get("smoke") or r.get("transductive_noisy") or r.get("model_family") not in submission.FAMILIES:
+        controller.verify_v56_metadata(r,state)
+        if state.get("status")!="COMPLETE" or state.get("kind")!="v4_external" or r.get("evaluation_protocol")!="v4.2-fixed-dev-v2" or r.get("smoke") or r.get("transductive_noisy") or r.get("model_family") not in set(submission.FAMILIES)|set(public_families):
             raise ValueError("Ineligible expert: "+str(folder))
         digest=submission.sha256(folder/"best_model.pt")
         if digest in hashes: raise ValueError("Duplicate expert checkpoint")
@@ -125,6 +127,10 @@ def bundle_experts(folders,out):
         entries.append({"weight":1/len(folders),"source":f"model_{i+1}/source.py","checkpoint":f"model_{i+1}/best_model.pt",
             "source_sha256":submission.sha256(sub/"source.py"),"checkpoint_sha256":digest,
             "individual_validation_pesq":r["best_validation_pesq_wb"],"family":r["model_family"],"remote_ref":state.get("ref")})
+        if r["model_family"] in public_families:
+            from v57_public_assets import package_public
+            meta=package_public(r["model_family"],folder,(sub/"source.py").read_text(encoding="utf-8"),sub/"assets",False,cmgan_root)
+            entries[-1]["public_assets"]={**meta,"root":f"model_{i+1}/assets"}
     return entries
 
 def json_write(path,obj):
@@ -135,14 +141,16 @@ def run(args):
     root=args.root.resolve();out=args.out.resolve()
     if out.exists() or out.is_relative_to(root): raise ValueError("Use a new output directory outside dataset root")
     if not 2<=args.max_experts<=5 or not 1<=args.gate_epochs<=100: raise ValueError("Invalid ensemble settings")
-    folders=[p.resolve() for p in args.run] if args.run else select_experts(controller.history(),args.max_experts)
+    public_families=tuple(getattr(args,"public_families",()))
+    cmgan_root=getattr(args,"cmgan_root",None)
+    folders=[p.resolve() for p in args.run] if args.run else select_experts(controller.history(),args.max_experts,public_families)
     if not 2<=len(folders)<=5 or len(set(folders))!=len(folders): raise ValueError("Need 2–5 distinct verified completed native checkpoints; train experts first")
     if any(out.is_relative_to(p.resolve()) for p in folders): raise ValueError("Output cannot modify expert runs")
     manifest,rows=load_train(root)
     fit,select=split_train(rows)
     device=torch.device(args.device)
     out.mkdir(parents=True)
-    entries=bundle_experts(folders,out)
+    entries=bundle_experts(folders,out,public_families,cmgan_root)
     config=out/"bundle.json"
     working=out/"candidate_bundle.json"
     json_write(working,{"models":entries})
@@ -190,7 +198,7 @@ def run(args):
         "bundle_sha256":submission.sha256(config),
         "limitations":["Prior challenge validation scores may shortlist experts; no validation target is used to fit or choose mixture.",
           "Base experts may have trained on fit/selection clips. Scores are not out-of-fold estimates or independent generalization.",
-          "Only native offline families admitted; public expert packaging deferred.",
+          "Public experts require explicit compatibility authorization and archived assets.",
           "Final validation is development evidence, not hidden test."]}
     json_write(out/"ensemble_report.json",report)
     print("V55 SELECTED",json.dumps(selected),flush=True)
