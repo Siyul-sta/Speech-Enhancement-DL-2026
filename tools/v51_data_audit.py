@@ -154,7 +154,15 @@ def main():
     p.add_argument("--out",required=True,type=Path)
     p.add_argument("--pesq",action="store_true",help="Score original noisy validation only")
     p.add_argument("--model-scores",type=Path,help="Complete validation_per_file.csv from exact matching manifest")
+    p.add_argument("--oracle",action="store_true",help="Also run train-prefix and full validation oracle projections locally")
+    p.add_argument("--oracle-train-limit",type=int,default=64,help="Number of training rows for the exploratory oracle; 1296 for full train")
     args=p.parse_args()
-    audit(args.root,args.out,args.pesq,args.model_scores)
+    if args.oracle and not 1<=args.oracle_train_limit<=1296: p.error("Invalid oracle train limit")
+    audit(args.root,args.out,args.pesq or args.oracle,args.model_scores)
+    if args.oracle:
+        from types import SimpleNamespace
+        import oracle_mask_audit
+        for split,limit in (("train",args.oracle_train_limit),("validation",None)):
+            oracle_mask_audit.run(SimpleNamespace(root=args.root,split=split,limit=limit,out=args.out/("oracle_"+split)))
 
 if __name__=="__main__": main()
