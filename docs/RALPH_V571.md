@@ -15,7 +15,7 @@ git pull --ff-only
 py -m compileall -q src tools tests
 $TorchVersion = (py -c "import torch; print(torch.__version__.split('+')[0])").Trim()
 py -m pip install --index-url https://download.pytorch.org/whl/cpu "torchaudio==$TorchVersion"
-py -m pip install "speechbrain==1.0.3" "hyperpyyaml==1.2.2" "huggingface_hub<1" einops
+py -m pip install "speechbrain==1.0.3" "hyperpyyaml==1.2.2" "ruamel.yaml==0.18.16" "huggingface_hub<1" einops
 py -m unittest discover -s tests -p "test_v571_preflight.py" -v
 $env:V5_TEST_PUBLIC_CMGAN = "1"
 py -m unittest discover -s tests -p "test_v57_final.py" -v
@@ -92,3 +92,5 @@ run the existing one-job V5.6 live integration check, not unrestricted
 training immediately. No GPU work was submitted by this development.
 Independent evaluation data, course submission layout and actual GPU
 results remain unresolved. Main branch is unchanged.
+
+Known issue: ruamel.yaml 0.19.x introduces max_depth and breaks the HyperPyYAML 1.2.2 Loader. Pin 0.18.16 locally and in Kaggle. The package version is included in the CPU gate and new archived metadata.
