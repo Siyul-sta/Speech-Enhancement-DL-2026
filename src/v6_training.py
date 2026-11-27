@@ -77,16 +77,23 @@ def v6_loaders(cfg,device):
         data=torch.utils.data.Subset(train,fit)
         if not zero:
             limit=int(cfg.get("v6_korean",0))
+            cached_ko,cached_noise=v6_read_extra_cache(cfg.get("public_cache"))
             korean=[]
             if limit:
-                subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
-                korean=fleurs_speech("train",limit=limit)
-            # Use both public speech and challenge residuals. Separate public-only mix keeps coverage.
+                # Prefer CPU-built Zeroth cache. Otherwise use pinned train-only
+                # FLEURS and Zeroth subsets, never official test data.
+                if len(cached_ko)>=limit: korean=cached_ko[:limit]
+                else:
+                    subprocess.check_call([sys.executable,"-m","pip","install","-q","datasets==3.6.0","pyarrow==20.0.0","huggingface_hub<1"])
+                    z=limit//2;f=limit-z
+                    korean=(v6_zeroth(WORK/"v6_external_korean",z) if z else [])+fleurs_speech("train",limit=f)
+            # Additional DNS noise is train-only; fixed external validation remains unchanged.
+            tn=list(tn)+cached_noise
             mix=V6CrossMix(train,fit,tr+korean,tn,int(cfg["v6_mix"]),int(cfg["seed"]),hard=cfg.get("v6_hard",False))
-            public=SyntheticPairs(tr,tn,int(cfg["v6_public_mix"]),42,True)
+            public=SyntheticPairs(tr+korean,tn,int(cfg["v6_public_mix"]),42,True)
             data=torch.utils.data.ConcatDataset([data,mix,public])
             print("V6_DATA "+json.dumps({"fit":len(fit),"calibration":len(cal),"gate_fit":len(gate_fit),"gate_select":len(gate_select),
-                   "external_speech_files":len(tr),"korean_files":len(korean),"crossmix_per_epoch":len(mix),"public_per_epoch":len(public)}),flush=True)
+                   "external_speech_files":len(tr),"korean_files":len(korean),"extra_dns_noise_files":len(cached_noise),"crossmix_per_epoch":len(mix),"public_per_epoch":len(public)}),flush=True)
     # Full-length validation always; optional short training crops only.
     loader=DataLoader(data,batch_size=int(cfg["batch_size"]),shuffle=True,generator=torch.Generator().manual_seed(cfg["seed"]),num_workers=0)
     return loader,DataLoader(val,batch_size=1,shuffle=False),DataLoader(ext,batch_size=1,shuffle=False),DataLoader(torch.utils.data.Subset(train,cal[:32]),batch_size=1,shuffle=False),mix,train,cal[:32]
@@ -250,5 +257,11 @@ def v6_run():
     print("FINAL_RESULT "+json.dumps(result,allow_nan=False),flush=True)
 
 if __name__=="__main__":
-    try: v6_run()
-    finally: close_pesq_pool()
+    if "--prepare-v6-cache" in sys.argv:
+        root=public_assets(prepare_only=True)
+        limit=int(EXPERIMENT_CONFIG.get("v6_cache_korean",0))
+        if limit: subprocess.check_call([sys.executable,"-m","pip","install","-q","pyarrow==20.0.0","fsspec[http]"])
+        print("V6 EXTRA CACHE",json.dumps(v6_cache_extra(root,limit,bool(EXPERIMENT_CONFIG.get("v6_cache_dns")))),flush=True)
+    else:
+        try: v6_run()
+        finally: close_pesq_pool()
