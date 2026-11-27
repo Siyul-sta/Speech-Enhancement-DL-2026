@@ -39,12 +39,13 @@ def build(source):
     replace('    for epoch in range(1, int(cfg["epochs"]) + 1):\n        model.train()', '''    for epoch in range(1, int(cfg["epochs"]) + 1):
         effective_epoch=epoch+v59_offset
         if v59_enabled:
-            seed_everything(int(cfg["seed"])+effective_epoch)
-            if train_loader.generator is not None: train_loader.generator.manual_seed(int(cfg["seed"])+effective_epoch)
+            data_epoch=v59_attempted+epoch
+            seed_everything(int(cfg["seed"])+data_epoch)
+            if train_loader.generator is not None: train_loader.generator.manual_seed(int(cfg["seed"])+data_epoch)
         model.train()''')
     replace('            event=transfer.apply(epoch)', '''            event=transfer.apply(effective_epoch)
             if v59_enabled: event.update(epoch=epoch,effective_epoch=effective_epoch)''')
-    replace('set_data_epoch(train_set,epoch)\n        losses = []','set_data_epoch(train_set,effective_epoch)\n        losses = []')
+    replace('set_data_epoch(train_set,epoch)\n        losses = []','set_data_epoch(train_set,v59_attempted+epoch if v59_enabled else epoch)\n        losses = []')
     replace('        scheduler.step()\n        val_pesq, _ = evaluate','        if not v59_enabled: scheduler.step()\n        val_pesq, _ = evaluate')
     replace('        eligible=not (transfer or cascade) or transfer_candidate_allowed(val_pesq,domain_scores[1:],zero_shot["external_domains"])', '''        eligible=not (transfer or cascade or v59_parent) or transfer_candidate_allowed(val_pesq,domain_scores[1:],zero_shot["external_domains"])
         if v59_parent:
