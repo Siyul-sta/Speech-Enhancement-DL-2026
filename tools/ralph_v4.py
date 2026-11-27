@@ -82,7 +82,7 @@ def history():
 
 def propose_config(records, n, epochs, codex, discovery=None, allow_generated=False, failures=None):
     """Codex chooses a typed research plan; no arbitrary evaluation code edits."""
-    architectures=("residual","residual_relaxed","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer")+(("generated",) if allow_generated else ())
+    architectures=("residual","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer")+(("generated",) if allow_generated else ())
     fallback={"architecture":architectures[n%len(architectures)],"self_supervised":bool(n%2),"self_mode":["consistency","remix"][(n//2)%2],
               "lr":0.0001,"external_size":[512,1024,2048][n%3],"loss_mode":["base","sisdr","waveform","composed"][n%4],"distill":bool(n%3==2),"transductive":False,"data_profile":["base","spanish","rir","korean"][n%4],"augmentation":["base","room_codec"][n%2],"loss_weights":{"wave":0.2,"spectral":0.3,"sisdr":0.5},"network_spec":catalog.default_network(n)}
     if not codex: return fallback
@@ -208,7 +208,7 @@ def submit(kaggle, source, tag, i, kind, config=None):
 
 def public_with_external(public,external):
     tree=ast.parse(external)
-    names={"public_assets","SyntheticPairs","quality_paths","_pesq_one","close_pesq_pool","score_waveforms"}
+    names={"public_assets","SyntheticPairs","quality_paths","_pesq_one","close_pesq_pool","score_waveforms","cmgan_assets","CMGANTransfer"}
     fragments=[ast.get_source_segment(external,n) for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
     if len(fragments)!=len(names): raise ValueError("Missing shared evaluation helper")
     marker="def run():"
@@ -267,14 +267,18 @@ def main():
     p.add_argument("--execute",action="store_true")
     p.add_argument("--loop",action="store_true",help="Continue mixed-corpus training and warm-start search until quota/safety guard")
     p.add_argument("--challenge-focus",action="store_true",help="Select training checkpoint by challenge PESQ; keep external scoring unchanged")
-    p.add_argument("--focus-architecture",choices=("residual","residual_relaxed","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer"),help="Override architecture for a controlled trial")
+    p.add_argument("--focus-architecture",choices=("residual","residual_relaxed","dual_axis","cmgan_transfer","temporal","metricgan","moe","composed","sepformer_dns_transfer","sepformer_wham_transfer"),help="Override architecture for a controlled trial")
+    p.add_argument("--v5-suite",action="store_true",help="Controlled challenge-focused V5 stages, then continuous research")
+    p.add_argument("--challenge-remix",type=int,choices=(0,512,1024,2048),default=0)
+    p.add_argument("--pesq-aware",action="store_true",help="Train-only PESQ critic, generator objective from epoch 3")
     p.add_argument("--codex-research",action="store_true",help="Use Codex for structured strategy proposals")
     p.add_argument("--max-rounds",type=int,default=0,help="0 means until quota/safety stop")
     p.add_argument("--epochs",type=int,default=15,choices=range(2,101))
     args=p.parse_args()
     if sum(map(bool,(args.smoke,args.loop,args.final_audit,args.perf_benchmark,args.validated_perf_run)))>1: p.error("Choose exactly one execution mode")
     if args.amp and not (args.smoke or args.perf_benchmark or args.validated_perf_run): p.error("--amp requires smoke or the quality-gated performance mode")
-    if (args.challenge_focus or args.focus_architecture) and not args.loop: p.error("Focus options require --loop")
+    if (args.v5_suite or args.focus_architecture or args.challenge_remix or args.pesq_aware) and not args.loop: p.error("Training focus options require --loop")
+    if args.v5_suite: args.challenge_focus=True
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
     sources["v4_public"]=public_with_external(sources["v4_public"],sources["v4_external"])
@@ -329,10 +333,11 @@ def main():
             legacy.require_quota(kaggle,2)
             submit(kaggle,source,tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":None if recipe else st["ref"],"public_recipe":recipe,"architecture":r.get("model_family","residual"),"data_profile":"base","network_spec":r.get("network_spec"),"final_audit":True,"audit_aux":args.audit_aux,"audit_urgent":args.audit_urgent,"audit_korean":args.audit_korean,"public_cache":cache})
             return
-        if not any(st["kind"]=="v4_public" for st,r in records) or not args.loop:
+        has_public=any(st["kind"]=="v4_public" and (not args.challenge_focus or (r.get("selection_target")=="challenge" and r.get("v5_public"))) for st,r in records)
+        if not has_public or not args.loop:
             legacy.require_quota(kaggle,2)
             i+=1
-            records.append(submit(kaggle,sources["v4_public"],tag,i,"v4_public",{"id":"V4_PUBLIC_ZERO_SHOT","seed":42,"public_cache":cache}))
+            records.append(submit(kaggle,sources["v4_public"],tag,i,"v4_public",{"id":"V4_PUBLIC_ZERO_SHOT","seed":42,"public_cache":cache,"selection_target":"challenge" if args.challenge_focus else "robust","v5_public":args.challenge_focus}))
         if not args.loop: return
         errors=0
         discovery={}
@@ -346,6 +351,18 @@ def main():
                 discovery=catalog.discover()
                 core.json_write(core.OUTPUT/("run_"+tag)/"public_research.json",discovery)
             plan=propose_config(records,n,args.epochs,codex,discovery,args.allow_generated_code,failures[-8:])
+            stages=[("bounded-control","residual",0,False),("relaxed","residual_relaxed",0,False),("remix","residual_relaxed",1024,False),("metric-loss","residual_relaxed",1024,True),("metricgan-transfer","metricgan",1024,True),("cmgan-transfer","cmgan_transfer",1024,True),("dual-axis","dual_axis",1024,True),("sepformer-transfer","sepformer_dns_transfer",1024,True)]
+            done={r.get("v5_stage") for st,r in records}
+            stage=next((s for s in stages if s[0] not in done and s[0] not in {x["plan"].get("v5_stage") for x in failures}),None) if args.v5_suite else None
+            if stage:
+                name,arch,remix,metric=stage
+                plan.update(architecture=arch,self_supervised=False,transductive=False,distill=False,data_profile="base",augmentation="base",external_size=512,lr=0.00003 if arch in ("metricgan","cmgan_transfer","sepformer_dns_transfer") else 0.0001,loss_mode="base",challenge_remix=remix,pesq_aware=metric,v5_stage=name)
+            else:
+                plan["challenge_remix"]=args.challenge_remix or (1024 if args.v5_suite else 0)
+                plan["pesq_aware"]=args.pesq_aware or args.v5_suite
+                if args.v5_suite:
+                    plan["transductive"]=False
+                    if n%4==0: plan["architecture"]=("residual_relaxed","dual_axis","cmgan_transfer")[(n//4)%3]
             if args.focus_architecture: plan["architecture"]=args.focus_architecture
             candidate=sources["v4_external"]
             if plan["architecture"]=="generated":
@@ -363,8 +380,8 @@ def main():
                       and r.get("generated_hash")==plan.get("generated_hash")
                       and (plan["architecture"]!="composed" or r.get("network_spec")==plan["network_spec"])]
             best=max(external,key=lambda pair:pair[1]["best_validation_pesq_wb"] if args.challenge_focus else rank_score(pair[1]),default=None)
-            warm=best[0]["ref"] if best and n%4!=0 else None
-            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,"amp":args.amp,"selection_target":"challenge" if args.challenge_focus else "robust",**plan}
+            warm=best[0]["ref"] if best and n%4!=0 and not stage else None
+            cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") or plan["architecture"]=="cmgan_transfer" else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,"amp":args.amp,"selection_target":"challenge" if args.challenge_focus else "robust",**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
             try:
