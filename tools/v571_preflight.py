@@ -15,7 +15,7 @@ ROOT=Path(__file__).resolve().parents[1]
 sys.path.insert(0,str(ROOT/"src"))
 REPORT=ROOT/"runs/v57_public_preflight/report.json"
 FAMILIES=("cmgan_transfer","cascade_cmgan_two","cascade_cmgan_three","cascade_cmgan","metricgan","sepformer_dns_transfer","sepformer_wham_transfer")
-FILES=("src/kaggle_v4_external.py","src/kaggle_v4_public.py","tools/ralph_v4.py","tools/ralph_v56.py","tools/v57_public_assets.py","tools/submit_v5.py","tools/v55_gating.py","tools/v55_ensemble.py","tools/v57_offline.py","tools/v57_finalize.py","tools/v571_preflight.py")
+FILES=("src/kaggle_v4_external.py","src/kaggle_v4_public.py","tools/ralph_v4.py","tools/ralph_v56.py","tools/v57_public_assets.py","tools/submit_v5.py","tools/v55_gating.py","tools/v55_ensemble.py","tools/v57_offline.py","tools/v57_finalize.py","tools/v571_preflight.py","tools/v572_scale_audit.py")
 DEPS=("torch","torchaudio","speechbrain","hyperpyyaml","ruamel.yaml","huggingface_hub","numpy","pandas","scipy","soundfile","einops","pesq")
 
 def digest(p):
@@ -131,7 +131,7 @@ def spec_for(folder,source,checkpoint,family,assets=None):
     if assets: d["public_assets"]=assets
     return d
 
-def single(family,work,cache,package):
+def single(family,work,cache,package,policies=None):
     import re
     import numpy as np
     import torch
@@ -140,7 +140,7 @@ def single(family,work,cache,package):
     import v57_finalize as f
     cpu_numeric_settings()
     t.WORK=cache
-    t.EXPERIMENT_CONFIG={"id":"V3_RESIDUAL_PHASE","architecture":family,"seed":571}
+    t.EXPERIMENT_CONFIG={"id":"V3_RESIDUAL_PHASE","architecture":family,"seed":571,"sepformer_scale_policies":policies or {}}
     # Public hparams capture belongs to this family; remove stale captures.
     for name in ("offline_hyperparams.yaml","offline_hyperparams.json"):
         (cache/name).unlink(missing_ok=True)
@@ -169,6 +169,7 @@ def single(family,work,cache,package):
     r["checkpoint_sha256"]=digest(checkpoint)
     r["initial_fixture_max_change"]=float(np.max(np.abs(expected-original.numpy()[0])))
     if r["initial_fixture_max_change"]<=1e-9: raise RuntimeError("Modified checkpoint did not change fixture output")
+    if family.startswith("sepformer_") and (policies or {}).get(family,"raw")!="raw" and (r["reference_peak"]>.98001 or r["actual_clipped_fraction"]>0): raise RuntimeError("Bounded SepFormer policy failed amplitude check")
     return r
 
 def mixed(work,public_package):
@@ -216,7 +217,11 @@ def run(out,data_root=None):
     if version("ruamel.yaml")!="0.18.16": raise RuntimeError("Install ruamel.yaml==0.18.16 before preflight")
     out.mkdir(parents=True,exist_ok=True)
     cache=out/"assets_cache";cache.mkdir(exist_ok=True)
-    report={"protocol":"v571-public-cpu-v1","status":"RUNNING","identity":identity(),"families":{},"cmgan_root":str(cache/"cmgan_assets")}
+    policies={}
+    if data_root:
+        from v572_scale_audit import require_report as require_scale
+        policies=require_scale(data_root=data_root)
+    report={"protocol":"v571-public-cpu-v1","status":"RUNNING","identity":identity(),"families":{},"cmgan_root":str(cache/"cmgan_assets"),"sepformer_scale_policies":policies}
     path=out/"report.json";write(path,report)
     with tempfile.TemporaryDirectory(dir=out) as d:
         work=Path(d);keep=None
@@ -237,7 +242,7 @@ def run(out,data_root=None):
             pkg=work/family
             print("V571 CHECK",family,flush=True)
             try:
-                r=single(family,work,cache,pkg)
+                r=single(family,work,cache,pkg,policies)
                 if family=="cmgan_transfer": keep=pkg
             except Exception as exc:
                 r={"status":"FAIL","error":repr(exc)}
