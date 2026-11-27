@@ -63,7 +63,7 @@ class V51Tests(unittest.TestCase):
                 with (p/name).open("w",newline="") as f:
                     w=csv.writer(f);w.writerow(["index","pesq_wb"]);w.writerows((i,2.) for i in range(count))
             (p/"best_model.pt").write_bytes(b"fixture")
-            r={"validation_files":164,"best_validation_pesq_wb":2.,"external_validation_files":64,"external_validation_pesq_wb":2.,"joint_score":2.,"evaluation_protocol":"v4-smoke-fixture-v1","domain_scores":{"challenge":2.,"external_normal":2.,"external_stress":2.},"robust_score":2.,"smoke":True,"epochs_completed":3,"smoke_metric_protocol":"v5.1-three-epoch","pesq_aware":True,"critic_updates":3,"metric_generator_steps":8,"metric_gradient_norm":.01}
+            r={"validation_files":164,"best_validation_pesq_wb":2.,"external_validation_files":64,"external_validation_pesq_wb":2.,"joint_score":2.,"evaluation_protocol":"v4-smoke-fixture-v1","domain_scores":{"challenge":2.,"external_normal":2.,"external_stress":2.},"robust_score":2.,"smoke":True,"epochs_completed":3,"smoke_metric_protocol":"v5.1-three-epoch","pesq_aware":True,"critic_updates":3,"metric_generator_steps":8,"metric_gradient_norm":.01,"critic_calibration":{"count":64,"mae":.2,"rmse":.3,"pearson":.5}}
             def write(): (p/"result.json").write_text(json.dumps(r))
             write();self.assertEqual(v4.verify(p,"v4_smoke")["metric_generator_steps"],8)
             for norm in (0.,None,float("nan")):
