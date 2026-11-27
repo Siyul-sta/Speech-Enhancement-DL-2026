@@ -26,7 +26,7 @@ def read_wave(root,name):
 
 def category(row,names):
     for k in names:
-        if row.get(k,"").strip(): return row[k].strip()
+        if (row.get(k) or "").strip(): return row[k].strip()
     return None
 
 def speaker(row):
@@ -49,12 +49,13 @@ def describe_pair(noisy,clean):
     cp=float(np.mean(clean**2)); npow=float(np.mean(n**2))
     corr=float(np.mean(clean*n)/max(math.sqrt(cp*npow),1e-12))
     snr=float(10*np.log10((cp+1e-12)/(npow+1e-12)))
+    low,mid,high=band_fractions(n)
     return {"input_snr_db":snr,"clean_rms":math.sqrt(cp),"residual_rms":math.sqrt(npow),
             "abs_residual_correlation":abs(corr),"clean_silent":cp<1e-8,
             "noisy_clip_fraction":float(np.mean(np.abs(noisy)>=.999)),
-            "residual_low_fraction":band_fractions(n)[0],
-            "residual_mid_fraction":band_fractions(n)[1],
-            "residual_high_fraction":band_fractions(n)[2]}
+            "residual_low_fraction":low,
+            "residual_mid_fraction":mid,
+            "residual_high_fraction":high}
 
 def snr_group(snr):
     for upper,label in ((0,"<0"),(5,"0–5"),(10,"5–10"),(15,"10–15"),(20,"15–20")):
