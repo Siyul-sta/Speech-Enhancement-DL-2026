@@ -161,6 +161,14 @@ def write_csv(path: Path, fields, records):
 # Public weights are downloaded locally in the private Kaggle kernel.
 # Only noisy tensors are passed to enhancement models.
 def load_model(name, device):
+    if EXPERIMENT_CONFIG.get("v571_recipe"):
+        family={"cmgan":"cmgan_transfer","metricgan":"metricgan","sepformer_dns":"sepformer_dns_transfer","sepformer_wham":"sepformer_wham_transfer"}[name]
+        old=EXPERIMENT_CONFIG.get("architecture")
+        EXPERIMENT_CONFIG["architecture"]=family
+        try:
+            cls={"cmgan_transfer":CMGANTransfer,"metricgan":MetricGANTransfer,"sepformer_dns_transfer":SepformerTransfer,"sepformer_wham_transfer":SepformerTransfer}[family]
+            return cls().to(device).eval()
+        finally: EXPERIMENT_CONFIG["architecture"]=old
     if name == "cmgan":
         return CMGANTransfer().to(device).eval()
     if name == "metricgan":
@@ -226,6 +234,25 @@ def checked_output(fn, noisy):
         raise RuntimeError("Invalid enhanced waveform shape or values")
     return y.clamp(-1, 1)
 
+class NoisyIdentity(nn.Module):
+    def forward(self,x): return x
+
+
+def export_recipe_expert(name,model):
+    import hashlib,shutil
+    family={"cmgan":"cmgan_transfer","metricgan":"metricgan","sepformer_dns":"sepformer_dns_transfer","sepformer_wham":"sepformer_wham_transfer"}[name]
+    root=WORK/"recipe_experts"/name;root.mkdir(parents=True,exist_ok=False)
+    checkpoint=root/"best_model.pt"
+    torch.save({k:v.detach().cpu() for k,v in model.state_dict().items()},checkpoint)
+    files={"best_model.pt":hashlib.sha256(checkpoint.read_bytes()).hexdigest()}
+    if family!="cmgan_transfer":
+        for filename in ("offline_hyperparams.yaml","offline_hyperparams.json"):
+            shutil.copy2(WORK/filename,root/filename)
+            files[filename]=hashlib.sha256((root/filename).read_bytes()).hexdigest()
+        if json.loads((root/"offline_hyperparams.json").read_text())["family"]!=family: raise RuntimeError("Wrong archived public hparams")
+    return {"family":family,"files":files}
+
+
 def run():
     if "public_assets" not in globals(): raise RuntimeError("Use V4 controller to package shared evaluation helpers")
     WORK.mkdir(parents=True, exist_ok=True)
@@ -238,7 +265,8 @@ def run():
     pesq_fn = ensure_pesq()
     names = ("metricgan", "deepfilter", "sepformer_dns", "sepformer_wham")
     if EXPERIMENT_CONFIG.get("v5_public"): names=names+("cmgan",)
-    predictions, errors = {}, {}
+    if EXPERIMENT_CONFIG.get("v571_recipe"): names=("cmgan","metricgan","sepformer_dns","sepformer_wham")
+    predictions, errors, recipe_experts = {}, {}, {}
     noisy = torch.from_numpy(data.noisy)
     clean = torch.from_numpy(data.clean)
     challenge_count=len(noisy)
@@ -251,10 +279,13 @@ def run():
         try:
             fn = load_model(name, device)
             with torch.inference_mode():
-                predictions[name] = torch.cat([
+                values = torch.cat([
                     checked_output(fn, x.to(device)).cpu()
                     for x in noisy.split(1)
                 ])
+            if EXPERIMENT_CONFIG.get("v571_recipe"): recipe_experts[name]=export_recipe_expert(name,fn)
+            predictions[name]=values
+            del fn
         except Exception as exc:
             errors[name] = repr(exc)
             print("MODEL_FAILED", name, repr(exc), flush=True)
@@ -296,6 +327,7 @@ def run():
               "selection_target":EXPERIMENT_CONFIG.get("selection_target","robust"),"v5_public":bool(EXPERIMENT_CONFIG.get("v5_public")),
               "best_validation_pesq_wb":domains["challenge"], "winner":winner, "scores":scores,
               "errors":errors, "selection":"global validation blend, no per-file oracle",
+              "v571_recipe":bool(EXPERIMENT_CONFIG.get("v571_recipe")),"recipe_experts":recipe_experts,
               "seed":42,"model_family":"public","v56_key":EXPERIMENT_CONFIG.get("v56_key"),
               "v56_source_sha":EXPERIMENT_CONFIG.get("v56_source_sha"),"v56_action":EXPERIMENT_CONFIG.get("v56_action"),
               "v56_requested_epochs":EXPERIMENT_CONFIG.get("epochs") if EXPERIMENT_CONFIG.get("v56_key") else None}
