@@ -1,0 +1,40 @@
+name: V6 Maximum PESQ checks
+on:
+  push:
+    branches: [feature/ralph-v5-pesq-diagnostics]
+    paths:
+      - 'src/v6_*.py'
+      - 'tools/*v6*.py'
+      - 'tests/test_v6_*.py'
+      - '.github/workflows/v6-check.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v6-check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  controller:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m compileall -q src tools tests
+      - run: python -m unittest discover -s tests -p test_v6_controller.py -v
+      - run: python tools/ralph_v6.py --data-root dummy
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install numpy pandas scipy soundfile einops
+      - run: python -m unittest discover -s tests -p test_v6_cpu.py -v
+        env:
+          V6_TEST_MP: '1'
