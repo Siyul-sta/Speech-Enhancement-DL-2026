@@ -62,6 +62,25 @@ def verify(folder, kind="v4_public"):
             for name,value in zip(("challenge","external_normal","external_stress"),domains):
                 actual=float(r["domain_scores"][name])
                 if not math.isfinite(actual) or abs(actual-value)>1e-6: raise ValueError("Invalid domain score")
+    if r.get("v571_recipe"):
+        if kind!="v4_public": raise ValueError("Recipe only valid for public benchmark")
+        import hashlib
+        families={"cmgan":"cmgan_transfer","metricgan":"metricgan","sepformer_dns":"sepformer_dns_transfer","sepformer_wham":"sepformer_wham_transfer"}
+        parts=r["winner"].split(":")
+        if len(parts)==2: names=parts[:1]
+        elif len(parts)==4 and parts[0]=="blend": names=parts[1:3]
+        elif len(parts)==4 and parts[0]=="mean3": names=parts[1:]
+        else: raise ValueError("Unknown recipe")
+        if len(set(names))!=len(names) or not set(names)<=set(families): raise ValueError("Invalid recipe names")
+        for name in names:
+            m=r["recipe_experts"][name]
+            required={"best_model.pt"} if name=="cmgan" else {"best_model.pt","offline_hyperparams.yaml","offline_hyperparams.json"}
+            if m["family"]!=families[name] or set(m["files"])!=required: raise ValueError("Incomplete public recipe archive")
+            for file,digest in m["files"].items():
+                p=folder/"recipe_experts"/name/file
+                if not p.is_file() or p.stat().st_size==0: raise ValueError("Missing public recipe asset")
+                with p.open("rb") as stream:
+                    if hashlib.file_digest(stream,"sha256").hexdigest()!=digest: raise ValueError("Public recipe archive hash mismatch")
     if r.get("v54_stage"):
         verify_cascade_result(folder,r,kind)
     if r.get("v53_stage"):
