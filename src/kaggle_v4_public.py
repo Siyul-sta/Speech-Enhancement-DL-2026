@@ -296,7 +296,9 @@ def run():
               "selection_target":EXPERIMENT_CONFIG.get("selection_target","robust"),"v5_public":bool(EXPERIMENT_CONFIG.get("v5_public")),
               "best_validation_pesq_wb":domains["challenge"], "winner":winner, "scores":scores,
               "errors":errors, "selection":"global validation blend, no per-file oracle",
-              "seed":42}
+              "seed":42,"model_family":"public","v56_key":EXPERIMENT_CONFIG.get("v56_key"),
+              "v56_source_sha":EXPERIMENT_CONFIG.get("v56_source_sha"),"v56_action":EXPERIMENT_CONFIG.get("v56_action"),
+              "v56_requested_epochs":EXPERIMENT_CONFIG.get("epochs") if EXPERIMENT_CONFIG.get("v56_key") else None}
     (WORK / "result.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
     print("FINAL_RESULT", json.dumps(result), flush=True)
 
