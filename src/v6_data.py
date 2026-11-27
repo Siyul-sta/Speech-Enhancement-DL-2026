@@ -61,9 +61,9 @@ def v6_mix(clean,noise,snr):
     return torch.from_numpy(np.asarray(x/scale,np.float32)),torch.from_numpy(np.asarray(s/scale,np.float32))
 
 class V6CrossMix(Dataset):
-    def __init__(self,train,fit,external,public_noise,size,seed=42,hard=False,curriculum=True):
+    def __init__(self,train,fit,external,public_noise,size,seed=42,hard=False,curriculum=True,korean=()):
         if train.split!="train": raise ValueError("No evaluation data in noise bank")
-        self.train=train;self.fit=np.asarray(fit,dtype=int);self.external=list(external);self.public_noise=list(public_noise)
+        self.train=train;self.fit=np.asarray(fit,dtype=int);self.external=list(external);self.korean=list(korean);self.public_noise=list(public_noise)
         if len(set(self.fit))!=len(self.fit) or self.fit.min()<0 or self.fit.max()>=len(train): raise ValueError("Invalid fit IDs")
         self.noise=train.noisy[self.fit]-train.clean[self.fit]
         clean=train.clean[self.fit]
@@ -90,7 +90,8 @@ class V6CrossMix(Dataset):
     def __getitem__(self,i):
         if not 0<=i<self.size: raise IndexError(i)
         rng=np.random.default_rng(np.random.SeedSequence([self.seed,self.epoch,int(i)]))
-        s=v6_crop(self.external,rng) if rng.random()<.80 else self.train.clean[int(rng.choice(self.fit))].copy()
+        corpus=self.korean if self.korean and rng.random()<.5 else self.external
+        s=v6_crop(corpus,rng) if rng.random()<.80 else self.train.clean[int(rng.choice(self.fit))].copy()
         g=self.groups[int(rng.choice(len(self.groups),p=self.probs))]
         j=int(rng.choice(g));n=np.roll(self.noise[j],int(rng.integers(len(s))))
         if self.public_noise and rng.random()<.20: n=v6_crop(self.public_noise,rng)
