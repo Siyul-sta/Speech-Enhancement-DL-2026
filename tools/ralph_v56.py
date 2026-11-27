@@ -241,7 +241,7 @@ def run(args):
             public_key=key_for(psha,"public","public",2,42,cache)
             if public_key not in ledger and remaining>=.45 and args.max_job_minutes/60>=.45:
                 cfg={"id":"V4_PUBLIC_ZERO_SHOT","architecture":"public","epochs":2,"seed":42,"public_cache":cache,
-                     "v5_public":True,"selection_target":"challenge","v56_key":public_key,"v56_action":"public","v56_source_sha":psha}
+                     "v5_public":True,"v571_recipe":True,"selection_target":"challenge","v56_key":public_key,"v56_action":"public","v56_source_sha":psha}
                 source=public;kind="v4_public"
             else:
                 # Search current seed first; expand deterministically only when its
