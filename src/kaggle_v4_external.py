@@ -832,6 +832,42 @@ class MetricGANTransfer(nn.Module):
         return self.resynthesize(torch.expm1(mask*features),x)
 
 
+SEPFORMER_SCALE_MODES=("raw","peak","rms_025","rms_050","rms_075","rms_100","ls","soft","soft_rms_050")
+
+
+def sepformer_scale_policy(family,cfg=None):
+    cfg=EXPERIMENT_CONFIG if cfg is None else cfg
+    mode=cfg.get("sepformer_scale_policies",{}).get(family,"raw")
+    if mode not in SEPFORMER_SCALE_MODES: raise ValueError("Invalid SepFormer scale policy")
+    return mode
+
+
+def sepformer_scale_output(x,y,mode):
+    """Noisy-only scale calibration. Preserve sign; differentiable tensor arithmetic.
+    raw is the archived legacy baseline; all other modes bound the output.
+    """
+    if mode not in SEPFORMER_SCALE_MODES or x.shape!=y.shape: raise ValueError("Invalid scaling input")
+    if mode=="raw": return y
+    # FP32 scale arithmetic avoids half-precision overflow; eps handles silence.
+    x=x.float();y=y.float()
+    peak=y.abs().amax(-1,keepdim=True).clamp_min(1e-8)
+    if mode=="peak":
+        return y*(.98/peak).clamp(max=1.)
+    xrms=x.square().mean(-1,keepdim=True).sqrt()
+    yrms=y.square().mean(-1,keepdim=True).sqrt().clamp_min(1e-8)
+    if mode=="ls":
+        gain=(x*y).mean(-1,keepdim=True)/(y.square().mean(-1,keepdim=True)+1e-8)
+        gain=gain.clamp(min=0.,max=10.)
+    elif mode=="soft":
+        return .98*torch.tanh(y/.98)
+    else:
+        ratio={"rms_025":.25,"rms_050":.5,"rms_075":.75,"rms_100":1.,"soft_rms_050":.5}[mode]
+        gain=(ratio*xrms/yrms).clamp(max=10.)
+    scaled=y*gain
+    if mode=="soft_rms_050": return .98*torch.tanh(scaled/.98)
+    return scaled*(.98/scaled.abs().amax(-1,keepdim=True).clamp_min(1e-8)).clamp(max=1.)
+
+
 class SepformerTransfer(nn.Module):
     """Registered SepFormer encoder/mask network, trainable decoder adaptation."""
     def __init__(self):
@@ -841,6 +877,7 @@ class SepformerTransfer(nn.Module):
         strategy=speechbrain_adapter_setup()
         from speechbrain.inference.separation import SepformerSeparation
         family=EXPERIMENT_CONFIG.get("architecture","sepformer_dns_transfer")
+        self.scale_policy=sepformer_scale_policy(family)
         source,revision=speechbrain_spec(family)
         savedir=Path("/tmp/ralph_v4_sepformer")/family if Path("/kaggle").exists() else WORK/family
         engine=SepformerSeparation.from_hparams(source=source,revision=revision,local_strategy=strategy,savedir=str(savedir),run_opts={"device":"cpu"},freeze_params=False)
@@ -849,7 +886,7 @@ class SepformerTransfer(nn.Module):
         self.encoder=engine.mods.encoder.requires_grad_(False)
         self.masknet=engine.mods.masknet.requires_grad_(False)
         self.decoder=engine.mods.decoder.requires_grad_(True)
-    def forward(self,x):
+    def raw_forward(self,x):
         encoder_active=any(p.requires_grad for p in self.encoder.parameters())
         mask_active=any(p.requires_grad for p in self.masknet.parameters())
         if not encoder_active: self.encoder.eval()
@@ -864,6 +901,8 @@ class SepformerTransfer(nn.Module):
         if y.ndim==3 and y.shape[1]==1: y=y[:,0]
         if y.ndim!=2: raise RuntimeError("SepFormer decoder shape")
         return F.pad(y,(0,max(0,x.shape[-1]-y.shape[-1])))[:,:x.shape[-1]]
+    def forward(self,x):
+        return sepformer_scale_output(x,self.raw_forward(x),getattr(self,"scale_policy","raw"))
 
 
 class LowRankLinearWeight(nn.Module):
@@ -1925,6 +1964,7 @@ def run():
         "elapsed_seconds": round(time.monotonic() - started, 2),
         "model": type(model).__name__,
         "model_family":cfg.get("architecture","residual"),
+        "sepformer_scale_policies":cfg.get("sepformer_scale_policies",{}),
         "loss_mode":cfg.get("loss_mode","base"),
         "pesq_aware":bool(cfg.get("pesq_aware")),
         "v5_stage":cfg.get("v5_stage"),
