@@ -72,7 +72,12 @@ def verify_lineage(st,r,cfg):
     initial=(r.get("zero_shot") or {}).get("challenge")
     gain=m.get("gain")
     if m.get("start_pesq")!=initial or (initial is None and gain is not None) or (initial is not None and (not isinstance(gain,(int,float)) or not math.isfinite(gain) or abs(gain-(r["best_validation_pesq_wb"]-initial))>1e-6)): raise ValueError("V5.9 gain mismatch")
-    if p and (initial is None or abs(initial-p["score"])>.02 or any(abs(a-b)>.02 for a,b in zip(r["zero_shot"]["external_domains"],p["external_domains"]))): raise ValueError("V5.9 parent reproduction mismatch")
+    if p:
+        if initial is None or abs(initial-p["score"])>.02 or any(abs(a-b)>.02 for a,b in zip(r["zero_shot"]["external_domains"],p["external_domains"])): raise ValueError("V5.9 parent reproduction mismatch")
+        if r["best_validation_pesq_wb"]<initial-1e-5 or any(a<b-.15001 for a,b in zip(domains(r),r["zero_shot"]["external_domains"])): raise ValueError("V5.9 checkpoint regression")
+        v4.verify_rows(cp.parent/"zero_shot_validation.csv",164,initial)
+        baseline=v4.verify_rows(cp.parent/"zero_shot_external.csv",64,sum(r["zero_shot"]["external_domains"])/2)
+        if any(abs(sum(baseline[i*32:(i+1)*32])/32-r["zero_shot"]["external_domains"][i])>1e-6 for i in range(2)): raise ValueError("V5.9 parent domain evidence mismatch")
     lrs=m.get("final_lrs")
     if not isinstance(lrs,list) or not lrs or any(not math.isfinite(float(v)) or not 0<float(v)<=float(cfg["lr"])+1e-12 for v in lrs): raise ValueError("Invalid V5.9 learning rates")
     return m
@@ -106,6 +111,14 @@ def compatible_records(records,stages,base_sha,sha):
             verify_lineage(st,r,cfg)
         elif r.get("v56_action")!="pilot" or cfg.get("warm_ref"): continue
         out.append((name,st,r,cfg))
+    by_ref={st["ref"]:(n,st,r,cfg) for n,st,r,cfg in out}
+    for name,st,r,cfg in out:
+        p=cfg.get("v59_parent")
+        if not p: continue
+        if p["ref"] not in by_ref: raise ValueError("V5.9 verified parent missing")
+        pn,ps,pr,pc=by_ref[p["ref"]]
+        if pn!=name or parent_record(ps,pr,pc)[0]!=p: raise ValueError("V5.9 parent artifact lineage mismatch")
+        if int(r["v59"]["attempted_epochs"])<=int(p["attempted_epochs"]): raise ValueError("Invalid V5.9 lineage order")
     return out
 
 def consumed_parents():
