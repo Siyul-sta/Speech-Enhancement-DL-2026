@@ -144,8 +144,9 @@ def run(args):
     out.mkdir(parents=True)
     entries=bundle_experts(folders,out)
     config=out/"bundle.json"
-    json_write(config,{"models":entries})
-    models=submission.load_bundle(config,device)
+    working=out/"candidate_bundle.json"
+    json_write(working,{"models":entries})
+    models=submission.load_bundle(working,device)
     for _,m in models: m.eval().requires_grad_(False)
     x,p,c=collect(root,rows,fit,models,device)
     sx,sp,sc=collect(root,rows,select,models,device)
@@ -172,6 +173,16 @@ def run(args):
         final["models"]=entries
         final["gating"]={"mode":mode,"experts":len(entries),"checkpoint":"gate.pt","checkpoint_sha256":submission.sha256(target)}
     json_write(config,final)
+    # Strict reload before publishing a successful report; use ordinary inference contract.
+    try:
+        selected_models=submission.load_bundle(config,device)
+        sample=sx[0].numpy()
+        actual=submission.predict(selected_models,sample,device)
+        if actual.shape!=sample.shape or not np.isfinite(actual).all(): raise RuntimeError("Invalid final bundle")
+    except Exception:
+        config.unlink(missing_ok=True)
+        raise
+    working.unlink()
     report={"protocol":"v55-train-fit-select-v1","train_manifest_sha256":submission.sha256(manifest),
         "fit_indices":fit,"selection_indices":select,"fit_speaker_groups":sorted({speaker(rows[i]) for i in fit}),
         "selection_speaker_groups":sorted({speaker(rows[i]) for i in select}),"gate_epochs":args.gate_epochs,
@@ -185,7 +196,7 @@ def run(args):
     print("V55 SELECTED",json.dumps(selected),flush=True)
     if args.validation:
         # Only selected, frozen recipe is evaluated; never reselect on this result.
-        submission.evaluate(submission.load_bundle(config,device),root,device,out)
+        submission.evaluate(selected_models,root,device,out)
     return report
 
 def main():
