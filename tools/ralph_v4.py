@@ -372,7 +372,7 @@ def submit(kaggle, source, tag, i, kind, config=None):
 
 def public_with_external(public,external):
     tree=ast.parse(external)
-    names={"public_assets","SyntheticPairs","quality_paths","_pesq_one","close_pesq_pool","score_waveforms","cmgan_assets","CMGANTransfer"}
+    names={"public_assets","SyntheticPairs","quality_paths","_pesq_one","close_pesq_pool","score_waveforms","cmgan_assets","CMGANTransfer","speechbrain_adapter_setup","speechbrain_spec","archive_speechbrain_config","MetricGANTransfer","SepformerTransfer"}
     fragments=[ast.get_source_segment(external,n) for n in tree.body if isinstance(n,(ast.FunctionDef,ast.ClassDef)) and n.name in names]
     if len(fragments)!=len(names): raise ValueError("Missing shared evaluation helper")
     marker="def run():"
