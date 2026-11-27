@@ -129,7 +129,7 @@ def package_recipe(folder,out,allow_download=False,cmgan_root=None):
             shutil.copy2(archived/"best_model.pt",cp)
         policies=r.get("sepformer_scale_policies",{})
         if family.startswith("sepformer_") and m.get("scale_policy","raw")!=policies.get(family,"raw"): raise ValueError("Recipe scale policy mismatch")
-        patched,count=re.subn(r"^EXPERIMENT_CONFIG = .+$",lambda _: "EXPERIMENT_CONFIG = "+repr({"architecture":family,"sepformer_scale_policies":policies}),code,count=1,flags=re.M
+        patched,count=re.subn(r"^EXPERIMENT_CONFIG = .+$",lambda _: "EXPERIMENT_CONFIG = "+repr({"architecture":family,"sepformer_scale_policies":policies}),code,count=1,flags=re.M)
         if count!=1: raise ValueError("Missing archived experiment config")
         source.write_text(patched,encoding="utf-8")
         entry={"weight":w,"family":family,"source":source.relative_to(out).as_posix(),"checkpoint":cp.relative_to(out).as_posix(),"source_sha256":s.sha256(source),"checkpoint_sha256":s.sha256(cp)}
