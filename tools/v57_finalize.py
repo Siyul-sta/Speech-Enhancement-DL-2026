@@ -190,6 +190,11 @@ def finalize(args):
     val=data/"validation/samples.csv";train=data/"train/samples.csv"
     offline.read_manifest(val,164);offline.read_manifest(train,1296)
     train_sha=s.sha256(train)
+    if args.cmgan_root is None:
+        from v571_preflight import REPORT,require_report
+        if REPORT.is_file():
+            try: args.cmgan_root=Path(require_report()["cmgan_root"])
+            except (OSError,ValueError,RuntimeError,KeyError): pass
     records=v4.history()
     ensemble_dirs=list((core.OUTPUT/"v56_ensembles").glob("ensemble_*"))
     candidates=candidate_list(records,ensemble_dirs,args.top)
