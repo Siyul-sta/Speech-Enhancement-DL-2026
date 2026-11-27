@@ -65,6 +65,7 @@ def verify(folder, kind="v4_public"):
     if r.get("v53_stage"):
         if kind!="v4_external" or r.get("transductive_noisy") or r.get("self_supervised") or r.get("v53_requested_epochs",0)<12 or r.get("epochs_completed")!=r["v53_requested_epochs"]:
             raise ValueError("Invalid V5.3 training contract")
+        if not re.fullmatch(r"[0-9a-f]{64}",str(r.get("v53_initial_hash",""))): raise ValueError("Missing initial pretrained fingerprint")
         zero=r.get("zero_shot") or {}
         verify_rows(folder/"zero_shot_validation.csv",164,zero["challenge"])
         initial=zero["external_domains"]
@@ -131,7 +132,8 @@ def v53_stage_plan(records,failures,epochs=None):
     failed={x["plan"].get("v53_stage") for x in failures}
     for name,arch,mode,anchor in stages:
         if name in done or name in failed: continue
-        return {"v53_stage":name,"architecture":arch,"transfer_mode":mode,"v53_anchor":anchor,
+        prior=next((r.get("v53_initial_hash") for st,r in records if r.get("v53_stage") and r.get("model_family")==arch and r.get("v53_initial_hash")),None)
+        return {"v53_stage":name,"architecture":arch,"transfer_mode":mode,"v53_anchor":anchor,"v53_expected_initial_hash":prior,
                 "phase_loss":False,"challenge_remix":1024,"empirical_remix":True,"balanced_remix":False,
                 "pesq_aware":False,"adaptive_critic":False,"self_supervised":False,"transductive":False,
                 "distill":False,"data_profile":"base","augmentation":"base","external_size":512,
@@ -273,6 +275,8 @@ def submit(kaggle, source, tag, i, kind, config=None):
         core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":kind})
         raise
     r=verify(folder,kind)
+    if config and config.get("v53_stage"):
+        if r.get("v53_stage")!=config["v53_stage"] or r.get("transfer_mode")!=config["transfer_mode"] or (config.get("v53_expected_initial_hash") and r.get("v53_initial_hash")!=config["v53_expected_initial_hash"]): raise ValueError("Remote transfer protocol mismatch")
     if kind=="v4_smoke" and config and config.get("smoke_metric_protocol") and r.get("smoke_metric_protocol")!=config["smoke_metric_protocol"]:
         raise ValueError("Remote smoke protocol mismatch")
     core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind})
