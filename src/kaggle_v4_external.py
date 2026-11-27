@@ -1374,6 +1374,7 @@ def run():
         "model_family":cfg.get("architecture","residual"),
         "loss_mode":cfg.get("loss_mode","base"),
         "pesq_aware":bool(cfg.get("pesq_aware")),
+        "v5_stage":cfg.get("v5_stage"),
         "challenge_remix":int(cfg.get("challenge_remix",0)),
         "loss_weights":cfg.get("loss_weights"),
         "data_profile":cfg.get("data_profile","base"),
