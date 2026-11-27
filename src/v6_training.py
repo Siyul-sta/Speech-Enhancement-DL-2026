@@ -51,15 +51,22 @@ def v6_parent_path(parent):
     return matches[0]
 
 def v6_loaders(cfg,device):
-    train=SpeechPairs(locate_data_root(),"train")
-    val=SpeechPairs(locate_data_root(),"validation")
+    root=locate_data_root()
+    train=SpeechPairs(root,"train")
+    val=SpeechPairs(root,"validation")
     if len(val)!=164: raise ValueError("Expected full validation")
     fit,cal,gate_fit,gate_select=v6_split(train)
+    train_ids={v6_speaker(row) for row in train.manifest.to_dict("records")}
+    val_ids={v6_speaker(row) for row in val.manifest.to_dict("records")}
+    if None in val_ids or train_ids & val_ids: raise ValueError("Challenge speaker split overlap or unknown")
+    for field in ("clean","noisy"):
+        seen={hashlib.sha256(x.tobytes()).digest() for x in getattr(train,field)}
+        if any(hashlib.sha256(x.tobytes()).digest() in seen for x in getattr(val,field)): raise ValueError("Challenge waveform overlap")
     zero=cfg.get("v6_mode")=="zero"
     smoke=bool(cfg.get("smoke"))
     mix=None
     if smoke:
-        fixture,ext=smoke_pairs(torch.utils.data.Subset(train,fit))
+        fixture,ext=smoke_pairs(SimpleNamespace(clean=train.clean[fit]))
         data=torch.utils.data.ConcatDataset([torch.utils.data.Subset(train,fit[:8]),fixture])
     else:
         tr,dv,tn,dn,_,_=public_assets(evaluation_only=zero)
@@ -140,16 +147,20 @@ def v6_run():
     base,br,be,ber,bd=v6_eval(model,val,ext,device,pesq_fn)
     if parent and abs(base-float(parent["score"]))>.025: raise RuntimeError("Parent score failed reproduction")
     if parent and any(abs(a-b)>.025 for a,b in zip(bd,parent["external_domains"])): raise RuntimeError("Parent domain failed reproduction")
+    if parent and any(a<b-float(cfg.get("v6_external_margin",.15))-.025 for a,b in zip(bd,parent["root_external_domains"])): raise RuntimeError("Parent root external gate failed")
     root_domains=parent["root_external_domains"] if parent else bd
     write_csv(WORK/"zero_shot_validation.csv",["index","pesq_wb"],br)
     write_csv(WORK/"zero_shot_external.csv",["index","pesq_wb"],ber)
     torch.save(model.state_dict(),WORK/"best_model.pt")
     best=base;best_epoch=0;stale=0;history=[];epoch_times=[];calibration=None;updates=0;metric_steps=0
     opt=None;co=None;critic=None;replay=None;lr=float(cfg["lr"])
+    transfer=None
+    if mode=="train" and cfg.get("v6_transfer") and not isinstance(model,V6Refiner):
+        transfer=TransferSchedule(model,cfg["v6_transfer"],lr)
     if mode!="zero":
         trainable=[p for p in model.parameters() if p.requires_grad]
         if not trainable: raise ValueError("No trainable parameters")
-        opt=torch.optim.AdamW(trainable,lr=lr,weight_decay=1e-4)
+        opt=transfer.optimizer() if transfer else torch.optim.AdamW(trainable,lr=lr,weight_decay=1e-4)
         schedule=torch.optim.lr_scheduler.ReduceLROnPlateau(opt,mode="max",patience=2,factor=.5,threshold=.001,threshold_mode="abs",min_lr=1e-8)
         if cfg.get("v6_critic"):
             critic=PESQCritic().to(device);co=torch.optim.AdamW(critic.parameters(),lr=3e-4);replay=CriticReplay(seed=cfg["seed"])
@@ -158,7 +169,14 @@ def v6_run():
             seed_everything(cfg["seed"]+e);loader.generator.manual_seed(cfg["seed"]+e)
             if mix is not None: mix.epoch=e
             set_data_epoch(loader.dataset,e)
-            model.train();losses=[];weight=adaptive_metric_weight(calibration,epoch,updates*2) if critic is not None else 0.
+            model.train()
+            if transfer:
+                ev=transfer.apply(offset+epoch)
+                for module in model.modules():
+                    ps=list(module.parameters())
+                    if ps and not any(p.requires_grad for p in ps): module.eval()
+                print("V6_TRANSFER "+json.dumps(ev),flush=True)
+            losses=[];weight=adaptive_metric_weight(calibration,epoch,updates*2) if critic is not None else 0.
             for j,(x,s) in enumerate(loader,1):
                 x,s=x.to(device),s.to(device)
                 length=int(cfg.get("v6_crop",48000))
