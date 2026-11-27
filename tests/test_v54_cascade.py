@@ -53,14 +53,20 @@ class V54Tests(unittest.TestCase):
         m=t.ConditionedWaveRefiner()
         with torch.no_grad():
             m.out.weight.fill_(.001)
-        a=m(noisy,prev)
-        b=m(-noisy,prev)
-        self.assertGreater(float((a-b).abs().sum()),0)
-        # Complex refiner can synthesize a nonzero spectrum from a zero prior.
-        z=t.ConditionedComplexRefiner()
-        with torch.no_grad(): z.head.bias[0]=.1
-        self.assertGreater(float(z(noisy,prev).abs().sum()),0)
-        self.assertTrue(torch.isfinite(z(torch.zeros_like(noisy),prev)).all())
+            a=m(noisy,prev)
+            b=m(-noisy,prev)
+            self.assertGreater(float((a-b).abs().sum()),1e-6)
+            # A flat real spectrum is an impulse at the frame boundary and
+            # can vanish under Hann synthesis. Exercise feature-dependent
+            # complex corrections instead, with identical zero priors.
+            z=t.ConditionedComplexRefiner()
+            z.head.weight[0].fill_(.001)
+            z.head.weight[1].fill_(-.001)
+            a=z(noisy,prev)
+            b=z(-noisy,prev)
+            self.assertGreater(float(a.abs().sum()),1e-6)
+            self.assertGreater(float((a-b).abs().sum()),1e-6)
+            self.assertTrue(torch.isfinite(z(torch.zeros_like(noisy),prev)).all())
 
     def test_native_strict_checkpoint(self):
         self.assertEqual(submit_v5.FAMILIES["cascade_native"],"CascadeEnhancer")
