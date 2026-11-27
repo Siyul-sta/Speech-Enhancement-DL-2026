@@ -198,6 +198,7 @@ def run(args):
         print("DRY RUN: V5.6 unified Ralph, no GPU submission")
         print("Initial stage catalog:",json.dumps([n for n,_,_,_ in stage_catalog(v4.history(),args.epochs)]))
         return
+    if (core.OUTPUT/"v57_audit_seal.json").exists(): raise RuntimeError("Independent audit sealed; no further V5.6 training/tuning")
     if not args.allow_public_assets: raise RuntimeError("Confirm instructor permission for licensed external corpora/pretrained models with --allow-public-assets")
     if args.data_root:
         import v55_ensemble as ensemble
@@ -215,6 +216,7 @@ def run(args):
     failures=0;rounds=0
     try:
         core.no_uncertain_prior_jobs()
+        if (core.OUTPUT/"v57_audit_seal.json").exists(): raise RuntimeError("Independent audit sealed; no further V5.6 training/tuning")
         run_dir.mkdir(parents=True)
         cache=args.public_cache_ref or v4.find_public_cache()
         initial_quota=quota_hours(kaggle)
