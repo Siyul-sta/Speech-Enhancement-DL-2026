@@ -279,7 +279,8 @@ def critic_step(critic, optimizer, pred, noisy, clean, pesq_fn):
     with torch.no_grad():
         target=clean[:n].detach().float()
         candidates=torch.cat((pred[:n].detach().float(),noisy[:n].detach().float(),target))
-        reference=target.repeat(3,1)
+        candidates=candidates.clamp(-1,1)
+        reference=target.repeat(3,1).clamp(-1,1)
         vals=score_waveforms(reference.cpu().numpy(),candidates.cpu().numpy(),pesq_fn,workers=0)
         labels=torch.tensor(vals,device=target.device,dtype=target.dtype).add(.5).div(5.2).clamp(0,1)
     critic.train().requires_grad_(True)
@@ -1057,6 +1058,22 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
         update_ema(teacher,model)
     return float(loss.detach())
 
+@torch.no_grad()
+def critic_calibration(model,critic,loader,device,pesq_fn):
+    """Engineering fixture only; no gradients and no use in checkpoint selection."""
+    model.eval(); critic.eval()
+    truth=[]; estimates=[]
+    for noisy,clean in loader:
+        clean=clean.to(device).float().clamp(-1,1)
+        pred=model(noisy.to(device)).float().clamp(-1,1)
+        truth.extend(score_waveforms(clean.cpu().numpy(),pred.cpu().numpy(),pesq_fn))
+        estimates.extend((critic(pred,clean)*5.2-.5).cpu().tolist())
+    a,b=np.asarray(truth),np.asarray(estimates)
+    if len(a)!=len(loader.dataset) or not np.isfinite(a).all() or not np.isfinite(b).all(): raise RuntimeError("Invalid critic calibration")
+    pearson=float(np.corrcoef(a,b)[0,1]) if len(a)>1 and a.std()>1e-8 and b.std()>1e-8 else None
+    return {"count":len(a),"mae":float(np.mean(np.abs(a-b))),"rmse":float(np.sqrt(np.mean((a-b)**2))),"pearson":pearson,"split":"train-derived engineering fixture","final_epoch_model":True}
+
+
 def consistency_step(model,optimizer,teacher,x,mode="consistency"):
     with torch.no_grad():
         target=teacher(x).clamp(-1,1)
@@ -1346,8 +1363,11 @@ def run():
         if not perf and epoch >= 5 and stale >= int(cfg["patience"]):
             break
 
-    if cfg.get("smoke_metric_protocol")=="v5.1-three-epoch" and (critic_updates<1 or metric_steps<1 or not metric_probe):
-        raise RuntimeError("Metric smoke did not exercise critic and generator gradients")
+    calibration=None
+    if cfg.get("smoke_metric_protocol")=="v5.1-three-epoch":
+        if critic_updates<1 or metric_steps<1 or not metric_probe: raise RuntimeError("Metric smoke did not exercise critic and generator gradients")
+        calibration=critic_calibration(model,critic,external_val,device,pesq_function)
+        print("CRITIC_CALIBRATION",json.dumps(calibration,allow_nan=False),flush=True)
     model.load_state_dict(torch.load(WORK / "best_model.pt", map_location=device, weights_only=True))
     best_score, rows = evaluate(model, val_loader, device, pesq_function, save_rows=True)
     write_csv(WORK / "validation_per_file.csv", ["index", "pesq_wb"], rows)
@@ -1365,6 +1385,7 @@ def run():
         "critic_updates":critic_updates,
         "metric_generator_steps":metric_steps,
         "metric_gradient_norm":metric_probe.get("gradient_norm"),
+        "critic_calibration":calibration,
         "precision":"amp_fp16_forward_fp32_loss" if use_amp else "fp32",
         "perf_reproducible":perf,
         "loader_workers":train_loader.num_workers,
