@@ -32,6 +32,9 @@ jobs:
       - run: pip install numpy pandas scipy soundfile einops
       - run: python -m unittest discover -s tests -p test_v51_preflight.py -v
       - run: python -m unittest discover -s tests -p test_v52_phase_critic.py -v
+      - run: python -m unittest discover -s tests -p test_v53_transfer.py -v
+        env:
+          V5_TEST_PUBLIC_CMGAN: '1'
       - run: python -m unittest discover -s tests -p test_v5_improvements.py -v
         env:
           V5_TEST_PUBLIC_CMGAN: '1'
