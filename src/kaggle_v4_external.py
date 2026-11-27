@@ -927,7 +927,7 @@ class TransferSchedule:
 
 def transfer_candidate_allowed(challenge,external,baseline,margin=.15):
     # Keep pretrained capability on both fixed external development domains.
-    return all(math.isfinite(float(v)) for v in [challenge,*external]) and all(
+    return len(external)==len(baseline)==2 and all(math.isfinite(float(v)) for v in [challenge,*external,*baseline]) and all(
         a>=b-margin for a,b in zip(external,baseline))
 
 
@@ -1655,7 +1655,7 @@ def run():
         if all(math.isfinite(v) for v in telemetry.values() if isinstance(v,(float,int))):
             print("V4_TELEMETRY "+json.dumps(telemetry,allow_nan=False),flush=True)
         epoch_times.append(time.monotonic()-epoch_started)
-        if not perf and epoch >= 5 and stale >= int(cfg["patience"]):
+        if not perf and not transfer and epoch >= 5 and stale >= int(cfg["patience"]):
             break
 
     calibration=None
@@ -1668,8 +1668,10 @@ def run():
         transfer.merge()
         torch.save(model.state_dict(),WORK/"best_model.pt")
     best_score, rows = evaluate(model, val_loader, device, pesq_function, save_rows=True)
+    if transfer and best_score<zero_shot["challenge"]-1e-5: raise RuntimeError("Selected checkpoint regressed below zero-shot")
     write_csv(WORK / "validation_per_file.csv", ["index", "pesq_wb"], rows)
     external_score, external_rows = evaluate(model, external_val, device, pesq_function, save_rows=True)
+    if transfer and not transfer_candidate_allowed(best_score,[float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))],zero_shot["external_domains"],margin=.15001): raise RuntimeError("Selected checkpoint failed external preservation gate")
     write_csv(WORK / "external_validation.csv", ["index","pesq_wb"], external_rows)
     metrics={}
     try:
@@ -1744,7 +1746,7 @@ def run():
         "self_mode":cfg.get("self_mode","consistency"),
         "unlabeled_files":len(unlabeled) if unlabeled is not None else 0,
         "architecture": cfg.get("architecture","residual"),
-        "optimizer": "AdamW+CosineAnnealingLR",
+        "optimizer": "AdamW+CosineAnnealingLR (grouped)" if transfer else "AdamW+CosineAnnealingLR",
         "loss_variant": variant,
         "checkpoint": "best_model.pt",
     }
