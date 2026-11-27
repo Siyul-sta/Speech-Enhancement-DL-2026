@@ -16,7 +16,7 @@ sys.path.insert(0,str(ROOT/"src"))
 REPORT=ROOT/"runs/v57_public_preflight/report.json"
 FAMILIES=("cmgan_transfer","cascade_cmgan_two","cascade_cmgan_three","cascade_cmgan","metricgan","sepformer_dns_transfer","sepformer_wham_transfer")
 FILES=("src/kaggle_v4_external.py","src/kaggle_v4_public.py","tools/ralph_v4.py","tools/ralph_v56.py","tools/v57_public_assets.py","tools/submit_v5.py","tools/v55_gating.py","tools/v55_ensemble.py","tools/v57_offline.py","tools/v57_finalize.py","tools/v571_preflight.py")
-DEPS=("torch","torchaudio","speechbrain","hyperpyyaml","huggingface_hub","numpy","pandas","scipy","soundfile","einops","pesq")
+DEPS=("torch","torchaudio","speechbrain","hyperpyyaml","ruamel.yaml","huggingface_hub","numpy","pandas","scipy","soundfile","einops","pesq")
 
 def digest(p):
     with p.open("rb") as f: return hashlib.file_digest(f,"sha256").hexdigest()
@@ -170,6 +170,7 @@ def run(out,data_root=None):
     import torchaudio
     if torch.cuda.is_available(): print("CUDA available but CPU preflight uses CPU only",flush=True)
     if str(torch.__version__).split("+")[0]!=str(torchaudio.__version__).split("+")[0]: raise RuntimeError("Torch/TorchAudio version mismatch")
+    if version("ruamel.yaml")!="0.18.16": raise RuntimeError("Install ruamel.yaml==0.18.16 before preflight")
     out.mkdir(parents=True,exist_ok=True)
     cache=out/"assets_cache";cache.mkdir(exist_ok=True)
     report={"protocol":"v571-public-cpu-v1","status":"RUNNING","identity":identity(),"families":{},"cmgan_root":str(cache/"cmgan_assets")}
@@ -204,6 +205,7 @@ def run(out,data_root=None):
             if keep is None: raise RuntimeError("CMGAN preflight failed")
             report["mixed_ensemble"]=mixed(work,keep)
         except Exception as exc: report["mixed_ensemble"]={"status":"FAIL","error":repr(exc)}
+    print("V571 MIXED ENSEMBLE",report["mixed_ensemble"],flush=True)
     os.environ.pop("V571_LOCAL_FIXTURE",None)
     passed=all(r["status"]=="PASS" for r in report["families"].values()) and report["mixed_ensemble"]["status"]=="PASS"
     report["status"]="PASS" if passed else "FAIL"
