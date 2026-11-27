@@ -653,7 +653,7 @@ class SyntheticPairs(Dataset):
         self.stress=stress
         self.rirs=tuple(TRAIN_RIRS) if dynamic else ()
         self.augmentation=EXPERIMENT_CONFIG.get("augmentation","base")
-        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v5_stage")) else None
+        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v5_stage") or EXPERIMENT_CONFIG.get("v52_stage")) else None
         self.epoch=0
     def __len__(self):
         return self.size
@@ -1239,7 +1239,7 @@ def make_loader(dataset,batch_size,shuffle,device,dynamic=False):
     workers=min(int(EXPERIMENT_CONFIG.get("loader_workers",0)),2,max(0,(os.cpu_count() or 1)-1)) if device.type=="cuda" and dynamic else 0
     opts={"num_workers":workers,"pin_memory":device.type=="cuda"}
     if workers: opts.update(persistent_workers=False,prefetch_factor=2,multiprocessing_context="spawn")
-    if shuffle and EXPERIMENT_CONFIG.get("perf_reproducible"):
+    if shuffle and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v52_stage")):
         opts["generator"]=torch.Generator().manual_seed(int(EXPERIMENT_CONFIG["seed"]))
     return DataLoader(dataset,batch_size=batch_size,shuffle=shuffle,**opts)
 
@@ -1450,7 +1450,7 @@ def run():
     metric_steps=0
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
-        if perf or cfg.get("challenge_remix") or cfg.get("v5_stage"): set_data_epoch(train_set,epoch)
+        if perf or cfg.get("challenge_remix") or cfg.get("v5_stage") or cfg.get("v52_stage"): set_data_epoch(train_set,epoch)
         losses = []
         epoch_started=time.monotonic()
         weight=adaptive_metric_weight(last_calibration,epoch,critic_updates*2) if replay is not None else (.05 if critic is not None and epoch>=3 else 0.)
