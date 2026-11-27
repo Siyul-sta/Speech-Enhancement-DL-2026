@@ -124,7 +124,6 @@ def choose_best(results):
 
 def finalize(args):
     core.no_uncertain_prior_jobs()
-    if (core.OUTPUT/"active.lock").exists(): raise RuntimeError("Stop active Ralph before final selection")
     data=args.data_root.resolve();out=args.out.resolve()
     if out.exists() or out.is_relative_to(data): raise ValueError("Use new output outside dataset")
     val=data/"validation/samples.csv";train=data/"train/samples.csv"
@@ -187,7 +186,6 @@ def audit_disjoint(challenge,audit,manifest):
 
 def audit(args):
     core.no_uncertain_prior_jobs()
-    if (core.OUTPUT/"active.lock").exists(): raise RuntimeError("Stop active Ralph before audit")
     final=args.final.resolve();package=final/"champion";r=read(final/"final_report.json")
     offline.verify_package(package)
     if s.sha256(package/"package_manifest.json")!=r["champion_manifest_sha256"]: raise ValueError("Frozen champion identity changed")
@@ -219,7 +217,13 @@ def main():
     b.add_argument("--audit-root",type=Path,required=True);b.add_argument("--manifest",type=Path,required=True)
     b.add_argument("--confirm-heldout",action="store_true");b.add_argument("--provenance",required=True)
     args=p.parse_args()
-    if args.mode=="select": finalize(args)
-    else: audit(args)
+    core.no_uncertain_prior_jobs()
+    lock=core.OUTPUT/"active.lock";lock.parent.mkdir(parents=True,exist_ok=True)
+    with lock.open("x",encoding="utf-8") as f: f.write(str(__import__("os").getpid()))
+    try:
+        if args.mode=="select": finalize(args)
+        else: audit(args)
+    finally:
+        lock.unlink(missing_ok=True)
 
 if __name__=="__main__": main()
