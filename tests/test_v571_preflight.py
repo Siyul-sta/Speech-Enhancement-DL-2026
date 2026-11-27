@@ -41,6 +41,22 @@ class V571Tests(unittest.TestCase):
         for name in ("class CMGANTransfer","class MetricGANTransfer","class SepformerTransfer","def archive_speechbrain_config","def export_recipe_expert"):
             self.assertIn(name,combined)
 
+    def test_bounded_sepformer_roundoff(self):
+        import numpy as np
+        reference=np.zeros(48000,dtype=np.float32)
+        reference[0]=8.
+        actual=reference.copy()
+        actual[10:20]=8.7e-5
+        with self.assertRaises(RuntimeError): p.waveform_equivalence(actual,reference)
+        stats=p.waveform_equivalence(actual,reference,True)
+        self.assertEqual(stats["numeric_comparison"],"bounded_sepformer_fp32_roundoff")
+        self.assertLessEqual(stats["pcm16_max_lsb_error"],4)
+        self.assertGreater(stats["reference_clipped_fraction"],0)
+        actual[10]=.001
+        with self.assertRaises(RuntimeError): p.waveform_equivalence(actual,reference,True)
+        actual[10]=np.nan
+        with self.assertRaises(ValueError): p.waveform_equivalence(actual,reference,True)
+
     def test_fixture(self):
         import numpy as np
         x,y=p.fixture()
