@@ -121,7 +121,7 @@ class SpeechPairs(Dataset):
 
 class ChallengeRemix(Dataset):
     """Train-only empirical residual remix; reject suspicious correlated residuals."""
-    def __init__(self, train, size, seed=42):
+    def __init__(self, train, size, seed=42, *, empirical=False, balanced=False, exclude=()):
         if not isinstance(train,SpeechPairs) or train.split!="train" or len(train)!=1296:
             raise ValueError("Challenge remix requires original training split")
         self.clean=train.clean
@@ -131,7 +131,17 @@ class ChallengeRemix(Dataset):
         cross=np.abs(np.mean(self.clean*self.noise,axis=1,dtype=np.float64))
         corr=cross/np.maximum(cr*nr,1e-12)
         self.pool=np.flatnonzero((cr>1e-4)&(nr>1e-5)&(corr<0.15)&np.isfinite(corr))
+        self.pool=np.setdiff1d(self.pool,np.asarray(exclude,dtype=int))
         if len(self.pool)<32: raise RuntimeError("Insufficient additive-like train residuals")
+        self.empirical=bool(empirical)
+        self.noise_groups=[]
+        if balanced:
+            key=next((k for k in ("noise_type","noise_category","noise_label","noise_class") if k in train.manifest.columns),None)
+            if key is None: raise ValueError("Noise balancing needs actual train metadata")
+            labels=train.manifest[key].fillna("unknown").astype(str).to_numpy()
+            self.noise_groups=[self.pool[labels[self.pool]==label] for label in sorted(set(labels[self.pool]))]
+            # Mild sqrt-frequency balancing, not uniform oversampling of three-clip classes.
+            counts=np.sqrt([len(g) for g in self.noise_groups]); self.noise_group_probs=counts/counts.sum()
         self.snr=20*np.log10(cr[self.pool]/nr[self.pool])
         self.snr_low,self.snr_high=np.clip(np.quantile(self.snr,[.05,.95]),-15,35)
         if not np.isfinite(self.snr).all(): raise ValueError("Invalid train SNR")
@@ -141,9 +151,13 @@ class ChallengeRemix(Dataset):
     def __getitem__(self,i):
         rng=np.random.default_rng(self.seed+100003*self.epoch+i)
         a,b=rng.choice(self.pool,2,replace=False)
+        if self.noise_groups:
+            g=self.noise_groups[rng.choice(len(self.noise_groups),p=self.noise_group_probs)]
+            choices=g[g!=a]
+            if len(choices): b=rng.choice(choices)
         s=self.clean[a].copy()
         n=np.roll(self.noise[b],int(rng.integers(0,len(s))))
-        snr=rng.uniform(self.snr_low,self.snr_high)
+        snr=float(np.clip(rng.choice(self.snr),-15,35)) if self.empirical else rng.uniform(self.snr_low,self.snr_high)
         n=n*(np.sqrt(np.mean(s*s)+1e-12)/np.sqrt(np.mean(n*n)+1e-12))*10**(-snr/20)
         x=s+n
         scale=max(1.,float(np.max(np.abs(x))),float(np.max(np.abs(s))))
@@ -220,16 +234,36 @@ class ResidualPhaseUNet(nn.Module):
         gain = self.max_gain * torch.sigmoid(self.mask_head(d)).squeeze(1)
         phase_delta = self.max_phase * torch.tanh(self.phase_head(d)).squeeze(1)
         phase_factor = torch.polar(torch.ones_like(phase_delta), phase_delta)
-        enhanced_spec = spec * gain * phase_factor
+        enhanced_spec = self.spectrum(spec,d,gain,phase_factor)
         return torch.istft(
             enhanced_spec, n_fft=N_FFT, hop_length=HOP,
             window=self.window, length=noisy.shape[-1],
         )
 
+    def spectrum(self,spec,features,gain,phase_factor):
+        return spec*gain*phase_factor
+
+
 class RelaxedPhaseUNet(ResidualPhaseUNet):
     """Experimental: gains up to 2 and full wrapped phase range."""
     max_gain = 2.0
     max_phase = 3.141592653589793
+
+
+class ComplexResidualUNet(RelaxedPhaseUNet):
+    """Additive real/imaginary residual, independent of a nonzero noisy bin."""
+    def __init__(self):
+        super().__init__()
+        self.complex_head=nn.Conv2d(16,2,1)
+        nn.init.zeros_(self.complex_head.weight)
+        nn.init.zeros_(self.complex_head.bias)
+        # Retain base module structure but use only the direct complex head.
+        self.mask_head.requires_grad_(False)
+        self.phase_head.requires_grad_(False)
+    def spectrum(self,spec,features,gain,phase_factor):
+        delta=self.complex_head(features)
+        scale=spec.abs().mean(dim=(-2,-1),keepdim=True).detach().clamp_min(.01)
+        return spec+torch.complex(delta[:,0],delta[:,1])*scale
 
 
 class DualAxisEnhancer(nn.Module):
@@ -291,6 +325,29 @@ def critic_step(critic, optimizer, pred, noisy, clean, pesq_fn):
     optimizer.step()
     critic.eval().requires_grad_(False)
     return float(loss.detach())
+
+
+def phase_complex_loss(pred,clean):
+    """Power-compressed complex loss and target-energy-weighted circular phase loss.
+    Phase comparison uses normalized complex vectors, not discontinuous raw angles.
+    """
+    total=pred.new_zeros(())
+    for size,hop in ((256,64),(512,128),(1024,256)):
+        w=torch.hann_window(size,device=pred.device,dtype=pred.dtype)
+        a=torch.stft(pred,size,hop,window=w,return_complex=True)
+        b=torch.stft(clean,size,hop,window=w,return_complex=True)
+        am,bm=a.abs(),b.abs()
+        eps=1e-4
+        ac=a/(am+eps).pow(.7); bc=b/(bm+eps).pow(.7)
+        norm=bc.abs().mean(dim=(-2,-1)).detach().clamp_min(.05)
+        compressed=(ac-bc).abs().mean(dim=(-2,-1))/norm
+        # Smooth normalization keeps silence finite; weight by target amplitude.
+        au=a/(am.square()+eps**2).sqrt(); bu=b/(bm.square()+eps**2).sqrt()
+        weight=bm.detach()
+        circular=(1-(au*bu.conj()).real).clamp(0,2)
+        phase=(weight*circular).sum(dim=(-2,-1))/weight.sum(dim=(-2,-1)).clamp_min(eps)
+        total=total+(.7*compressed+.3*phase).mean()
+    return total/3
 
 
 def enhancement_loss(pred, clean, variant: str):
@@ -1009,6 +1066,7 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
     else:
         pred=model(noisy)
     loss = enhancement_loss(pred, clean, variant)
+    if cfg.get("phase_loss"): loss=loss+0.15*phase_complex_loss(pred.float(),clean.float())
     if distill is not None:
         with torch.no_grad(): pseudo=distill(noisy).clamp(-1,1)
         loss=loss+0.1*F.l1_loss(pred,pseudo)
@@ -1232,6 +1290,8 @@ def run():
         model = DualAxisEnhancer().to(device)
     elif cfg.get("architecture") == "residual_relaxed":
         model = RelaxedPhaseUNet().to(device)
+    elif cfg.get("architecture") == "complex_residual":
+        model = ComplexResidualUNet().to(device)
     else:
         model = ResidualPhaseUNet().to(device)
     warm_ref = cfg.get("warm_ref")
