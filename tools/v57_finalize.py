@@ -88,11 +88,67 @@ def package_ensemble(folder,out,train_sha):
     write(out/"bundle.json",cfg)
     finalize_package(out)
 
+def recipe_weights(recipe):
+    names={"cmgan","metricgan","sepformer_dns","sepformer_wham"}
+    parts=recipe.split(":")
+    if len(parts)==2 and parts[0] in names:
+        a=float(parts[1]);pairs=[(parts[0],a),("noisy_identity",1-a)]
+    elif len(parts)==4 and parts[0]=="blend" and set(parts[1:3])<=names and parts[1]!=parts[2]:
+        a=float(parts[3]);pairs=[(parts[1],a),(parts[2],1-a)]
+    elif len(parts)==4 and parts[0]=="mean3" and len(set(parts[1:]))==3 and set(parts[1:])<=names:
+        pairs=[(n,1/3) for n in parts[1:]]
+    else: raise ValueError("Unsupported public recipe")
+    if any(not math.isfinite(w) or not 0<=w<=1 for _,w in pairs): raise ValueError("Invalid recipe weights")
+    return [(n,w) for n,w in pairs if w>0]
+
+
+def package_recipe(folder,out,allow_download=False,cmgan_root=None):
+    import re
+    import torch
+    state=read(folder/"remote_state.json");r=v4.verify(folder,"v4_public")
+    v4.verify_v56_metadata(r,state)
+    if state.get("status")!="COMPLETE" or state.get("kind")!="v4_public" or not r.get("v571_recipe") or r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": raise ValueError("Ineligible public recipe")
+    code=(folder/"source.py").read_text(encoding="utf-8")
+    weights=recipe_weights(r["winner"])
+    out.mkdir(parents=True,exist_ok=False)
+    entries=[]
+    for i,(name,w) in enumerate(weights):
+        sub=out/f"model_{i+1}";sub.mkdir()
+        source=sub/"source.py";cp=sub/"best_model.pt"
+        if name=="noisy_identity":
+            family=name;torch.save({},cp)
+        else:
+            archived=folder/"recipe_experts"/name
+            m=r["recipe_experts"][name];family=m["family"]
+            expected={"cmgan":"cmgan_transfer","metricgan":"metricgan","sepformer_dns":"sepformer_dns_transfer","sepformer_wham":"sepformer_wham_transfer"}[name]
+            if family!=expected: raise ValueError("Recipe family mismatch")
+            required={"best_model.pt"} if family=="cmgan_transfer" else {"best_model.pt","offline_hyperparams.yaml","offline_hyperparams.json"}
+            if set(m["files"])!=required: raise ValueError("Missing recipe assets")
+            for file,digest in m["files"].items():
+                if s.sha256(archived/file)!=digest: raise ValueError("Recipe asset hash mismatch")
+            shutil.copy2(archived/"best_model.pt",cp)
+        patched,count=re.subn(r"^EXPERIMENT_CONFIG = .+$",lambda _: "EXPERIMENT_CONFIG = "+repr({"architecture":family}),code,count=1,flags=re.M)
+        if count!=1: raise ValueError("Missing archived experiment config")
+        source.write_text(patched,encoding="utf-8")
+        entry={"weight":w,"family":family,"source":source.relative_to(out).as_posix(),"checkpoint":cp.relative_to(out).as_posix(),"source_sha256":s.sha256(source),"checkpoint_sha256":s.sha256(cp)}
+        if name!="noisy_identity":
+            meta=public.package_public(family,archived,code,sub/"assets",allow_download,cmgan_root)
+            entry["public_assets"]={**meta,"root":(sub/"assets").relative_to(out).as_posix()}
+        entries.append(entry)
+    write(out/"bundle.json",{"models":entries,"public_recipe":r["winner"]})
+    finalize_package(out)
+
+
 def candidate_list(records,ensembles,limit):
     """Top verified development candidates; no audit data used here."""
     pool=[]
     for st,r in records:
-        if st.get("kind")!="v4_external" or st.get("status")!="COMPLETE" or r.get("smoke") or r.get("transductive_noisy") or r.get("evaluation_protocol")!="v4.2-fixed-dev-v2" or not st.get("source_path"): continue
+        if st.get("status")!="COMPLETE" or r.get("smoke") or r.get("transductive_noisy") or r.get("evaluation_protocol")!="v4.2-fixed-dev-v2" or not st.get("source_path"): continue
+        if st.get("kind")=="v4_public" and r.get("v571_recipe"):
+            score=float(r["best_validation_pesq_wb"])
+            if math.isfinite(score): pool.append((score,"recipe",Path(st["source_path"]).parent))
+            continue
+        if st.get("kind")!="v4_external": continue
         family=r.get("model_family")
         if family not in s.FAMILIES and family not in public.PUBLIC: continue
         folder=Path(st["source_path"]).parent
@@ -102,7 +158,7 @@ def candidate_list(records,ensembles,limit):
     pool.sort(key=lambda x:(-x[0],str(x[2])))
     used=set();chosen=[]
     for score,kind,folder in pool:
-        key=s.sha256(folder/"best_model.pt")
+        key=s.sha256(folder/"best_model.pt") if kind=="single" else s.sha256(folder/"result.json")
         if key in used: continue
         used.add(key);chosen.append((score,kind,folder))
     # Include all eligible ensemble reports in the shortlist ranking, but
@@ -146,6 +202,7 @@ def finalize(args):
         entry={"rank":i,"kind":kind,"source_run":str(folder),"prior_development_pesq":score}
         try:
             if kind=="single": package_single(folder,package,args.allow_public_download,args.cmgan_root)
+            elif kind=="recipe": package_recipe(folder,package,args.allow_public_download,args.cmgan_root)
             else: package_ensemble(folder,package,train_sha)
             offline_command(package,"--probe")
             offline_command(package,"--data-root",data,"--manifest",val,"--count",164,"--output",report)
@@ -177,7 +234,7 @@ def finalize(args):
         "train_manifest_sha256":train_sha,"champion_manifest_sha256":s.sha256(out/"champion/package_manifest.json"),
         "selection":"highest actual PCM16 WAV PESQ among successfully evaluated shortlisted candidates",
         "limitations":["Development validation is not independent test; candidate selection biases this score.",
-        "Only verified local V4/V5 checkpoint and V5.5 ensemble artifacts admitted. Older V1–V3 and public-recipe-only records are excluded.",
+        "Verified local V4/V5 checkpoints, V5.5 ensembles and V5.7.1 archived public recipes admitted; older V1–V3 and legacy recipe-only records excluded.",
         "Rejected/unshortlisted candidates may be better; no hidden-test claim."]}
     write(out/"final_report.json",report)
     print("V57 CHAMPION",winner["pcm16_pesq"],out/"champion",flush=True)
