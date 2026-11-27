@@ -47,7 +47,7 @@ def main():
     module=importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     family=module.EXPERIMENT_CONFIG.get("architecture","residual")
-    names={"residual":"ResidualPhaseUNet","residual_relaxed":"RelaxedPhaseUNet","dual_axis":"DualAxisEnhancer","cmgan_transfer":"CMGANTransfer","temporal":"TemporalEnhancer","metricgan":"MetricGANTransfer","sepformer_dns_transfer":"SepformerTransfer","sepformer_wham_transfer":"SepformerTransfer","moe":"AdaptiveMixture","composed":"ComposedEnhancer","generated":"GeneratedEnhancer"}
+    names={"residual":"ResidualPhaseUNet","residual_relaxed":"RelaxedPhaseUNet","complex_residual":"ComplexResidualUNet","dual_axis":"DualAxisEnhancer","cmgan_transfer":"CMGANTransfer","temporal":"TemporalEnhancer","metricgan":"MetricGANTransfer","sepformer_dns_transfer":"SepformerTransfer","sepformer_wham_transfer":"SepformerTransfer","moe":"AdaptiveMixture","composed":"ComposedEnhancer","generated":"GeneratedEnhancer"}
     if args.recipe:
         fn=module.public_recipe(args.recipe,torch.device(args.device))
         model=lambda x: torch.cat([fn(v) for v in x.split(1)])
