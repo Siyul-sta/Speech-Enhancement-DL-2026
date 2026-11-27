@@ -98,6 +98,7 @@ class SpeechPairs(Dataset):
             if col not in manifest.columns:
                 raise ValueError(f"Missing {col} from {split}/samples.csv")
         self.manifest = manifest
+        self.split=split
         self.noisy = np.empty((len(manifest), 48000), np.float32)
         self.clean = np.empty((len(manifest), 48000), np.float32)
         for idx, row in enumerate(manifest.itertuples(index=False)):
@@ -121,7 +122,7 @@ class SpeechPairs(Dataset):
 class ChallengeRemix(Dataset):
     """Train-only empirical residual remix; reject suspicious correlated residuals."""
     def __init__(self, train, size, seed=42):
-        if len(train)!=1296 or not isinstance(train,SpeechPairs):
+        if not isinstance(train,SpeechPairs) or train.split!="train" or len(train)!=1296:
             raise ValueError("Challenge remix requires original training split")
         self.clean=train.clean
         self.noise=train.noisy-train.clean
@@ -133,6 +134,7 @@ class ChallengeRemix(Dataset):
         if len(self.pool)<32: raise RuntimeError("Insufficient additive-like train residuals")
         self.snr=20*np.log10(cr[self.pool]/nr[self.pool])
         self.snr_low,self.snr_high=np.clip(np.quantile(self.snr,[.05,.95]),-15,35)
+        if not np.isfinite(self.snr).all(): raise ValueError("Invalid train SNR")
         self.size,self.seed,self.epoch=int(size),int(seed),0
         print("CHALLENGE_REMIX",len(self.pool),float(self.snr_low),float(self.snr_high),flush=True)
     def __len__(self): return self.size
@@ -531,7 +533,7 @@ class SyntheticPairs(Dataset):
         self.stress=stress
         self.rirs=tuple(TRAIN_RIRS) if dynamic else ()
         self.augmentation=EXPERIMENT_CONFIG.get("augmentation","base")
-        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and EXPERIMENT_CONFIG.get("perf_reproducible") else None
+        self.perf_seed=int(EXPERIMENT_CONFIG["seed"]) if dynamic and (EXPERIMENT_CONFIG.get("perf_reproducible") or EXPERIMENT_CONFIG.get("v5_stage")) else None
         self.epoch=0
     def __len__(self):
         return self.size
@@ -1027,7 +1029,8 @@ def supervised_step(model,optimizer,noisy,clean,cfg,distill=None,teacher=None,sc
     elif cfg.get("loss_mode") == "waveform":
         loss=loss+0.2*F.l1_loss(pred,clean)
     if critic is not None:
-        if update_critic: critic_step(critic,critic_optimizer,pred,noisy,clean,pesq_fn)
+        if update_critic:
+            critic_step(critic,critic_optimizer,pred,noisy,clean,pesq_fn)
         if metric_weight>0:
             critic.eval().requires_grad_(False)
             loss=loss+metric_weight*(1-critic(pred.float().clamp(-1,1),clean.float().clamp(-1,1))).square().mean()
@@ -1286,7 +1289,7 @@ def run():
     epoch_times=[]
     for epoch in range(1, int(cfg["epochs"]) + 1):
         model.train()
-        if perf or cfg.get("challenge_remix"): set_data_epoch(train_set,epoch)
+        if perf or cfg.get("challenge_remix") or cfg.get("v5_stage"): set_data_epoch(train_set,epoch)
         losses = []
         epoch_started=time.monotonic()
         for batch_idx,(noisy, clean) in enumerate(train_loader,1):
