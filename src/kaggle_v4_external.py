@@ -1017,6 +1017,9 @@ class CascadeEnhancer(nn.Module):
         if self.pretrained: self.coarse.eval().requires_grad_(False)
     def set_epoch(self,epoch):
         self.coarse.requires_grad_(not self.pretrained)
+        if not self.pretrained:
+            self.coarse.mask_head.requires_grad_(False)
+            self.coarse.phase_head.requires_grad_(False)
         self.residual.requires_grad_(True)
         if self.depth>=3: self.complex.requires_grad_(epoch>=3)
         if self.depth>=4: self.refine.requires_grad_(epoch>=5)
@@ -1704,6 +1707,8 @@ def run():
         raise RuntimeError("Generated model exceeds parameter budget")
     probe=torch.randn(1,48000,device=device)*0.05
     cascade=isinstance(model,CascadeEnhancer)
+    cascade_coarse_hash=transfer_state_hash(model.coarse) if cascade and model.pretrained else None
+    if cascade_coarse_hash and cfg.get("v54_expected_coarse_hash") and cascade_coarse_hash!=cfg["v54_expected_coarse_hash"]: raise RuntimeError("Cascade pretrained coarse state mismatch")
     if cascade: model.set_epoch(1)
     if transfer or cascade: model.eval()
     out=model(probe)
@@ -1831,6 +1836,7 @@ def run():
     if (transfer or cascade) and not transfer_candidate_allowed(best_score,[float(np.mean([r[1] for r in external_rows[:32]])),float(np.mean([r[1] for r in external_rows[32:]]))],zero_shot["external_domains"],margin=.15001): raise RuntimeError("Selected checkpoint failed external preservation gate")
     write_csv(WORK / "external_validation.csv", ["index","pesq_wb"], external_rows)
     if cascade:
+        if model.pretrained and transfer_state_hash(model.coarse)!=cascade_coarse_hash: raise RuntimeError("Frozen cascade coarse model changed")
         cascade_scores=cascade_report(model,val_loader,external_val,device,pesq_function,WORK)
         final=list(cascade_scores.values())[-1]
         if abs(final["challenge"]-best_score)>1e-6 or abs(sum(final["external_domains"])/2-external_score)>1e-6: raise RuntimeError("Cascade final stage scoring mismatch")
@@ -1884,6 +1890,7 @@ def run():
         "v54_requested_epochs":int(cfg["epochs"]) if cascade else None,
         "cascade_depth":model.depth if cascade else None,
         "cascade_pretrained":bool(cascade and model.pretrained),
+        "cascade_coarse_hash":cascade_coarse_hash,
         "cascade_scores":cascade_scores,
         "cascade_aux":bool(cfg.get("cascade_aux",True)) if cascade else None,
         "v53_stage":cfg.get("v53_stage"),
