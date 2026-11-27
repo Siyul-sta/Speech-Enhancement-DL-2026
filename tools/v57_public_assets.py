@@ -63,7 +63,7 @@ def package_public(family,run,source,out,allow_download=False,cmgan_root=None):
     if info.get("family")!=family or file_hash(config)!=info.get("sha256"): raise ValueError("Invalid archived SpeechBrain configuration")
     if not all(isinstance(info.get(k),str) and info[k] for k in ("speechbrain","hyperpyyaml")): raise ValueError("Missing SpeechBrain version identity")
     dest=out/"hyperparams.yaml";dest.write_bytes(config.read_bytes())
-    return {"kind":"speechbrain","files":{"hyperparams.yaml":file_hash(dest)},"speechbrain":info["speechbrain"],"hyperpyyaml":info["hyperpyyaml"],"source":info.get("source"),"revision":info.get("revision")}
+    return {"kind":"speechbrain","files":{"hyperparams.yaml":file_hash(dest)},"speechbrain":info["speechbrain"],"hyperpyyaml":info["hyperpyyaml"],"ruamel.yaml":info.get("ruamel.yaml"),"source":info.get("source"),"revision":info.get("revision")}
 
 def make_cmgan_module(root,meta):
     if meta.get("revision")!=CMGAN_REV or set(meta["files"])!=set(CMGAN_BLOBS): raise ValueError("Unsupported CMGAN asset manifest")
@@ -105,6 +105,7 @@ def construct(mod,family,root,meta):
     from importlib.metadata import version
     for dep in ("speechbrain","hyperpyyaml"):
         if version(dep)!=meta[dep]: raise ValueError("Offline dependency version mismatch: "+dep)
+    if meta.get("ruamel.yaml") is not None and version("ruamel.yaml")!=meta["ruamel.yaml"]: raise ValueError("Offline dependency version mismatch: ruamel.yaml")
     if hasattr(mod,"speechbrain_adapter_setup"): mod.speechbrain_adapter_setup()
     else:
         import torchaudio
