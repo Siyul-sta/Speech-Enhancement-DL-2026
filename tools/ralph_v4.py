@@ -62,6 +62,8 @@ def verify(folder, kind="v4_public"):
             for name,value in zip(("challenge","external_normal","external_stress"),domains):
                 actual=float(r["domain_scores"][name])
                 if not math.isfinite(actual) or abs(actual-value)>1e-6: raise ValueError("Invalid domain score")
+    if r.get("v54_stage"):
+        verify_cascade_result(folder,r,kind)
     if r.get("v53_stage"):
         if kind!="v4_external" or r.get("transductive_noisy") or r.get("self_supervised") or r.get("v53_requested_epochs",0)<12 or r.get("epochs_completed")!=r["v53_requested_epochs"]:
             raise ValueError("Invalid V5.3 training contract")
@@ -99,6 +101,41 @@ def verify(folder, kind="v4_public"):
         elif r.get("epochs_completed")!=2: raise ValueError("Incomplete legacy smoke run")
     return r
 
+def verify_cascade_result(folder,r,kind):
+    if kind!="v4_external" or r.get("transductive_noisy") or r.get("self_supervised") or r.get("critic_reserved_train_files")!=32 or r.get("v54_requested_epochs",0)<8 or r.get("epochs_completed")!=r["v54_requested_epochs"]:
+        raise ValueError("Invalid cascade training contract")
+    family=r.get("model_family")
+    families={"cascade_native_two":2,"cascade_native_three":3,"cascade_native":4,"cascade_cmgan_two":2,"cascade_cmgan_three":3,"cascade_cmgan":4}
+    depth=families.get(family)
+    if depth is None or depth!=r.get("cascade_depth") or bool(r.get("cascade_pretrained"))!=family.startswith("cascade_cmgan"): raise ValueError("Cascade architecture mismatch")
+    if r["cascade_pretrained"] and not re.fullmatch(r"[0-9a-f]{64}",str(r.get("cascade_coarse_hash",""))): raise ValueError("Missing frozen coarse fingerprint")
+    zero=r["zero_shot"];initial=zero["external_domains"]
+    if len(initial)!=2: raise ValueError("Missing initial domains")
+    verify_rows(folder/"zero_shot_validation.csv",164,zero["challenge"])
+    init_rows=verify_rows(folder/"zero_shot_external.csv",64,sum(initial)/2)
+    if any(abs(sum(init_rows[j*32:(j+1)*32])/32-initial[j])>1e-6 for j in range(2)): raise ValueError("Invalid initial domain score")
+    names=("coarse","residual","complex","refine")[:depth]
+    scores=r["cascade_scores"]
+    if set(scores)!=set(names): raise ValueError("Missing cascade stage scores")
+    for name in names:
+        d=scores[name];ext=d["external_domains"]
+        if len(ext)!=2: raise ValueError("Missing stage external domains")
+        verify_rows(folder/f"cascade_{name}_validation.csv",164,d["challenge"])
+        rows=verify_rows(folder/f"cascade_{name}_external.csv",64,sum(ext)/2)
+        if any(abs(sum(rows[j*32:(j+1)*32])/32-ext[j])>1e-6 for j in range(2)): raise ValueError("Stage domain mismatch")
+    final=scores[names[-1]]
+    if abs(final["challenge"]-r["best_validation_pesq_wb"])>1e-6 or any(abs(final["external_domains"][j]-r["domain_scores"][name])>1e-6 for j,name in enumerate(("external_normal","external_stress"))): raise ValueError("Final stage score mismatch")
+    if final["challenge"]<zero["challenge"]-1e-5 or any(a<b-.15001 for a,b in zip(final["external_domains"],initial)): raise ValueError("Cascade baseline preservation gate failed")
+    history=json.loads((folder/"cascade_history.json").read_text(encoding="utf-8"))
+    if len(history)!=r["epochs_completed"] or [x["epoch"] for x in history]!=list(range(1,len(history)+1)): raise ValueError("Missing cascade stage history")
+    for entry in history:
+        active=set(entry["active_stages"])
+        expected={"residual"}|({"coarse"} if not r["cascade_pretrained"] else set())|({"complex"} if depth>=3 and entry["epoch"]>=3 else set())|({"refine"} if depth>=4 and entry["epoch"]>=5 else set())
+        if active!=expected or entry["trainable_parameters"]<=0: raise ValueError("Invalid active cascade stages")
+    if r.get("pesq_aware"):
+        if depth!=4 or (r.get("critic_last_calibration") or {}).get("count")!=32 or r.get("critic_optimizer_steps",0)<1 or not (folder/"critic_history.json").is_file(): raise ValueError("Missing adaptive cascade critic evidence")
+
+
 def history():
     records=[]
     for path in sorted(core.OUTPUT.glob("run_v4*/round_*/*/remote_state.json")):
@@ -112,6 +149,31 @@ def history():
             except (OSError,ValueError,KeyError):
                 continue
     return records
+
+
+def v54_stage_plan(records,failures,epochs=None):
+    """Cumulative cascade depths and isolated adaptive perceptual objective."""
+    stages=[
+        ("native-two","cascade_native_two",False),
+        ("native-three","cascade_native_three",False),
+        ("native-four","cascade_native",False),
+        ("native-perceptual","cascade_native",True),
+        ("cmgan-two","cascade_cmgan_two",False),
+        ("cmgan-three","cascade_cmgan_three",False),
+        ("cmgan-four","cascade_cmgan",False),
+        ("cmgan-perceptual","cascade_cmgan",True),
+    ]
+    done={r.get("v54_stage") for st,r in records if epochs is None or r.get("v54_requested_epochs")==epochs}
+    failed={x["plan"].get("v54_stage") for x in failures}
+    for name,arch,metric in stages:
+        if name in done or name in failed: continue
+        prior=next((r.get("cascade_coarse_hash") for st,r in records if r.get("v54_stage") and r.get("cascade_pretrained") and r.get("cascade_coarse_hash")),None)
+        return {"v54_stage":name,"architecture":arch,"v54_expected_coarse_hash":prior if arch.startswith("cascade_cmgan") else None,
+                "cascade_aux":True,"phase_loss":True,"challenge_remix":1024,"empirical_remix":True,"balanced_remix":False,
+                "pesq_aware":metric,"adaptive_critic":metric,"self_supervised":False,"transductive":False,
+                "distill":False,"data_profile":"base","augmentation":"base","external_size":512,
+                "lr":.0001,"loss_mode":"base","self_mode":"consistency","network_spec":None,"batch_size":1}
+    return None
 
 
 def v53_stage_plan(records,failures,epochs=None):
@@ -275,6 +337,8 @@ def submit(kaggle, source, tag, i, kind, config=None):
         core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":kind})
         raise
     r=verify(folder,kind)
+    if config and config.get("v54_stage"):
+        if r.get("v54_stage")!=config["v54_stage"] or r.get("model_family")!=config["architecture"] or bool(r.get("pesq_aware"))!=bool(config.get("pesq_aware")) or (config.get("v54_expected_coarse_hash") and r.get("cascade_coarse_hash")!=config["v54_expected_coarse_hash"]): raise ValueError("Remote cascade protocol mismatch")
     if config and config.get("v53_stage"):
         if r.get("v53_stage")!=config["v53_stage"] or r.get("transfer_mode")!=config["transfer_mode"] or (config.get("v53_expected_initial_hash") and r.get("v53_initial_hash")!=config["v53_expected_initial_hash"]): raise ValueError("Remote transfer protocol mismatch")
     if kind=="v4_smoke" and config and config.get("smoke_metric_protocol") and r.get("smoke_metric_protocol")!=config["smoke_metric_protocol"]:
@@ -359,6 +423,7 @@ def main():
     p.add_argument("--v5-suite",action="store_true",help="Controlled challenge-focused V5 stages, then continuous research")
     p.add_argument("--v52-suite",action="store_true",help="Seven fixed phase/critic ablations; stops after suite, no public benchmark")
     p.add_argument("--v53-suite",action="store_true",help="Eleven fixed pretrained transfer ablations; epoch-zero baseline in each trial")
+    p.add_argument("--v54-suite",action="store_true",help="Eight fixed multistage depth/perceptual ablations; per-stage PESQ and epoch-zero fallback")
     p.add_argument("--challenge-remix",type=int,choices=(0,512,1024,2048),default=0)
     p.add_argument("--pesq-aware",action="store_true",help="Train-only PESQ critic, generator objective from epoch 3")
     p.add_argument("--codex-research",action="store_true",help="Use Codex for structured strategy proposals")
@@ -367,13 +432,14 @@ def main():
     args=p.parse_args()
     if sum(map(bool,(args.smoke,args.loop,args.final_audit,args.perf_benchmark,args.validated_perf_run)))>1: p.error("Choose exactly one execution mode")
     if args.amp and not (args.smoke or args.perf_benchmark or args.validated_perf_run): p.error("--amp requires smoke or the quality-gated performance mode")
+    if args.v54_suite and (not args.loop or args.v53_suite or args.v52_suite or args.v5_suite or args.focus_architecture or args.pesq_aware or args.challenge_remix or args.allow_generated_code or args.epochs<8): p.error("V5.4 suite requires --loop, >=8 epochs and no strategy overrides")
     if args.v53_suite and (not args.loop or args.v52_suite or args.v5_suite or args.focus_architecture or args.pesq_aware or args.challenge_remix or args.allow_generated_code or args.epochs<12): p.error("V5.3 suite requires --loop, >=12 epochs and no strategy overrides")
     if args.v52_suite and (not args.loop or args.v5_suite or args.focus_architecture or args.pesq_aware or args.challenge_remix or args.allow_generated_code or args.epochs<5): p.error("V5.2 suite requires --loop, >=5 epochs and no strategy overrides")
     if (args.v5_suite or args.challenge_remix) and not args.loop: p.error("Suite/remix require --loop")
     if (args.focus_architecture or args.pesq_aware) and not (args.loop or args.smoke): p.error("Training focus options require --loop or --smoke")
     if args.smoke and args.pesq_aware and args.amp: p.error("Metric smoke uses FP32")
     if args.smoke and args.focus_architecture not in (None,"residual","residual_relaxed","complex_residual","dual_axis","temporal"): p.error("Smoke must use a native model without public downloads")
-    if args.v5_suite or args.v52_suite or args.v53_suite: args.challenge_focus=True
+    if args.v5_suite or args.v52_suite or args.v53_suite or args.v54_suite: args.challenge_focus=True
     if args.max_rounds<0: p.error("--max-rounds must be nonnegative")
     sources={k:(ROOT/"src"/name).read_text(encoding="utf-8") for k,name in (("v4_public","kaggle_v4_public.py"),("v4_external","kaggle_v4_external.py"))}
     sources["v4_public"]=public_with_external(sources["v4_public"],sources["v4_external"])
@@ -429,7 +495,7 @@ def main():
             submit(kaggle,source,tag,1,"v4_audit",{"id":"V3_RESIDUAL_PHASE","seed":42,"batch_size":4,"epochs":2,"patience":2,"warm_ref":None if recipe else st["ref"],"public_recipe":recipe,"architecture":r.get("model_family","residual"),"data_profile":"base","network_spec":r.get("network_spec"),"final_audit":True,"audit_aux":args.audit_aux,"audit_urgent":args.audit_urgent,"audit_korean":args.audit_korean,"public_cache":cache})
             return
         has_public=any(st["kind"]=="v4_public" and (not args.challenge_focus or (r.get("selection_target")=="challenge" and r.get("v5_public"))) for st,r in records)
-        if not (args.v52_suite or args.v53_suite) and (not has_public or not args.loop):
+        if not (args.v52_suite or args.v53_suite or args.v54_suite) and (not has_public or not args.loop):
             legacy.require_quota(kaggle,2)
             i+=1
             records.append(submit(kaggle,sources["v4_public"],tag,i,"v4_public",{"id":"V4_PUBLIC_ZERO_SHOT","seed":42,"public_cache":cache,"selection_target":"challenge" if args.challenge_focus else "robust","v5_public":args.challenge_focus}))
@@ -442,10 +508,15 @@ def main():
             try: legacy.require_quota(kaggle,2)
             except legacy.QuotaGuardReached as exc:
                 print("STOP",exc,flush=True); break
-            if args.discover and not (args.v52_suite or args.v53_suite) and (not discovery or n%5==0):
+            if args.discover and not (args.v52_suite or args.v53_suite or args.v54_suite) and (not discovery or n%5==0):
                 discovery=catalog.discover()
                 core.json_write(core.OUTPUT/("run_"+tag)/"public_research.json",discovery)
-            if args.v53_suite:
+            if args.v54_suite:
+                plan=v54_stage_plan(records,failures,args.epochs)
+                if plan is None:
+                    print("V5.4 controlled suite exhausted; review reports before continuing",flush=True)
+                    break
+            elif args.v53_suite:
                 plan=v53_stage_plan(records,failures,args.epochs)
                 if plan is None:
                     print("V5.3 controlled suite exhausted; review reports before continuing",flush=True)
@@ -460,7 +531,7 @@ def main():
             stages=[("bounded-control","residual",0,False),("relaxed","residual_relaxed",0,False),("remix","residual_relaxed",1024,False),("metric-loss","residual_relaxed",1024,True),("metricgan-transfer","metricgan",1024,True),("cmgan-transfer","cmgan_transfer",1024,True),("dual-axis","dual_axis",1024,True),("sepformer-transfer","sepformer_dns_transfer",1024,True),("remix-scale","residual_relaxed",4096,True),("cmgan-remix-scale","cmgan_transfer",4096,True)]
             done={r.get("v5_stage") for st,r in records}
             stage=next((s for s in stages if s[0] not in done and s[0] not in {x["plan"].get("v5_stage") for x in failures}),None) if args.v5_suite else None
-            if args.v52_suite or args.v53_suite:
+            if args.v52_suite or args.v53_suite or args.v54_suite:
                 pass  # fixed controlled plan; do not overwrite settings
             elif stage:
                 name,arch,remix,metric=stage
@@ -488,7 +559,7 @@ def main():
                       and r.get("generated_hash")==plan.get("generated_hash")
                       and (plan["architecture"]!="composed" or r.get("network_spec")==plan["network_spec"])]
             best=max(external,key=lambda pair:pair[1]["best_validation_pesq_wb"] if args.challenge_focus else rank_score(pair[1]),default=None)
-            warm=best[0]["ref"] if best and n%4!=0 and not stage and not (args.v52_suite or args.v53_suite) else None
+            warm=best[0]["ref"] if best and n%4!=0 and not stage and not (args.v52_suite or args.v53_suite or args.v54_suite) else None
             cfg={"id":"V3_RESIDUAL_PHASE","epochs":args.epochs,"batch_size":1 if plan["architecture"].startswith("sepformer_") or plan["architecture"]=="cmgan_transfer" else 4,"patience":7,"seed":42,"warm_ref":warm,"public_cache":cache,"amp":args.amp,"selection_target":"challenge" if args.challenge_focus else "robust",**plan}
             print("RESEARCH PLAN",json.dumps(cfg),flush=True)
             i+=1
