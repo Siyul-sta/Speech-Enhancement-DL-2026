@@ -136,6 +136,15 @@ def verify_cascade_result(folder,r,kind):
         if depth!=4 or (r.get("critic_last_calibration") or {}).get("count")!=32 or r.get("critic_optimizer_steps",0)<1 or not (folder/"critic_history.json").is_file(): raise ValueError("Missing adaptive cascade critic evidence")
 
 
+def verify_v56_metadata(result,state):
+    if not state.get("v56_key"): return
+    for key in ("v56_key","v56_source_sha","v56_action"):
+        if result.get(key)!=state.get(key): raise ValueError("V5.6 result identity mismatch: "+key)
+    if result.get("model_family")!=state.get("architecture") or result.get("v56_requested_epochs")!=state.get("epochs"):
+        raise ValueError("V5.6 architecture/epoch mismatch")
+    if bool(result.get("smoke"))!=(state["v56_action"]=="smoke"): raise ValueError("V5.6 smoke identity mismatch")
+
+
 def history():
     records=[]
     for path in sorted(core.OUTPUT.glob("run_v4*/round_*/*/remote_state.json")):
@@ -143,6 +152,7 @@ def history():
         if state.get("status")=="COMPLETE" and state.get("kind") not in ("v4_audit","v4_cache","v4_smoke","v4_perf"):
             try:
                 r=verify(path.parent,state["kind"])
+                verify_v56_metadata(r,state)
                 if r.get("evaluation_protocol")!="v4.2-fixed-dev-v2": continue
                 state["source_path"]=str(path.parent/"source.py")
                 records.append((state,r))
@@ -329,21 +339,23 @@ def submit(kaggle, source, tag, i, kind, config=None):
     (folder/"source.py").write_text(source,encoding="utf-8")
     core.json_write(job/"kernel-metadata.json",{"id":ref,"title":title,"code_file":"run.py","language":"python","kernel_type":"script","is_private":"true","enable_gpu":"true","enable_internet":"true","dataset_sources":[] if kind=="v4_audit" else [DATASET],"competition_sources":[],"kernel_sources":list(dict.fromkeys(config[k] for k in ("warm_ref","public_cache") if config and config.get(k)))})
     state=folder/"remote_state.json"
-    core.json_write(state,{"ref":ref,"status":"SUBMIT_PENDING","kind":kind})
+    metadata={k:config[k] for k in ("v56_key","v56_source_sha","v56_action","architecture","epochs") if config and config.get("v56_key") and k in config}
+    core.json_write(state,{"ref":ref,"status":"SUBMIT_PENDING","kind":kind,**metadata})
     core.dashboard_event(folder.parents[1],"training",message="V4 "+kind,ref=ref,round=i,remote_status="SUBMIT_PENDING")
     try:
-        core.poll_adaptive_kernel(kaggle,job,ref,folder,180*60,status_hook=lambda status,**updates: core.dashboard_event(folder.parents[1], "training",remote_status=status,ref=ref,**updates))
+        core.poll_adaptive_kernel(kaggle,job,ref,folder,int((config or {}).get("v56_wait_minutes",180))*60,status_hook=lambda status,**updates: core.dashboard_event(folder.parents[1], "training",remote_status=status,ref=ref,**updates))
     except legacy.KaggleTerminalFailure:
-        core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":kind})
+        core.json_write(state,{"ref":ref,"status":"ERROR_TERMINAL","kind":kind,**metadata})
         raise
     r=verify(folder,kind)
+    if metadata: verify_v56_metadata(r,metadata)
     if config and config.get("v54_stage"):
         if r.get("v54_stage")!=config["v54_stage"] or r.get("model_family")!=config["architecture"] or bool(r.get("pesq_aware"))!=bool(config.get("pesq_aware")) or (config.get("v54_expected_coarse_hash") and r.get("cascade_coarse_hash")!=config["v54_expected_coarse_hash"]): raise ValueError("Remote cascade protocol mismatch")
     if config and config.get("v53_stage"):
         if r.get("v53_stage")!=config["v53_stage"] or r.get("transfer_mode")!=config["transfer_mode"] or (config.get("v53_expected_initial_hash") and r.get("v53_initial_hash")!=config["v53_expected_initial_hash"]): raise ValueError("Remote transfer protocol mismatch")
     if kind=="v4_smoke" and config and config.get("smoke_metric_protocol") and r.get("smoke_metric_protocol")!=config["smoke_metric_protocol"]:
         raise ValueError("Remote smoke protocol mismatch")
-    core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind})
+    core.json_write(state,{"ref":ref,"status":"COMPLETE","kind":kind,**metadata})
     if kind=="v4_perf":
         print("PERFORMANCE TRIAL (not ranked)",json.dumps(r),flush=True)
         return {"ref":ref,"kind":kind,"status":"COMPLETE"},r
