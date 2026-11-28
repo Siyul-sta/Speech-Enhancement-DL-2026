@@ -115,14 +115,18 @@ def remote_rows(base):
         if not st:continue
         c=config(p.parent/"source.py")
         r=read(p.parent/"result.json") if st.get("status")=="COMPLETE" else {}
-        if not (st.get("v6") or c.get("v7_recipe")):continue
+        if not (st.get("v6") or c.get("v7_recipe") or st.get("v71_session")):continue
+        if st.get("v71_session") and not c:
+            plan=read(p.parent/"v71_plan.json")
+            rows.append({"ref":st.get("ref"),"run":p.parents[2].name,"round":p.parents[1].name,"status":st.get("status"),"kind":"v71_session","model":"MP-DNS lineage","version":"V7.1","recipe":"session ("+str(len(plan.get("candidates",[])))+" candidates)","smoke":False,"score":None,"gain":None,"recorded_at":mtime(p),"result_at":0})
+            continue
         m=r.get("v6") or {};parent=c.get("v6_parent") or {};v7=r.get("v7") or {}
         score=result_score(p.parent,r)
         raw=finite(r.get("best_validation_pesq_wb"))
         smoke=bool(c.get("smoke") or r.get("smoke") or st.get("kind")=="v4_smoke")
         rows.append({"ref":st.get("ref"),"run":p.parents[2].name,"round":p.parents[1].name,
             "status":st.get("status"),"kind":st.get("kind"),"model":r.get("model_family") or c.get("architecture") or st.get("architecture"),
-            "version":"V7" if c.get("v7_recipe") else "V6.11" if c.get("v611_recipe") else "V6.10" if c.get("v610_recipe") else "V6.9" if c.get("v6_refine_hypothesis") else "V6",
+            "version":"V7.1" if st.get("v71_session") else "V7" if c.get("v7_recipe") else "V6.11" if c.get("v611_recipe") else "V6.10" if c.get("v610_recipe") else "V6.9" if c.get("v6_refine_hypothesis") else "V6",
             "recipe":c.get("v7_recipe") or c.get("v611_recipe") or c.get("v610_recipe") or c.get("v6_refine_hypothesis") or ("zero-shot" if c.get("v6_mode")=="zero" else "legacy training"),
             "smoke":smoke,"score":score,"smoke_score":raw if smoke else None,"external":finite(r.get("external_validation_pesq_wb")),
             "parent_score":finite(parent.get("score")),"checkpoint":m.get("checkpoint_sha256"),"gain":score-parent["score"] if score is not None and finite(parent.get("score")) is not None else None,
@@ -179,7 +183,7 @@ def snapshot(base=REMOTE,research=RESEARCH,poll_remote=False):
     cycle=latest.get("cycles",[])[-1] if latest and latest.get("cycles") else None
     if active:
         phase="remote_pending"
-        if active["version"]!="V7":phase="legacy_pending"
+        if active["version"] not in ("V7","V7.1"):phase="legacy_pending"
     elif lock_present and reason in {"budget","budget_before_preflight","budget_after_preflight","budget_after_smoke","no_affordable_recipe"} and cycle and cycle.get("end_quota"):
         phase="possible_quota_wait"
     elif lock_present:phase="local_activity_unknown"
