@@ -71,7 +71,7 @@ def trial(parent,recipe,sha,cache,epochs,mix,public_mix,smoke=False):
     depth=old.get("v6_depth")
     new_residual=recipe=="residual" and not depth
     if recipe=="residual" and not new_residual:raise ValueError("Residual already exists")
-    family="v6_cascade_mp_dns_d2" if new_residual else old["architecture"]
+    family="v6_cascade" if new_residual else old["architecture"]
     depth=2 if new_residual else depth
     lr=float(old["lr"])
     if r["v6"]["attempted_epochs"]>0:lr=max(1e-8,min(lr*.5,float(r["v6"]["lr"])))
@@ -107,6 +107,7 @@ def preflight(data,code,cfg,out,parent):
     rows=off.read_manifest(data/"train/samples.csv",1296)
     row=rows[0];x=torch.from_numpy(wav.read_wav(wav.safe_path(data,row["noisy_path"])))[None]
     s=torch.from_numpy(wav.read_wav(wav.safe_path(data,row["clean_path"])))[None]
+    m.EXPERIMENT_CONFIG=cfg
     model=m.v6_make_model(cfg,mp_root=Path(accepted["assets"]),pretrained=False)
     target=model.coarse if cfg["v6_parent_coarse"] else model
     cp=parent[3]/"best_model.pt"
