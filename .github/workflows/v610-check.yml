@@ -6,6 +6,9 @@ on:
       - 'src/v610_focus.py'
       - 'tools/ralph_v610.py'
       - 'tests/test_v610_focus.py'
+      - 'tools/ralph_v611.py'
+      - 'tools/v6_refine_analysis.py'
+      - 'tests/test_v611_loop.py'
       - '.github/workflows/v610-check.yml'
   workflow_dispatch:
 permissions:
@@ -26,3 +29,4 @@ jobs:
       - run: pip install numpy pandas scipy soundfile einops
       - run: python -m compileall -q src tools tests
       - run: python -m unittest discover -s tests -p test_v610_focus.py -v
+      - run: python -m unittest discover -s tests -p test_v611_loop.py -v
