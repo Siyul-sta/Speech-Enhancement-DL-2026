@@ -120,6 +120,8 @@ def verify_stages(folder,ref):
     return rows,winner
 
 def import_session(folder,state):
+    plan,_,_=session_files(folder)
+    if state.get("plan_sha",digest(plan))!=digest(plan):raise ValueError("Recorded plan identity mismatch")
     rows,winner=verify_stages(folder,state["ref"])
     if winner:
         _,st,r,cfg,p=winner
@@ -239,6 +241,8 @@ def run(a):
             winner=submit(kaggle,base,plan,a.max_job_minutes)
             if winner is None:
                 print("V71 STOP no verified training result; inspect session",flush=True);break
+            if session_files(winner[4].parents[2])[2]["reason"]=="stage_error":
+                print("V71 STOP stage error; verified winner preserved",flush=True);break
         if not a.skip_final:
             core.no_uncertain_prior_jobs()
             report=research.analyze(data,research.ROOT/("v7_final_"+research.stamp()),a.top,2,8,a.allow_public_assets,prefer_diverse=False)
