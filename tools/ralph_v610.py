@@ -121,12 +121,19 @@ def preflight(data,code,cfg,out,parent):
         if not torch.allclose(y,z,rtol=2e-4,atol=2e-5):raise ValueError("Cascade identity failed")
     model.train()
     if cfg.get("v6_transfer"):m.TransferSchedule(model,cfg["v6_transfer"],float(cfg["lr"]))
-    loss=m.v6_loss(model(x[:,:4096]),s[:,:4096],cfg)
+    xx,ss=x[:,:4096],s[:,:4096]
+    if cfg.get("v7_residual_weight"):
+        if not isinstance(model,m.V6Refiner):raise ValueError("Residual trust requires cascade")
+        stages=model.forward_stages(xx)
+        loss=m.v6_loss(stages[-1],ss,cfg)+float(cfg["v7_residual_weight"])*m.v7_residual_trust(stages[-1],stages[0],xx)
+    else:
+        loss=m.v6_loss(model(xx),ss,cfg)
     if not torch.isfinite(loss):raise ValueError("Invalid new loss")
     loss.backward()
     grads=[p.grad for p in model.parameters() if p.grad is not None]
     if not grads or any(not torch.isfinite(g).all() for g in grads) or not any(float(g.abs().max())>0 for g in grads):
         raise ValueError("New objective gradient failed")
+    if isinstance(model,m.V6Refiner) and any(p.grad is not None for p in model.coarse.parameters()):raise ValueError("Frozen coarse gradient leak")
     result={"status":"PASS","source_sha256":digest(code),"parent_sha256":ctl.sha(cp),"recipe":cfg["v610_recipe"],
         "environment":environment(),"loss":float(loss.detach()),"samples":48000}
     core.json_write(out/"report.json",result)
