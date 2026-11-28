@@ -146,6 +146,7 @@ def history(entries):
             try:c=ctl.config_of(folder)
             except (OSError,ValueError,SyntaxError,KeyError):continue
         if c.get("smoke") or not c.get("v6_parent"):continue
+        if (c.get("v6_base_family") or c.get("architecture"))!="mp_dns":continue
         name=c.get("v7_recipe") or c.get("v611_recipe") or c.get("v610_recipe") or c.get("v6_refine_hypothesis")
         if not name:continue
         if name=="continue" and c.get("v611_lr_step")==1:name="lr_half"
