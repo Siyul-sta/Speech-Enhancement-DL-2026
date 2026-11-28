@@ -1,4 +1,5 @@
 """V6.10 CPU tests for new training-only objectives and controlled recipe lineage."""
+import ast
 import sys
 import unittest
 from pathlib import Path
@@ -24,8 +25,8 @@ class FocusTests(unittest.TestCase):
         base=ctl.source();new=focus.source()
         for name in ("def evaluate(","def score_waveforms(","def v6_eval(","def v6_make_model("):
             def body(code):
-                start=code.index(name);end=code.find("\ndef ",start+1)
-                return code[start:end]
+                target=name[4:-1]
+                return ast.dump(next(n for n in ast.parse(code).body if isinstance(n,ast.FunctionDef) and n.name==target))
             self.assertEqual(body(base),body(new))
         self.assertNotEqual(focus.digest(base),self.sha)
         self.assertEqual(new.count("V610_HARD_INIT"),1)
