@@ -61,7 +61,7 @@ def run(bundle,out,hours=None):
     shutil.copy2(bundle/"v71_base.txt",out/"v71_base.txt")
     session.atomic_json(out/"v71_plan.json",plan)
     session.atomic_json(out/"colab_environment.json",{"device":torch.cuda.get_device_name(0),"torch":str(torch.__version__),"cuda":torch.version.cuda,
-        "handoff_plan_sha":manifest["plan_sha"],"runtime_plan_sha":session.digest(plan),"data_root":str(data),"parent_path":str(parent),"cache":"/content/v71_public_cache"})
+        "handoff_plan_sha":manifest["plan_sha"],"runtime_plan_sha":session.digest(plan),"data_root":str(data),"parent_path":str(parent),"output_root":str(out),"cache":"/content/v71_public_cache"})
     original=session.stage_source
     def adapted(code,cfg,work,dataset):
         # Avoid recursion: colab_source invokes original stage-source function.
