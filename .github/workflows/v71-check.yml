@@ -8,6 +8,7 @@ on:
       - 'tools/v71_colab.py'
       - 'tests/test_v71_colab.py'
       - 'tools/ralph_v71.py'
+      - 'tools/v72_parallel.py'
       - 'tests/test_v71.py'
       - '.github/workflows/v71-check.yml'
   workflow_dispatch:
