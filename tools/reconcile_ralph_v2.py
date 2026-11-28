@@ -106,6 +106,9 @@ def reconcile(kaggle: str, path: Path, info: dict, *, resolve: bool):
         if not resolve:
             print("Remote job COMPLETE. Re-run --resolve to fetch/check artifacts.")
             return
+        if info.get("v71_session"):
+            print("V7.1 session requires its own stage verifier; use ralph_v71.py --execute --resume. Keep unresolved.")
+            return
         if info.get("kind")=="v4_cache":
             info["status"]="COMPLETE"
             info["reconciled"]=True
