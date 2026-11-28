@@ -13,7 +13,7 @@ put('colabStatus',labels[c.status]||c.status);put('colabFresh',c.updated_at?'파
 const root=$('colabTrials');root.replaceChildren();let series=[];
 for(const item of c.candidates||[]){const sm=item.stages.smoke,tr=item.stages.train;const describe=s=>s.status==='complete'?'완료':s.status==='reused'?'재사용':s.folder_seen?'폴더 생성됨 / 미완료':'미시작';trialLine(root,item.recipe,'Smoke '+describe(sm)+' · Train '+describe(tr), 'Epoch '+tr.history.length+'/'+tr.epochs+(tr.score!=null?' · 완료 PESQ '+fmt(tr.score,6):'')+(item.error?' · '+item.error:''));if(tr.history.length)series=tr.history}
 graph('colabChart',series,[['challenge','#48d5a0'],['best','#78b8ff']]);graph('colabLoss',series,[['loss','#78b8ff']]);
-put('subStatus',k.active?'로컬 기록 '+k.active.status:'대기 작업 기록 없음');put('subRef',p.ref);put('subHours',hour(p.hours));put('subEstimate',hour(p.estimate_hours));put('subNote',p.parallel_sub?'Colab과 분리된 SUB 계획':'SUB 계획 미확인');
+put('subStatus',k.active?(k.remote?.status?'원격 '+k.remote.status:'로컬 기록 '+k.active.status):'대기 작업 기록 없음');put('subRef',p.ref);put('subHours',hour(p.hours));put('subEstimate',hour(p.estimate_hours));put('subNote',(p.parallel_sub?'Colab과 분리된 SUB 계획':'SUB 계획 미확인')+(k.remote?.error?' · '+k.remote.error:''));
 const sub=$('subTrials');sub.replaceChildren();for(const i of p.recipes||[])trialLine(sub,i.name,i.epochs+' Epoch',i.reuse_smoke?'Smoke 재사용':'Smoke 실행 예정')}
 const originalRenderLogs=renderLogs;
 renderLogs=function(d){originalRenderLogs(d);if(activeRef&&d.ref!==activeRef)return;put('subStage',d.stage?d.stage.recipe+' / '+d.stage.stage:'단계 로그 미확인')};
