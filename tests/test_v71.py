@@ -39,7 +39,10 @@ class SessionTests(unittest.TestCase):
         a,b=funcs(self.base),funcs(src)
         for key in ("evaluate","score_waveforms","v6_eval","v6_loaders","v6_parent_path","v6_run"):
             self.assertEqual(a[key],b[key],key)
-        self.assertIn("WORK = Path('/tmp/test')",src)
+        work=next(n for n in ast.parse(src).body if isinstance(n,ast.Assign) and any(isinstance(t,ast.Name) and t.id=="WORK" for t in n.targets))
+        self.assertIsInstance(work.value,ast.Call)
+        self.assertEqual(work.value.func.id,"Path")
+        self.assertEqual(ast.literal_eval(work.value.args[0]),str(Path("/tmp/test")))
     def fixture(self,base,cfg,work,dataset,timeout):
         work.mkdir(parents=True);parent=cfg["v6_parent"];sm=cfg["smoke"];n=cfg["epochs"]
         score=3.25 if sm else 3.3 if cfg["v7_recipe"]=="continue" else 3.4
