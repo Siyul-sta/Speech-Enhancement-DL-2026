@@ -28,5 +28,7 @@ jobs:
       - run: pip install numpy pandas scipy soundfile einops
       - run: python -m compileall -q src tools tests
       - run: python -m unittest discover -s tests -p test_v7.py -v
+        env:
+          V7_TEST_MP: '1'
       - run: python -m unittest discover -s tests -p test_v611_loop.py -v
       - run: python -m unittest discover -s tests -p test_v610_focus.py -v
