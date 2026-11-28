@@ -4,6 +4,9 @@ on:
     branches: [feature/ralph-v5-pesq-diagnostics]
     paths:
       - 'src/v71_session.py'
+      - 'src/v71_colab_worker.py'
+      - 'tools/v71_colab.py'
+      - 'tests/test_v71_colab.py'
       - 'tools/ralph_v71.py'
       - 'tests/test_v71.py'
       - '.github/workflows/v71-check.yml'
@@ -26,4 +29,5 @@ jobs:
       - run: pip install numpy pandas scipy soundfile einops
       - run: python -m compileall -q src tools tests
       - run: python -m unittest discover -s tests -p test_v71.py -v
+      - run: python -m unittest discover -s tests -p test_v71_colab.py -v
       - run: python -m unittest discover -s tests -p test_v6_controller.py -v
