@@ -223,8 +223,16 @@ def analyze(data,out,top=3,threads=2,gate_epochs=8,allow_download=False,cache=RO
     csv_scores(out/"pcm16_scores.csv",vm,matrix,[*names,"train_selected_recipe"])
     csv_scores(out/"train_select_scores.csv",sm,train_scores,names)
     groups=group_summary(train_scores,sm,names)
-    diag=oracle_diagnostic(sc,sp[:,best_i])
-    hp=hypothesis(diag,groups,best_name)
+    champion=entries[0]
+    diagnostic_name=champion[0]["ref"].rsplit("/",1)[-1]
+    # The improvement hypothesis must be measured on the actual continuation parent.
+    # If its offline reconstruction fails, allow ensemble evaluation but no new training.
+    if diagnostic_name in names:
+        diag=oracle_diagnostic(sc,sp[:,names.index(diagnostic_name)])
+        hp=hypothesis(diag,groups,diagnostic_name)
+    else:
+        diag=None
+        hp={"name":"unavailable","reason":"Highest verified checkpoint could not be reconstructed for CPU diagnosis."}
     # Validation only chooses between frozen train-selected recipe and individual experts.
     if float(blend_scores.mean())>float(val_scores[:,best_i].mean())+.001:
         config={"protocol":"v6-offline-v1","experts":specs,"alignment":best["alignment"]}
@@ -245,11 +253,10 @@ def analyze(data,out,top=3,threads=2,gate_epochs=8,allow_download=False,cache=RO
     if replay["count"]!=164 or replay["manifest_sha256"]!=ctl.sha(val_manifest) or abs(float(replay["pesq_wb"])-winner_score)>.005:
         raise ValueError("Offline winner score failed cached PCM16 reproduction")
     # Keep training parent the highest verified single checkpoint, not an oracle/gate bundle.
-    champion=entries[0]
     report={"protocol":"v6-refine-v1","snapshot_champion":ctl.parent_info(champion[0],champion[1]),"train_manifest_sha256":ctl.sha(train_manifest),
-        "validation_manifest_sha256":ctl.sha(val_manifest),"count":164,"models":names,"raw":quick["scores"],
+        "validation_manifest_sha256":ctl.sha(val_manifest),"count":164,"models":names,"snapshot_models":quick["models"],"raw":quick["scores"],
         "pcm16":matrix_summary(val_scores,names),"validation_groups":group_summary(val_scores,vm,names),
-        "train_select_groups":groups,"diagnostic_model":best_name,"train_oracle_diagnostic":diag,
+        "train_select_groups":groups,"diagnostic_model":diagnostic_name,"train_oracle_diagnostic":diag,
         "train_fit_count":len(fit_ids),"train_select_count":len(select_ids),"gate_candidates":candidates,"gate_recipe":best,
         "ensemble_pesq":float(blend_scores.mean()),"winner":winner,"winner_pesq":float(replay["pesq_wb"]),
         "winner_package_manifest":ctl.sha(package/"package_manifest.json"),"hypothesis":hp,"rejected":rejected,
