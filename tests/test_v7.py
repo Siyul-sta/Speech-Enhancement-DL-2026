@@ -119,4 +119,33 @@ class V7Tests(unittest.TestCase):
             r=v7.await_refresh("dummy",q,180,2,poll_minutes=1,clock=lambda:t[0],sleep=sleep,reader=lambda:new)
             self.assertEqual(r,new);check.assert_called_once()
             self.assertIsNone(v7.await_refresh("dummy",new,180,2,poll_minutes=1,clock=lambda:t[0],sleep=sleep,reader=lambda:new))
+    def test_actual_mp_public_checkpoint(self):
+        import os
+        if os.environ.get("V7_TEST_MP")!="1":self.skipTest("Optional public MP-DNS assets")
+        from v6_preflight import load_module
+        with tempfile.TemporaryDirectory() as d:
+            root=Path(d);runner=root/"runner.py";runner.write_bytes(search.source().encode("utf-8"))
+            m=load_module(runner);assets=root/"assets"
+            model=m.V6MPNet("mp_dns",assets,allow_download=True).eval()
+            torch.manual_seed(7)
+            x=torch.randn(1,48000)*.03
+            with torch.no_grad():y=model(x)
+            self.assertEqual(tuple(y.shape),(1,48000));self.assertTrue(torch.isfinite(y).all())
+            other=m.V6MPNet("mp_dns",assets,False,False).eval()
+            other.load_state_dict(model.state_dict(),strict=True)
+            with torch.no_grad():z=other(x)
+            self.assertTrue(torch.allclose(y,z,atol=2e-5,rtol=2e-4))
+            crop=x[:,:4096];clean=crop*.8
+            cfg={"id":"V3_RESIDUAL_PHASE","v610_phase_derivatives":True,"v7_phase_weight":.08,"v7_spectral_weight":.04}
+            model.train();m.TransferSchedule(model,"progressive",3e-5)
+            loss=m.v6_loss(model(crop),clean,cfg);loss.backward()
+            self.assertTrue(any(p.grad is not None and torch.isfinite(p.grad).all() and p.grad.abs().max()>0 for p in model.parameters()))
+            refiner=m.V6Refiner(other,2).eval()
+            with torch.no_grad():self.assertTrue(torch.allclose(refiner(crop),other(crop),atol=2e-5,rtol=2e-4))
+            refiner.train();stages=refiner.forward_stages(crop)
+            loss=m.v6_loss(stages[-1],clean,cfg)+.02*m.v7_residual_trust(stages[-1],stages[0],crop)
+            loss.backward()
+            self.assertFalse(any(p.grad is not None for p in refiner.coarse.parameters()))
+            self.assertTrue(any(p.grad is not None and torch.isfinite(p.grad).all() for p in refiner.phase.parameters()))
+
 if __name__=="__main__":unittest.main()
