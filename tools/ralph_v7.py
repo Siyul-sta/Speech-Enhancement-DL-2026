@@ -112,24 +112,36 @@ def run(a):
             budget=max(0.,min(q["remaining"]-a.reserve_hours,a.budget_hours if a.budget_hours is not None else q["remaining"]))
             cycles.append({"cycle":cycle,"start_quota":q,"budget_hours":budget})
             return time.monotonic(),budget
-        started,budget=begin(q)
+        started,budget=begin(q);last_quota=q;observed_reset=False
+        def observe_quota():
+            nonlocal last_quota,observed_reset
+            now=quota(kaggle)
+            observed_reset=observed_reset or refreshed(last_quota,now)
+            last_quota=now
+            return now
         def save():
             core.json_write(state,{"protocol":"v7-controller-v1","source":sha,"rounds":rounds,"jobs":jobs,"cycle":cycle,
                 "events":events,"cycles":cycles,"stop_reason":reason,"wait_hours":wait_used/3600})
         def remaining():
-            return min(budget-(time.monotonic()-started)/3600,quota(kaggle)["remaining"]-a.reserve_hours)
+            return min(budget-(time.monotonic()-started)/3600,observe_quota()["remaining"]-a.reserve_hours)
         def next_cycle():
-            nonlocal q,cycle,started,budget,wait_used,reason
+            nonlocal q,cycle,started,budget,wait_used,reason,last_quota,observed_reset
             if not a.wait_for_quota or cycle>=a.max_quota_cycles or wait_used>=a.max_wait_hours*3600:return False
+            if a.max_rounds and rounds>=a.max_rounds:return False
             core.no_uncertain_prior_jobs()
-            previous=quota(kaggle);cycles[-1]["end_quota"]=previous;cycles[-1]["reason"]=reason
-            wait_start=time.monotonic()
-            deadline=wait_start+a.max_wait_hours*3600-wait_used
-            print("V7 QUOTA_WAIT_START",json.dumps({"previous":previous,"cycle":cycle}),flush=True);save()
-            new=await_refresh(kaggle,previous,deadline,a.reserve_hours,a.poll_minutes)
-            wait_used+=time.monotonic()-wait_start
+            previous=observe_quota();cycles[-1]["end_quota"]=previous;cycles[-1]["reason"]=reason
+            if observed_reset and previous["remaining"]>a.reserve_hours:
+                # A reset may already have happened during the previous job or CPU analysis.
+                new=previous
+                print("V7 QUOTA_REFRESH_ALREADY_OBSERVED",json.dumps(new),flush=True)
+            else:
+                wait_start=time.monotonic()
+                deadline=wait_start+a.max_wait_hours*3600-wait_used
+                print("V7 QUOTA_WAIT_START",json.dumps({"previous":previous,"cycle":cycle}),flush=True);save()
+                new=await_refresh(kaggle,previous,deadline,a.reserve_hours,a.poll_minutes)
+                wait_used+=time.monotonic()-wait_start
             if new is None:reason="quota_wait_limit";save();return False
-            q=new;cycle+=1;started,budget=begin(q);reason="running";save();return True
+            q=new;last_quota=new;observed_reset=False;cycle+=1;started,budget=begin(q);reason="running";save();return True
         try:
             while not a.max_rounds or rounds<a.max_rounds:
                 core.no_uncertain_prior_jobs()
