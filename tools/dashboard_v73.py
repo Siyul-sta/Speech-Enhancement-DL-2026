@@ -92,7 +92,7 @@ def page():
     html=(d.ROOT/"tools/dashboard_v7.html").read_text(encoding="utf-8")
     addition=(d.ROOT/"tools/dashboard_v73_panel.html").read_text(encoding="utf-8")
     panel,script=addition.split("<!--SCRIPT-->",1)
-    return html.replace("SPEECH ENHANCEMENT / V7","SPEECH ENHANCEMENT / V7.3").replace("<section class=\"panel hero\">",panel+"\n<section class=\"panel hero\">",1).replace("</script></body>",script+"\n</script></body>",1)
+    return html.replace("SPEECH ENHANCEMENT / V7","SPEECH ENHANCEMENT / V7.3").replace("<section class=\"panel hero\">",panel+"\n<section class=\"panel hero\">",1).replace("poll('/api',",script+"\npoll('/api',",1)
 
 class Handler(d.Handler):
     colab_root=None
@@ -102,7 +102,7 @@ class Handler(d.Handler):
         try:
             if path=="/":data=page().encode("utf-8");mime="text/html; charset=utf-8"
             else:
-                value=combined(self.colab_root,poll=False) if path=="/parallel" else scoped_logs(d.log_payload())
+                value=combined(self.colab_root,poll=True) if path=="/parallel" else scoped_logs(d.log_payload())
                 data=json.dumps(value,ensure_ascii=False,allow_nan=False).encode();mime="application/json; charset=utf-8"
             self.send_response(200);self.send_header("Content-Type",mime);self.send_header("Content-Length",str(len(data)))
             self.send_header("Cache-Control","no-store");self.send_header("X-Content-Type-Options","nosniff")
