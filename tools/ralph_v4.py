@@ -35,7 +35,7 @@ def verify_rows(path, count, expected):
 def rank_score(result):
     return result.get("robust_score",result["joint_score"])
 
-def verify(folder, kind="v4_public"):
+def verify(folder, kind="v4_public", *, v6_smoke_epochs=None):
     r = json.loads((folder/"result.json").read_text(encoding="utf-8"))
     if kind not in ("v4_public","v4_external","v4_audit","v4_smoke","v4_perf"): raise ValueError("Unknown result kind")
     if kind=="v4_audit":
@@ -108,7 +108,14 @@ def verify(folder, kind="v4_public"):
                 raise ValueError("Missing V5.2 critic evidence")
     if kind=="v4_smoke":
         if not r.get("smoke"): raise ValueError("Incomplete isolated smoke run")
-        if r.get("smoke_metric_protocol")=="v5.1-three-epoch":
+        if v6_smoke_epochs is not None:
+            if (type(v6_smoke_epochs) is not int or v6_smoke_epochs<1 or
+                r.get("evaluation_protocol")!="v4-smoke-fixture-v1" or
+                r.get("v6",{}).get("protocol")!="v6-max-pesq-v1" or
+                r.get("v56_requested_epochs")!=v6_smoke_epochs or
+                type(r.get("epochs_completed")) is not int or r["epochs_completed"]!=v6_smoke_epochs):
+                raise ValueError("Incomplete V6/V7 configured smoke run")
+        elif r.get("smoke_metric_protocol")=="v5.1-three-epoch":
             norm=r.get("metric_gradient_norm")
             if (r.get("epochs_completed")!=3 or not r.get("pesq_aware") or r.get("critic_updates",0)<1 or r.get("metric_generator_steps",0)<1 or not isinstance(norm,(int,float)) or not math.isfinite(norm) or norm<=0):
                 raise ValueError("Missing real metric-gradient smoke evidence")
