@@ -32,6 +32,38 @@ class SessionTests(unittest.TestCase):
         self.assertTrue(all(c["config"]["v6_parent"]==p["parent"] for c in p["candidates"]))
         self.assertLessEqual(p["estimate_hours"],p["hours"])
         self.assertIsNone(v.make_plan(self.parent,self.diag,{},self.base,None,.01,3,False,False,3,200))
+    def test_parallel_sub_disjoint_and_resume_guard(self):
+        import v72_parallel as parallel
+        import zipfile
+        p=self.plan(3)
+        # Reserve continuation family, exactly as the live Colab handoff.
+        p["candidates"]=[i for i in p["candidates"] if i["family"]=="continue"]
+        self.assertTrue(p["candidates"])
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);data=root/"data"
+            files={}
+            for split in ("train","validation"):
+                q=data/split/"samples.csv";q.parent.mkdir(parents=True);q.write_text(split)
+                files["data/"+split+"/samples.csv"]=v.ctl.sha(q)
+            z=root/"handoff.zip"
+            with zipfile.ZipFile(z,"w") as f:
+                f.writestr("handoff_manifest.json",json.dumps({"protocol":"v71-colab-handoff-v1","plan_sha":v.digest(p),"files":files}))
+                f.writestr("v71_plan.json",json.dumps(p));f.writestr("v71_base.txt",self.base)
+            sub=parallel.reservation(z,data,self.base)
+            with patch.object(v.search,"cost",lambda c,e:.2 if c["smoke"] else .5):
+                plan=v.make_plan(self.parent,self.diag,{},self.base,None,4.5,3,False,False,3,200,sub=sub)
+            self.assertEqual(plan["parallel_sub"],sub["plan_sha"])
+            families=[i["family"] for i in plan["candidates"]]
+            self.assertEqual(len(families),3);self.assertEqual(len(set(families)),3)
+            self.assertNotIn("continue",families)
+            folder=root/"run_demo/round_0001/v4_external";folder.mkdir(parents=True)
+            st={"ref":"owner/job","status":"SUBMIT_PENDING","v71_session":True,"plan_sha":v.digest(p)}
+            (folder/"remote_state.json").write_text(json.dumps(st));(folder/"v71_plan.json").write_text(json.dumps(p))
+            with patch.object(v.core,"OUTPUT",root):
+                with self.assertRaisesRegex(RuntimeError,"MAIN Kaggle"):parallel.require_sub_pending(sub)
+                st["plan_sha"]=v.digest(plan)
+                (folder/"remote_state.json").write_text(json.dumps(st));(folder/"v71_plan.json").write_text(json.dumps(plan))
+                parallel.require_sub_pending(sub)
     def test_source_preserves_eval(self):
         p=self.plan(1);cfg=p["candidates"][0]["config"]
         src=worker.stage_source(self.base,cfg,Path("/tmp/test"),p["dataset"])
