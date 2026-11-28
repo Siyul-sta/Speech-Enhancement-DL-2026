@@ -37,12 +37,14 @@ def archived_source(base,cfg,dataset):
         if n!=1:raise ValueError("Missing source config")
     compile(base,"v71_archived.py","exec");return base
 
-def make_plan(parent,diag,entries,base,cache,hours,max_candidates,allow_reduce,enable_korean,chunk,max_epochs):
+def make_plan(parent,diag,entries,base,cache,hours,max_candidates,allow_reduce,enable_korean,chunk,max_epochs,sub=None):
     sha=search.digest(base);old=parent[2];left=max_epochs-parent[1]["v6"]["attempted_epochs"]
     candidates=[];used=.15
     if left<1 or hours<=.15:return None
     for name,why in search.rank(parent,diag,entries,enable_korean):
         if len(candidates)>=max_candidates:break
+        if sub and (name in sub["recipes"] or why["family"] in sub["excluded_families"]):continue
+        if sub and any(c["family"]==why["family"] for c in candidates):continue
         s=search.settings(old);s.update({k:v for k,v in search.BY_NAME[name][1].items() if k in s})
         minimum=3 if s["v6_critic"] and not s["v7_critic_warm_count"] else 1
         upper=min(left,max(minimum,chunk) if name in ("continue","lr_half","lr_quarter") else minimum)
@@ -50,7 +52,7 @@ def make_plan(parent,diag,entries,base,cache,hours,max_candidates,allow_reduce,e
         for epochs in range(upper,minimum-1,-1):
             for mix,pub in oldloop.profiles(old,allow_reduce):
                 c=search.build(parent,name,sha,cache,epochs,mix,pub);sm=search.build(parent,name,sha,cache,epochs,mix,pub,True)
-                if c["v56_key"] in entries:continue
+                if c["v56_key"] in entries or (sub and c["v56_key"] in sub["keys"]):continue
                 prior=entries.get(sm["v56_key"])
                 if prior:
                     if not prior[1]:continue
@@ -65,7 +67,7 @@ def make_plan(parent,diag,entries,base,cache,hours,max_candidates,allow_reduce,e
         if selected:candidates.append(selected);used+=selected["estimate_hours"]
     if not candidates:return None
     return {"protocol":"v71-plan-v1","source":sha,"dataset":v4.DATASET,"hours":hours,"estimate_hours":used,
-            "parent":ctl.parent_info(parent[0],parent[1]),"candidates":candidates}
+            "parent":ctl.parent_info(parent[0],parent[1]),"candidates":candidates,**({"parallel_sub":sub["plan_sha"]} if sub else {})}
 
 def state_for(ref,cfg):
     return {"ref":ref,"kind":"v4_smoke" if cfg["smoke"] else "v4_external","status":"COMPLETE","v6":True,
@@ -203,6 +205,11 @@ def run(a):
     base_sha=search.digest(ctl.source());focus_sha=search.digest(focus.source())
     seal=core.OUTPUT/"v57_audit_seal.json"
     if seal.exists():raise RuntimeError("Independent audit sealed")
+    sub=None
+    if a.colab_handoff:
+        from v72_parallel import reservation
+        sub=reservation(a.colab_handoff,data,base)
+        print("V72 RESERVATION "+json.dumps(sub),flush=True)
     if not a.execute:
         p=oldloop.champion(v7.verified_entries());print("V71 DRY PLAN",json.dumps({"parent":ctl.parent_info(p[0],p[1]),"max_candidates":a.max_candidates,"session_hours":a.session_hours,"note":"No GPU submission"}),flush=True);return
     if not a.allow_public_assets:raise ValueError("Explicit public asset authorization required")
@@ -211,6 +218,9 @@ def run(a):
     refine.wait_idle(3);lock=core.OUTPUT/"active.lock";lock.parent.mkdir(parents=True,exist_ok=True)
     with lock.open("x",encoding="utf-8") as f:f.write(str(os.getpid()))
     try:
+        if sub:
+            from v72_parallel import require_sub_pending
+            require_sub_pending(sub)
         if a.resume:resume(kaggle,a.max_job_minutes)
         else:core.no_uncertain_prior_jobs()
         from v6_preflight import require
@@ -225,7 +235,7 @@ def run(a):
             diag=oldloop.train_diagnostic(data,p,a.allow_public_assets)
             cache=p[2].get("public_cache") or v4.find_public_cache()
             q=v7.quota(kaggle);hours=min(a.session_hours,q["remaining"]-a.reserve_hours)
-            plan=make_plan(p,diag,session_history(e),base,cache,hours,a.max_candidates,a.allow_reduce_mix,a.enable_korean,a.chunk_epochs,a.max_epochs)
+            plan=make_plan(p,diag,session_history(e),base,cache,hours,a.max_candidates,a.allow_reduce_mix,a.enable_korean,a.chunk_epochs,a.max_epochs,sub=sub)
             if not plan:
                 if a.wait_for_quota and cycle<a.max_quota_cycles and hours<a.session_hours and time.monotonic()<wait_deadline:
                     new=v7.await_refresh(kaggle,q,wait_deadline,a.reserve_hours)
@@ -243,7 +253,7 @@ def run(a):
                 print("V71 STOP no verified training result; inspect session",flush=True);break
             if session_files(winner[4].parents[2])[2]["reason"]=="stage_error":
                 print("V71 STOP stage error; verified winner preserved",flush=True);break
-        if not a.skip_final:
+        if not a.skip_final and not sub:
             core.no_uncertain_prior_jobs()
             report=research.analyze(data,research.ROOT/("v7_final_"+research.stamp()),a.top,2,8,a.allow_public_assets,prefer_diverse=False)
             print("V71 FINAL "+json.dumps({"winner":report["winner"],"pesq":report["winner_pesq"]}),flush=True)
@@ -252,6 +262,7 @@ def run(a):
 def main():
     p=argparse.ArgumentParser(description=__doc__)
     p.add_argument("--data-root",type=Path,required=True)
+    p.add_argument("--colab-handoff",type=Path,help="Reserve Colab recipes; Kaggle explores different families only")
     for flag in ("execute","resume","allow-public-assets","allow-reduce-mix","enable-korean","wait-for-quota","skip-final"):
         p.add_argument("--"+flag,action="store_true")
     p.add_argument("--max-sessions",type=int,default=0);p.add_argument("--max-candidates",type=int,default=3)
