@@ -53,7 +53,7 @@ def ranked_recipes(parent,diag,entries,max_epochs):
     if not math.isfinite(phase) or not math.isfinite(mag):raise ValueError("Invalid Train diagnosis")
     order=[]
     # First exploit a verified improvement. After a no-gain block, explore orthogonal hypotheses.
-    if r["v6"]["attempted_epochs"]==0 or (r["v6"]["gain"]>=MIN_GAIN and r["best_epoch"]>0):order.append("continue")
+    if r["v6"]["attempted_epochs"]==0 or (r["v6"].get("gain",0.)>=MIN_GAIN and r["best_epoch"]>0):order.append("continue")
     order+=["phase_derivatives","hard_noise_first"] if phase>=mag-.1 else ["hard_noise_first","phase_derivatives"]
     order+=["full_length","critic","residual","continue"]
     out=[]
@@ -249,7 +249,7 @@ def run(a):
         core.no_uncertain_prior_jobs()
         # Once at the end, evaluate/compare actual PCM16 checkpoint mixtures and seal local winner.
         if not a.skip_final:
-            report=research.analyze(data,research.ROOT/("unified_final_"+research.stamp()),a.top,2,8,a.allow_public_assets)
+            report=research.analyze(data,research.ROOT/("unified_final_"+research.stamp()),a.top,2,8,a.allow_public_assets,prefer_diverse=False)
             print("V611 FINAL",json.dumps({"winner":report["winner"],"pesq":report["winner_pesq"]}),flush=True)
     finally:lock.unlink(missing_ok=True)
 
