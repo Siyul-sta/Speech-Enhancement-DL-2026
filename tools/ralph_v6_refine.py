@@ -122,11 +122,15 @@ def run(a):
         done=[e for e in entries.values() if e[1] and not e[1]["smoke"]]
         if not done:raise ValueError("No complete checkpoint")
         champion=sorted(done,key=lambda e:(-e[1]["best_validation_pesq_wb"],e[0]["ref"]))[0]
-        if ctl.parent_info(champion[0],champion[1])!=report["snapshot_champion"]:
-            # Reuse cached predictions; re-analyze the current best instead of stale parent.
+        present={(e[0]["ref"],e[1]["v6"]["checkpoint_sha256"]) for e in done}
+        prior={(e["ref"],e["checkpoint"]) for e in report.get("snapshot_models",[])}
+        if ctl.parent_info(champion[0],champion[1])!=report["snapshot_champion"] or present!=prior:
+            # Reuse cached predictions; refresh all newly completed results and current champion.
             out=research.ROOT/("analysis_"+research.stamp())
             report=research.analyze(data,out,a.top,a.threads,a.gate_epochs,a.allow_public_assets)
             if ctl.parent_info(champion[0],champion[1])!=report["snapshot_champion"]:raise RuntimeError("Champion identity changed unexpectedly")
+        if report["hypothesis"]["name"]=="unavailable":
+            print("V6 REFINE STOP champion CPU diagnosis unavailable",flush=True);return
         if champion[1]["v56_source_sha"]!=code_sha:raise ValueError("Champion source differs from accepted trainer; no silent migration")
         family=champion[2].get("v6_base_family") or champion[2]["architecture"]
         accepted=require(code_sha,data,[family]);locks=accepted.get("hf_locks",{})
