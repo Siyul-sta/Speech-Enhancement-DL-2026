@@ -1,5 +1,7 @@
 """V7 offline tests: reviewed source contracts, objectives, search, quota wait and recovery."""
 import ast
+import json
+from contextlib import ExitStack
 import math
 import sys
 import tempfile
@@ -119,6 +121,46 @@ class V7Tests(unittest.TestCase):
             r=v7.await_refresh("dummy",q,180,2,poll_minutes=1,clock=lambda:t[0],sleep=sleep,reader=lambda:new)
             self.assertEqual(r,new);check.assert_called_once()
             self.assertIsNone(v7.await_refresh("dummy",new,180,2,poll_minutes=1,clock=lambda:t[0],sleep=sleep,reader=lambda:new))
+    def test_controller_one_round_and_recovery_order(self):
+        # Integration fixture: real recipe construction and journal, fake remote/CPU.
+        cfg=search.build(self.parent,"spectral_balance",self.sha,None,1,2048,512)
+        smoke=search.build(self.parent,"spectral_balance",self.sha,None,1,2048,512,True)
+        plan={"config":cfg,"smoke":smoke,"reuse_smoke":False,"hours":.5,"reason":{"family":"spectral"},"compound_data_change":False}
+        q={"remaining":10.,"used":20.,"total":30.,"refresh":None}
+        calls=[]
+        def submit(kaggle,code,tag,num,c,wait):
+            calls.append("smoke" if c["smoke"] else "train")
+            result={"best_validation_pesq_wb":3.3,"v6":{"metric_steps":0,"critic_calibration":None},
+                "v7":{"protocol":search.VERSION,"recipe":c["v7_recipe"],"mutation":c["v7_mutation"],"parent":c["v6_parent"],
+                    "warmup_updates":0,"warmup_calibration":None}}
+            return {"ref":"owner/new"},result
+        with tempfile.TemporaryDirectory() as d,ExitStack() as stack:
+            root=Path(d);remote=root/"remote";output=root/"v7"
+            patches=[(v7.core,"OUTPUT",remote),(v7,"ROOT",output),(v7.shutil,"which",lambda _: "kaggle"),
+                (v7.refine,"wait_idle",lambda _:calls.append("idle")),(v7.ctl,"resume",lambda *a:calls.append("resume")),
+                (v7,"quota",lambda *a,**k:q),(v7,"verified_entries",lambda:{"parent":self.parent}),
+                (v7.oldloop,"train_diagnostic",lambda *a:self.diag),(v7.v4,"find_public_cache",lambda:None),
+                (v7.search,"pick",lambda *a:plan),(v7.search,"cost",lambda *a:.25),
+                (v7.focus,"preflight",lambda *a:calls.append("preflight")),(v7.ctl,"submit",submit)]
+            for module,key,val in patches:stack.enter_context(patch.object(module,key,val))
+            import v6_preflight
+            stack.enter_context(patch.object(v6_preflight,"require",lambda *a:None))
+            a=SimpleNamespace(data_root=root,execute=True,allow_public_assets=True,resume=True,max_job_minutes=360,
+                budget_hours=3.,reserve_hours=2.,wait_for_quota=False,max_quota_cycles=2,max_wait_hours=168.,
+                poll_minutes=10,max_rounds=1,max_epochs=200,chunk_epochs=3,allow_reduce_mix=True,enable_korean=False,
+                max_stale=0,skip_final=True,top=3)
+            v7.run(a)
+            self.assertEqual(calls,["idle","resume","preflight","smoke","train"])
+            self.assertFalse((remote/"active.lock").exists())
+            j=json.loads(next(output.glob("run_*.json")).read_text())
+            self.assertEqual(j["stop_reason"],"round_limit");self.assertEqual(j["jobs"],2)
+            self.assertEqual(j["events"][0]["status"],"complete")
+            self.assertAlmostEqual(j["events"][0]["gain"],.05)
+            calls.clear()
+            with patch.object(v7.ctl,"resume",side_effect=TimeoutError("unresolved")):
+                with self.assertRaises(TimeoutError):v7.run(a)
+            self.assertEqual(calls,["idle"]);self.assertFalse((remote/"active.lock").exists())
+
     def test_actual_mp_public_checkpoint(self):
         import os
         if os.environ.get("V7_TEST_MP")!="1":self.skipTest("Optional public MP-DNS assets")
