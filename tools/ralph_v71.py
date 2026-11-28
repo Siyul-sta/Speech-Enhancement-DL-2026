@@ -40,7 +40,7 @@ def archived_source(base,cfg,dataset):
 def make_plan(parent,diag,entries,base,cache,hours,max_candidates,allow_reduce,enable_korean,chunk,max_epochs):
     sha=search.digest(base);old=parent[2];left=max_epochs-parent[1]["v6"]["attempted_epochs"]
     candidates=[];used=.15
-    if left<1:return None
+    if left<1 or hours<=.15:return None
     for name,why in search.rank(parent,diag,entries,enable_korean):
         if len(candidates)>=max_candidates:break
         s=search.settings(old);s.update({k:v for k,v in search.BY_NAME[name][1].items() if k in s})
@@ -100,10 +100,11 @@ def verify_stages(folder,ref):
             (p/"source.py").write_text(source,encoding="utf-8")
             # Local temporary filename required by unchanged V6 verifier.
             cp=p/"best_model.pt"
-            if cp.exists():raise ValueError("Unexpected extra checkpoint")
-            try:
-                os.link(p/"checkpoint.pt",cp)
-            except OSError:shutil.copy2(p/"checkpoint.pt",cp)
+            if cp.exists():
+                if ctl.sha(cp)!=ctl.sha(p/"checkpoint.pt"):raise ValueError("Unexpected extra checkpoint")
+            else:
+                try:os.link(p/"checkpoint.pt",cp)
+                except OSError:shutil.copy2(p/"checkpoint.pt",cp)
             st=state_for(ref,cfg)
             try:
                 r,actual=ctl.verify(p,st);search.verify_result(r,cfg)
