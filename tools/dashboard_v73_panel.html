@@ -1,0 +1,20 @@
+<section class="panel"><div class="flex"><h2>V7.3 · 병렬 연구 통합 현황</h2><span class="small" id="parallelFresh">조회 중</span></div>
+<div class="metric" style="margin:12px 0"><div class="small">전체 최고 기록 PESQ (164개 행 확인 · 최종 검증 전)</div><div class="value green" id="parallelBest">—</div><div class="small" id="parallelBestFrom">—</div></div>
+<div class="grid" style="grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px">
+<div class="metric"><div class="eyebrow">COLAB / MAIN</div><div class="status" id="colabStatus">—</div><p class="small" id="colabFresh">—</p><div class="kv"><span>GPU</span><b id="colabGPU">—</b></div><div class="kv"><span>세션 제한</span><b id="colabHours">—</b></div><p class="small" id="colabNote">—</p><div id="colabTrials"></div><h2 style="margin-top:14px">최근 본학습 Epoch PESQ</h2><svg id="colabChart" viewBox="0 0 700 240"></svg><h2>Epoch 평균 Loss</h2><svg id="colabLoss" viewBox="0 0 700 240"></svg></div>
+<div class="metric"><div class="eyebrow">KAGGLE / SUB</div><div class="status" id="subStatus">—</div><p class="small" id="subRef">—</p><div class="kv"><span>세션 제한</span><b id="subHours">—</b></div><div class="kv"><span>후보 비용 추정</span><b id="subEstimate">—</b></div><div class="kv"><span>현재 로그 단계</span><b id="subStage">—</b></div><p class="small" id="subNote">—</p><div id="subTrials"></div><p class="small">GPU 잔여량, Batch, Loss, Epoch PESQ 및 원격 로그는 아래 기존 Kaggle 패널 참조.</p></div></div>
+<p class="small">Colab은 Drive 파일 기록만 읽음. 'running'은 저장된 상태이며 런타임 생존 보장 아님. Smoke 점수는 전체 최고에서 제외. 최종 제출 검증은 별도.</p></section>
+<!--SCRIPT-->
+function trialLine(root,title,detail,extra){const a=document.createElement('div');a.className='kv';const l=document.createElement('span'),r=document.createElement('b');l.textContent=title;r.textContent=detail;a.append(l,r);root.append(a);if(extra){const p=document.createElement('p');p.className='small';p.textContent=extra;root.append(p)}}
+function renderParallel(x){const c=x.colab||{},k=x.kaggle||{},p=x.kaggle_plan||{},best=x.best_recorded;
+put('parallelFresh','조회 '+date(x.updated_at));put('parallelBest',fmt(best?.score,6));put('parallelBestFrom',best?best.lane+' · '+best.recipe:'기록 없음');
+const labels={not_configured:'경로 미설정',waiting_files:'Drive 파일 대기',inconsistent:'기록 불일치',saved_running:'실행 중으로 저장됨',finished:'세션 종료',budget:'시간 제한 종료',stage_error:'오류 종료'};
+put('colabStatus',labels[c.status]||c.status);put('colabFresh',c.updated_at?'파일 수정 '+date(c.updated_at)+' · '+Math.floor(c.age_seconds/60)+'분 전':'파일 기록 없음');put('colabGPU',c.device);put('colabHours',hour(c.hours));put('colabNote',c.note);
+const root=$('colabTrials');root.replaceChildren();let series=[];
+for(const item of c.candidates||[]){const sm=item.stages.smoke,tr=item.stages.train;const describe=s=>s.status==='complete'?'완료':s.status==='reused'?'재사용':s.folder_seen?'폴더 생성됨 / 미완료':'미시작';trialLine(root,item.recipe,'Smoke '+describe(sm)+' · Train '+describe(tr), 'Epoch '+tr.history.length+'/'+tr.epochs+(tr.score!=null?' · 완료 PESQ '+fmt(tr.score,6):'')+(item.error?' · '+item.error:''));if(tr.history.length)series=tr.history}
+graph('colabChart',series,[['challenge','#48d5a0'],['best','#78b8ff']]);graph('colabLoss',series,[['loss','#78b8ff']]);
+put('subStatus',k.active?'로컬 기록 '+k.active.status:'대기 작업 기록 없음');put('subRef',p.ref);put('subHours',hour(p.hours));put('subEstimate',hour(p.estimate_hours));put('subNote',p.parallel_sub?'Colab과 분리된 SUB 계획':'SUB 계획 미확인');
+const sub=$('subTrials');sub.replaceChildren();for(const i of p.recipes||[])trialLine(sub,i.name,i.epochs+' Epoch',i.reuse_smoke?'Smoke 재사용':'Smoke 실행 예정')}
+const originalRenderLogs=renderLogs;
+renderLogs=function(d){originalRenderLogs(d);if(activeRef&&d.ref!==activeRef)return;put('subStage',d.stage?d.stage.recipe+' / '+d.stage.stage:'단계 로그 미확인')};
+poll('/parallel',renderParallel,10000,e=>put('parallelFresh','조회 실패 · '+e.message));
