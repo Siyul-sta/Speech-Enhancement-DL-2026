@@ -42,9 +42,9 @@ def snapshot():
     entries.sort(key=lambda a:(-a[1]["best_validation_pesq_wb"],a[0]["ref"]))
     return entries,rejected
 
-def shortlist(entries,top):
+def shortlist(entries,top,prefer_diverse=True):
     chosen=[];seen=set();hashes=set()
-    for distinct in (True,False):
+    for distinct in ((True,False) if prefer_diverse else (False,)):
         for e in entries:
             st,r,cfg,folder=e
             family=(cfg.get("v6_base_family") or cfg["architecture"])
@@ -168,7 +168,7 @@ def predict_recipe(x,p,best,state):
     gate=V6Gate(p.shape[1],best["mode"]);gate.load_state_dict(state,strict=True);gate.eval()
     with torch.no_grad():return torch.cat([v6_combine(a,b,gate(a)) for a,b in zip(x.split(4),pp.split(4))])
 
-def analyze(data,out,top=3,threads=2,gate_epochs=8,allow_download=False,cache=ROOT/"predictions"):
+def analyze(data,out,top=3,threads=2,gate_epochs=8,allow_download=False,cache=ROOT/"predictions",prefer_diverse=True):
     if (core.OUTPUT/"v57_audit_seal.json").exists():raise RuntimeError("Independent audit sealed")
     data=data.resolve();out=out.resolve()
     if out.exists() or out.is_relative_to(data) or out.is_relative_to(core.OUTPUT.resolve()):raise ValueError("Use a fresh analysis directory outside dataset/history")
@@ -195,7 +195,7 @@ def analyze(data,out,top=3,threads=2,gate_epochs=8,allow_download=False,cache=RO
         cmgan=Path(require_report()["cmgan_root"])
     except (OSError,ValueError,KeyError,RuntimeError):pass
     package=out/"package";package.mkdir()
-    chosen=shortlist(entries,top);accepted=[];specs=[];preds={"fit":[],"select":[],"val":[]}
+    chosen=shortlist(entries,top,prefer_diverse);accepted=[];specs=[];preds={"fit":[],"select":[],"val":[]}
     for i,e in enumerate(chosen):
         st,r,cfg,folder=e
         try:
