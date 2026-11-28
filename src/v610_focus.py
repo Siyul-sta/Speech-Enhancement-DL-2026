@@ -1,6 +1,8 @@
 """V6.10 optional training-only objectives; inserted into archived V6 runner.
 No model topology, forward path, evaluator or validation split changes.
 """
+import math
+import numpy as np
 import torch
 
 def v610_phase_derivatives(pred,clean):
