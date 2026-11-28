@@ -1,0 +1,26 @@
+name: V7 dashboard checks
+on:
+  push:
+    branches: [feature/ralph-v5-pesq-diagnostics]
+    paths:
+      - 'tools/dashboard_v7.py'
+      - 'tools/dashboard_v7.html'
+      - 'tools/dashboard_v4.py'
+      - 'tools/v7_search.py'
+      - 'tests/test_dashboard_v7.py'
+      - '.github/workflows/dashboard-v7-check.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: python -m unittest discover -s tests -p test_dashboard_v7.py -v
+      - run: python -c "from pathlib import Path; p=Path('tools/dashboard_v7.html').read_text(encoding='utf-8'); Path('/tmp/dashboard-v7.js').write_text(p.split('<script>')[1].split('</script>')[0],encoding='utf-8')"
+      - run: node --check /tmp/dashboard-v7.js
