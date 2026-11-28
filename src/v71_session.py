@@ -95,6 +95,9 @@ def run_session(base,plan,root=Path("/kaggle/working"),runner=run_child,clock=ti
             # Preserve completed trials; stop rather than consume GPU after a failure.
             record["error"]=type(exc).__name__+": "+str(exc)[:500];save("stage_error");break
     reason="stage_error" if records and records[-1].get("error") else "finished" if not pending and all(r["train"]=="complete" for r in records) else "budget"
+    # A failed child may have written a partial checkpoint; never expose it as a mountable parent.
+    for cp in trials.rglob("best_model.pt"):
+        cp.replace(cp.with_name("unverified_checkpoint.pt"))
     if winner is not None:
         shutil.copy2(trials/f"trial_{winner:02d}"/"train/checkpoint.pt",root/"best_model.pt")
     save(reason)
