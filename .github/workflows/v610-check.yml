@@ -1,0 +1,28 @@
+name: V6.10 focused refinement checks
+on:
+  push:
+    branches: [feature/ralph-v5-pesq-diagnostics]
+    paths:
+      - 'src/v610_focus.py'
+      - 'tools/ralph_v610.py'
+      - 'tests/test_v610_focus.py'
+      - '.github/workflows/v610-check.yml'
+  workflow_dispatch:
+permissions:
+  contents: read
+concurrency:
+  group: v610-check-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install torch --index-url https://download.pytorch.org/whl/cpu
+      - run: pip install numpy pandas scipy soundfile einops
+      - run: python -m compileall -q src tools tests
+      - run: python -m unittest discover -s tests -p test_v610_focus.py -v
