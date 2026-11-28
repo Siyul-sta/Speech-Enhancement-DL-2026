@@ -49,8 +49,15 @@ def config_of(folder):
     return ast.literal_eval(rows[0].split("=",1)[1].strip())
 
 def verify(folder,state):
-    kind=state["kind"];r=v4.verify(folder,kind);v4.verify_v56_metadata(r,state)
-    cfg=config_of(folder);m=r.get("v6",{})
+    kind=state["kind"];cfg=config_of(folder)
+    if kind=="v4_smoke":
+        if not state.get("v6") or cfg.get("smoke") is not True or type(cfg.get("epochs")) is not int or cfg["epochs"]!=state.get("epochs") or cfg.get("v56_action")!="smoke" or cfg.get("v6_mode") not in ("train","cascade"):
+            raise ValueError("Invalid archived V6 smoke configuration")
+        r=v4.verify(folder,kind,v6_smoke_epochs=cfg["epochs"])
+    else:
+        r=v4.verify(folder,kind)
+    v4.verify_v56_metadata(r,state)
+    m=r.get("v6",{})
     if m.get("protocol")!="v6-max-pesq-v1" or m.get("mode")!=cfg.get("v6_mode") or m.get("parent")!=cfg.get("v6_parent"):
         raise ValueError("V6 identity mismatch")
     if m.get("checkpoint_sha256")!=sha(folder/"best_model.pt"): raise ValueError("V6 checkpoint corrupt")
