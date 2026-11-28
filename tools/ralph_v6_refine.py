@@ -74,12 +74,20 @@ def cost(cfg,entries):
     elif cfg["v6_crop"]==48000:guess=max(guess,1.5*guess)
     return guess
 
-def wait_idle(minutes):
-    lock=core.OUTPUT/"active.lock";deadline=time.monotonic()+minutes*60
-    while lock.exists():
-        if time.monotonic()>=deadline:raise TimeoutError("Existing controller still active; no new GPU job")
-        print("V6 REFINE WAIT existing controller (not interrupted)",flush=True)
-        time.sleep(60)
+def wait_idle(minutes,quiet_seconds=90,clock=time.monotonic,sleep=time.sleep):
+    # Original V6 briefly releases and reacquires its lock before offline finalization.
+    # Require a quiet interval so this continuation cannot steal that handoff.
+    lock=core.OUTPUT/"active.lock";deadline=clock()+minutes*60;idle_since=None
+    while True:
+        now=clock()
+        if lock.exists():
+            idle_since=None
+            print("V6 REFINE WAIT existing controller (not interrupted)",flush=True)
+        else:
+            if idle_since is None:idle_since=now
+            if now-idle_since>=quiet_seconds:return
+        if now>=deadline:raise TimeoutError("Existing controller not stably idle; no new GPU job")
+        sleep(min(30,max(0.,deadline-now)))
 
 def load_report(path,data):
     report=json.loads((path/"report.json").read_text(encoding="utf-8"))
@@ -113,7 +121,7 @@ def run(a):
         entries=ctl.ledger()
         done=[e for e in entries.values() if e[1] and not e[1]["smoke"]]
         if not done:raise ValueError("No complete checkpoint")
-        champion=max(done,key=lambda e:e[1]["best_validation_pesq_wb"])
+        champion=sorted(done,key=lambda e:(-e[1]["best_validation_pesq_wb"],e[0]["ref"]))[0]
         if ctl.parent_info(champion[0],champion[1])!=report["snapshot_champion"]:
             # Reuse cached predictions; re-analyze the current best instead of stale parent.
             out=research.ROOT/("analysis_"+research.stamp())
