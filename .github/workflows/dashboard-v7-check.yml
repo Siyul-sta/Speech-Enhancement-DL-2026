@@ -4,6 +4,9 @@ on:
     branches: [feature/ralph-v5-pesq-diagnostics]
     paths:
       - 'tools/dashboard_v7.py'
+      - 'tools/dashboard_v73.py'
+      - 'tools/dashboard_v73_panel.html'
+      - 'tests/test_dashboard_v73.py'
       - 'tools/dashboard_v7.html'
       - 'tools/dashboard_v4.py'
       - 'tools/v7_search.py'
@@ -24,3 +27,6 @@ jobs:
       - run: python -m unittest discover -s tests -p test_dashboard_v7.py -v
       - run: python -c "from pathlib import Path; p=Path('tools/dashboard_v7.html').read_text(encoding='utf-8'); Path('/tmp/dashboard-v7.js').write_text(p.split('<script>')[1].split('</script>')[0],encoding='utf-8')"
       - run: node --check /tmp/dashboard-v7.js
+      - run: python -m unittest discover -s tests -p test_dashboard_v73.py -v
+      - run: python -c "import sys; sys.path.insert(0,'tools'); import dashboard_v73 as d; from pathlib import Path; Path('/tmp/dashboard-v73.js').write_text(d.page().split('<script>')[1].split('</script>')[0],encoding='utf-8')"
+      - run: node --check /tmp/dashboard-v73.js
